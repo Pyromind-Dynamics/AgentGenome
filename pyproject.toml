@@ -10,12 +10,13 @@ dependencies = ["PyYAML"]
 
 [project.scripts]
 agentgenome = "cli:main"
+agentgenome-assets = "agentgenome.cli:main"
 
 [tool.setuptools]
 py-modules = ["cli"]
 
 [tool.setuptools.packages.find]
-include = ["builder*", "core*", "adapters*"]
+include = ["builder*", "core*", "adapters*", "agentgenome*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

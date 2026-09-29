@@ -21,8 +21,9 @@ if TYPE_CHECKING:
     Node = Any
     VerifyRule = Any
 
+from .artifacts import LocalArtifacts
 from .checkpoint import Checkpoint
-from .ledger import Ledger, file_ref
+from .ledger import Ledger
 from .ports import Answer, Candidate, FailDecl, JudgeResult, PortError, Ports, ShellResult
 
 
@@ -50,6 +51,7 @@ class Engine:
     def __init__(self, graph: Graph, ports: Ports, run_dir: Path, checkpoint: Checkpoint, ledger: Ledger) -> None:
         self.graph = graph
         self.ports = ports
+        self.artifacts = ports.artifacts or LocalArtifacts(run_dir)
         self.run_dir = run_dir
         self.checkpoint = checkpoint
         self.ledger = ledger
@@ -67,6 +69,8 @@ class Engine:
         return self.node(self.graph.node)
 
     def node(self, node: Node) -> dict[str, dict[str, Any]]:
+        if self.ports.check_cancel:
+            self.ports.check_cancel()
         entry = self.checkpoint.entry(node.path)
         if entry and entry.get("status") == "succeeded":
             refs = entry["outputs"]
@@ -156,8 +160,10 @@ class Engine:
         """以同一条 FailDecl 取证链服务 try 选路与 on_fail: ask。"""
         evidence: list[dict[str, Any]] = []
         artifact = self._artifact_path(node)
-        if artifact.exists():
-            evidence.append(file_ref(self.run_dir, artifact))
+        try:
+            evidence.append(self.artifacts.describe(str(artifact)))
+        except FileNotFoundError:
+            pass
         event = self.ledger.event(failure.cause_seq)
         if event:
             evidence.extend(
@@ -182,7 +188,7 @@ class Engine:
                 if result.rc != 0:
                     raise NodeFailed(Failure(node.path, "do", seq, f"do 命令退出码 {result.rc}"))
             try:
-                refs = {key: file_ref(self.run_dir, artifact) for key in node.output}
+                refs = {key: self.artifacts.describe(str(artifact)) for key in node.output}
             except OSError:
                 raise NodeFailed(Failure(node.path, "do", seq, "do 未物化声明的 artifact")) from None
         else:
@@ -390,7 +396,7 @@ class Engine:
         self, node: Node, refs: dict[str, dict[str, Any]], artifact: Path | None
     ) -> dict[str, Any]:
         return {
-            "artifact": file_ref(self.run_dir, artifact) if artifact is not None else None,
+            "artifact": self.artifacts.describe(str(artifact)) if artifact is not None else None,
             "outputs": {
                 key: self._typed_value(node.output[key].type, ref) for key, ref in refs.items()
             },
@@ -408,7 +414,13 @@ class Engine:
         self, command: str, node: Node, attempt: int, event: str, **extra: Any
     ) -> tuple[ShellResult, int]:
         try:
-            result = self.ports.shell.execute(command, self.graph.package_dir)
+            if self.ports.check_cancel:
+                self.ports.check_cancel()
+            if self.ports.on_event:
+                self.ports.on_event({"event": "command_started", "node": node.path, "command": command})
+            result = self.ports.shell.execute(command, self.ports.cwd or self.graph.package_dir)
+            if self.ports.check_cancel:
+                self.ports.check_cancel()
         except PortError as exc:
             self.ledger.append(
                 "port_error", node=node.path, attempt=attempt,
@@ -427,9 +439,7 @@ class Engine:
         return result, seq
 
     def _artifact_path(self, node: Node) -> Path:
-        directory = self.run_dir / "artifacts"
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{node.path.replace('.', '--')}.out"
+        return Path("artifacts") / f"{node.path.replace('.', '--')}.out"
 
     def _fill(
         self, template: str, node: Node, artifact: Path | None,
@@ -442,7 +452,7 @@ class Engine:
             if token == "artifact":
                 if artifact is None:
                     raise RuntimeError("{artifact} 仅可用于有产物的叶子")
-                value: Any = str(artifact.resolve())
+                value: Any = self.artifacts.path(str(artifact))
             else:
                 scope, key = token.split(".", 1)
                 if scope == "tried":
@@ -451,7 +461,7 @@ class Engine:
                 elif scope == "input":
                     value = self._input_slot(node, key)
                 elif scope == "output":
-                    value = str((self.run_dir / refs[key]["path"]).resolve())
+                    value = self.artifacts.path(refs[key]["path"])
                 else:
                     raise RuntimeError(f"无效槽位 {token}")
             return shlex.quote(str(value)) if quote else str(value)
@@ -465,13 +475,12 @@ class Engine:
             return self.checkpoint.params[source.key]
         if source.kind == "ancestor_input":
             return self._input_slot(self.nodes[source.node_path], source.key)
-        return str((self.run_dir / self.refs[source.node_path][source.key]["path"]).resolve())
+        return self.artifacts.path(self.refs[source.node_path][source.key]["path"])
 
     def _typed_value(self, type_name: str, ref: dict[str, Any]) -> Any:
-        path = self.run_dir / ref["path"]
         if type_name == "path":
-            return str(path.resolve())
-        text = path.read_text(encoding="utf-8")
+            return self.artifacts.path(ref["path"])
+        text = self.artifacts.read_text(ref["path"])
         if type_name == "text":
             return text
         value = json.loads(text)

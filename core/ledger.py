@@ -8,7 +8,7 @@ import os
 import warnings
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def file_ref(run_dir: Path, path: Path) -> dict[str, Any]:
@@ -21,7 +21,8 @@ def file_ref(run_dir: Path, path: Path) -> dict[str, Any]:
 
 
 class Ledger:
-    def __init__(self, run_dir: Path) -> None:
+    def __init__(self, run_dir: Path, on_event: Callable[[dict[str, Any]], None] | None = None) -> None:
+        self.on_event = on_event
         self.run_dir = run_dir
         self.path = run_dir / "ledger.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,4 +88,6 @@ class Ledger:
             stream.flush()
             os.fsync(stream.fileno())
         self._seq += 1
+        if self.on_event:
+            self.on_event(payload)
         return payload["seq"]

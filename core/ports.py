@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Protocol
+from typing import Any, Callable, ClassVar, Protocol
+
+from .artifacts import ArtifactPort
 
 
 class PortError(RuntimeError):
@@ -96,3 +98,7 @@ class Ports:
     shell: ShellPort
     ai: AIPort | None = None
     human: HumanPort | None = None
+    artifacts: ArtifactPort | None = None
+    cwd: Path | None = None
+    check_cancel: Callable[[], None] | None = None
+    on_event: Callable[[dict[str, Any]], None] | None = None

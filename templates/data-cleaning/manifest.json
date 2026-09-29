@@ -1,0 +1,8 @@
+{
+  "id": "data-cleaning",
+  "version": "1.0.0",
+  "name": "CSV 数据清洗",
+  "description": "清除 CSV 中含空字段的行及重复行，生成有效行数和列名报告。适用于同结构 CSV 的重复清洗。",
+  "parameters": {"data_file": {"type": "path", "description": "输入 CSV 路径"}},
+  "outputs": {"report": "JSON，包含 rows 和 columns"}
+}

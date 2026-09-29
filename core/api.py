@@ -114,7 +114,7 @@ def _result_abandoned(graph: Any, run_dir: Path, abandoned: NodeAbandoned, check
 def run(graph: Any, params: dict[str, Any], ports: Ports, run_dir: str | Path) -> RunResult:
     directory = Path(run_dir)
     checkpoint = Checkpoint.create(directory, graph.pin, params)
-    ledger = Ledger(directory)
+    ledger = Ledger(directory, ports.on_event)
     ledger.append(
         "run_start",
         pin=graph.pin,
@@ -146,7 +146,7 @@ def resume(graph: Any, ports: Ports, run_dir: str | Path) -> RunResult:
     root = checkpoint.entry(graph.node.path)
     if root and root.get("status") in {"succeeded", "failed"}:
         raise CheckpointError("run 已是终态，不可 resume")
-    ledger = Ledger(directory)
+    ledger = Ledger(directory, ports.on_event)
     ledger.append("run_resumed", pin=graph.pin)
     engine = Engine(graph, ports, directory, checkpoint, ledger)
     try:

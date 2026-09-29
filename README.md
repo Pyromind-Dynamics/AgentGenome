@@ -42,6 +42,12 @@ agentgenome status <run-id>
 
 可运行示例见 `templates/data-cleaning/`（图 + 脚本）。
 
+## SDK Pi 插件（v1）
+
+新增共享任务包管理、SQLite 运行登记和 `genome_*` 工具入口。固定脚本与产物访问通过宿主注入的接口完成；SDK 接入时使用 SDK 当前会话的执行环境。现有 CLI 与图内核保持可用。
+
+安装、发布和接口说明见 [SDK v1 接入](docs/sdk-v1.md)。
+
 ## 引用 / Citation
 
 如果你在研究中使用了 AgentGenome，请引用。配套论文发表后，此处会更新为论文的
