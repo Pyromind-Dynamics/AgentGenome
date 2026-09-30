@@ -3,7 +3,7 @@ const asset = { asset_id: string, version: string };
 const tools = [
   ["list", "List latest published historical experiences (历史经验): reusable graphs with fixed scripts. For execution tasks, check these before choosing a Skill; compare applicability with genome_get.", {}, []],
   ["get", "Read a historical experience graph's inputs, expected outputs and applicability before reusing it.", asset, ["asset_id", "version"]],
-  ["run", "Reuse a historical experience graph with explicit inputs. Preserve input paths exactly as verified with host file tools, including any path prefix. Returns a run ID; SDK executes after this turn. Do not also execute its scripts yourself.", { ...asset, params: { type: "object", additionalProperties: true } }, ["asset_id", "version", "params"]],
+  ["run", "Reuse a historical experience graph with explicit inputs. Preserve input paths exactly as verified with host file tools, including any path prefix. Returns a run ID immediately. Execution continues in the background after this turn yields; completion automatically returns results to you for a follow-up turn. Tell the user it was submitted, not completed. End this turn without polling; do not also execute its scripts yourself.", { ...asset, params: { type: "object", additionalProperties: true } }, ["asset_id", "version", "params"]],
   ["status", "Read progress and results of a historical experience run in this conversation.", { run_id: string }, ["run_id"]],
   ["cancel", "Request cancellation of a historical experience run in this conversation.", { run_id: string }, ["run_id"]],
 ];
