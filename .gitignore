@@ -7,3 +7,5 @@ runs/
 
 build/
 dist/
+pi-extension/python/*.whl
+pi-extension/*.tgz

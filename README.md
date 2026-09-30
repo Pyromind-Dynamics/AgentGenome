@@ -42,11 +42,11 @@ agentgenome status <run-id>
 
 可运行示例见 `templates/data-cleaning/`（图 + 脚本）。
 
-## SDK Pi 插件（v1）
+## Pi 插件（0.2.0）
 
-新增共享任务包管理、SQLite 运行登记和 `genome_*` 工具入口。固定脚本与产物访问通过宿主注入的接口完成；SDK 接入时使用 SDK 当前会话的执行环境。现有 CLI 与图内核保持可用。
+插件自带 `genome_*` 工具、Python 环境初始化和本地服务连接，无需修改 Pi 或依赖 SDK。多个 Pi 窗口共享资产，运行按会话隔离；执行完成后自动续聊。SDK 接入时使用可选宿主适配，继续由 SDK 管理沙箱、权限和结果通知。现有 CLI 与图内核保持可用。
 
-安装、发布和接口说明见 [SDK v1 接入](docs/sdk-v1.md)。
+原生 Pi 安装与 CSV 示例见 [插件指南](pi-extension/README.md)，SDK 接入见 [SDK v1 接入](docs/sdk-v1.md)。插件仅支持固定脚本流程；服务重启不自动重放脚本，与 CLI 的显式 resume 区分。
 
 ## 引用 / Citation
 

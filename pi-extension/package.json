@@ -1,6 +1,6 @@
 {
   "name": "@agentgenome/pi-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
@@ -13,6 +13,11 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "native-client.js",
+    "native-extension.js",
+    "host-discovery.js",
+    "python/",
+    "README.md",
     "LICENSE"
   ],
   "pi": {
@@ -24,7 +29,8 @@
     "@earendil-works/pi-coding-agent": "0.84.2"
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "prepack": "node scripts/build-python.js"
   },
   "license": "MIT"
 }

@@ -25,7 +25,9 @@ SDK 中的等价命令是 `./start_inference.sh --test-agentgenome` 和 `./start
 
 ## 第一版接口
 
-`createGenomeExtension(host)` 注册 `genome_list/get/run/status/cancel`。`host.invoke(action, arguments, callId, signal)` 由 SDK 注入。启动返回运行 ID，不等待脚本完成。
+SDK 通过 Pi 标准 `additionalExtensionPaths` 加载已安装包，与原生 Pi 使用同一个默认入口。插件通过 `pi.events` 发现宿主；SDK 只用 `provideGenomeHost` 提供通信能力，不再调用扩展工厂或注册 `genome_*` 工具。启动前校验宿主发现结果，失败不回退到本机执行。Python 操作分发由 `agentgenome.dispatch.invoke` 提供。启动返回运行 ID，不等待脚本完成。
+
+默认插件入口支持原生 Pi：安装、初始化 Python 环境和多窗口共享服务见 [插件说明](../pi-extension/README.md)。SDK 通过上述宿主发现接入，沙箱、产品事件和完成通知留在 SDK；不会启动本地服务或回退到本机执行。
 
 Python `GenomeService` 管理共享资产与运行；`Host.prepare(...)` 返回执行端口和解析后的参数。`Ports.shell` 执行命令，`Ports.artifacts` 提供产物路径、摘要和小型验收结果。默认文件端口保留现有 CLI 行为。SDK 通过已安装的 Python wheel 和 npm 包接入，不需要引用此仓库的源码目录。
 
@@ -52,4 +54,4 @@ SQLite 记录资产索引、运行摘要和请求回执；`runs/<id>/checkpoint.
 - 每个会话最多一个活动图；重复请求返回同一运行，重复请求 ID 配不同参数会报错。
 - 一份 SQLite 同时只能由一个 SDK 执行宿主持有；资产可统一管理，运行按会话隔离。当前支持 Linux/macOS。
 - 取消只有在宿主确认命令停止后才标记 `cancelled`。连接中断、取消未确认等情况标记 `interrupted`，不自动重放。再次运行前须确认外部命令和副作用。
-- 重启后可查历史，但不自动续跑。Pi 节点、脚本修复、轨迹提炼和原生 Pi 独立安装留给后续版本。
+- 重启后可查历史，但不自动续跑。Pi 节点、脚本修复和轨迹提炼留给后续版本。

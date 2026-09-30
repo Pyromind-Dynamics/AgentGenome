@@ -1,3 +1,7 @@
+import { nativeHost } from "./native-extension.js";
+import { discoverGenomeHost } from "./host-discovery.js";
+export { GENOME_HOST_CHANNEL, provideGenomeHost, createBridgeHost } from "./host-discovery.js";
+
 const string = { type: "string", minLength: 1 };
 const asset = { asset_id: string, version: string };
 const tools = [
@@ -18,8 +22,8 @@ export function createGenomeExtension(host) {
       pi.registerTool({
         name: `genome_${action}`, label: `历史经验 ${action}`, description,
         parameters: { type: "object", properties, required, additionalProperties: false },
-        async execute(callId, args, signal) {
-          const result = await host.invoke(action, args, callId, signal);
+        async execute(callId, args, signal, _onUpdate, ctx) {
+          const result = await host.invoke(action, args, callId, signal, ctx);
           return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
         },
       });
@@ -27,6 +31,7 @@ export function createGenomeExtension(host) {
   };
 }
 
-export default function () {
-  throw new Error("AgentGenome v1 requires a host execution bridge. Load createGenomeExtension(host) from the SDK.");
+export default function agentGenome(pi) {
+  const host = discoverGenomeHost(pi.events);
+  createGenomeExtension(host ?? nativeHost(pi))(pi);
 }
