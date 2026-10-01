@@ -1,0 +1,31 @@
+version: "gt/1.0"
+node:
+  id: clean-report
+  mode: sequence
+  input:
+    data_file: {type: path, from: params.data_file}
+    delimiter: {type: text, from: params.delimiter}
+  output:
+    report: {type: json, compose: [report.output.report]}
+  verify:
+    - metric: "report.rows > 0"
+  children:
+    - id: clean
+      input:
+        data_file: {type: path, from: clean-report.input.data_file}
+        delimiter: {type: text, from: clean-report.input.delimiter}
+      do: {run: "python3 scripts/clean.py {input.data_file} {input.delimiter} > {artifact}"}
+      output:
+        cleaned: {type: path}
+      verify:
+        - run: "test -s {artifact}"
+    - id: report
+      input:
+        cleaned: {type: path, from: clean.output.cleaned}
+      do:
+        llm: "读取清洗后的 CSV {input.cleaned}，将 JSON 报告写入 {artifact}。包含 rows（行数）、columns（列名列表）、summary（解释当前数据情况，不臆造输入数据统计）。写完提交本阶段的 genome_step_result，再结束本轮。"
+      output:
+        report: {type: json}
+      verify:
+        - run: "python3 scripts/verify_report.py {artifact} {input.cleaned}"
+        - run: "python3 scripts/judge.py prompts/report-quality.txt {artifact}"

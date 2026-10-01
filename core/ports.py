@@ -100,5 +100,7 @@ class Ports:
     human: HumanPort | None = None
     artifacts: ArtifactPort | None = None
     cwd: Path | None = None
+    verification_cwd: Path | None = None
     check_cancel: Callable[[], None] | None = None
     on_event: Callable[[dict[str, Any]], None] | None = None
+    agent_task: Callable[[dict[str, Any]], str] | None = None

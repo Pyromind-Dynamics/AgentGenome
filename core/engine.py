@@ -285,7 +285,7 @@ class Engine:
 
     def _ai_work(self, prompt: str, node: Node, attempt: int) -> int:
         ai = self.ports.ai
-        if ai is None:
+        if ai is None and self.ports.agent_task is None:
             error = PortError("未注入 ai 端口")
             self.ledger.append(
                 "port_error", node=node.path, attempt=attempt,
@@ -294,7 +294,18 @@ class Engine:
             raise error
         started = time.monotonic()
         try:
-            response = ai.work(prompt)
+            if self.ports.agent_task is not None:
+                response = self.ports.agent_task({
+                    "node_id": node.path, "attempt": attempt, "prompt": prompt,
+                    "inputs": {key: self._input_slot(node, key) for key in node.input},
+                    "resource_dir": str(self.ports.cwd or self.graph.package_dir),
+                    "verification_dir": str(self.ports.verification_cwd) if self.ports.verification_cwd else None,
+                    "expected_outputs": [self.artifacts.path(str(self._artifact_path(node)))],
+                    "constraints": "Write declared outputs, then call genome_step_result and end this turn. Do not modify verification resources or start another graph.",
+                })
+            else:
+                assert ai is not None
+                response = ai.work(prompt)
         except PortError as exc:
             self.ledger.append(
                 "port_error", node=node.path, attempt=attempt,
@@ -417,8 +428,9 @@ class Engine:
             if self.ports.check_cancel:
                 self.ports.check_cancel()
             if self.ports.on_event:
-                self.ports.on_event({"event": "command_started", "node": node.path, "command": command})
-            result = self.ports.shell.execute(command, self.ports.cwd or self.graph.package_dir)
+                self.ports.on_event({"event": "command_started" if event == "call_shell" else "verification_started", "node": node.path, "command": command})
+            cwd = self.ports.verification_cwd if event != "call_shell" else None
+            result = self.ports.shell.execute(command, cwd or self.ports.cwd or self.graph.package_dir)
             if self.ports.check_cancel:
                 self.ports.check_cancel()
         except PortError as exc:

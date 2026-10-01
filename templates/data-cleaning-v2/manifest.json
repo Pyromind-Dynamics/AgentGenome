@@ -1,0 +1,17 @@
+{
+  "id": "data-cleaning-v2",
+  "version": "1.0.0",
+  "name": "CSV 清洗与解释报告",
+  "description": "清洗含重复行、空字段的 CSV；Agent 解释统计结果，脚本和模型共同验收。需要支持 Agent 节点、模型验收及只读验收目录的宿主。",
+  "parameters": {
+    "data_file": {"type": "path", "description": "CSV 输入文件路径"},
+    "delimiter": {"type": "string", "description": "字段分隔符，例如逗号或分号"}
+  },
+  "requires": ["agent_task", "model_judge", "protected_verification"],
+  "expected_outputs": {"report": "含 rows、columns、summary 的 JSON 报告；清洗数据保留在 clean 节点产物中"},
+  "revision": {
+    "safe_to_rerun": true,
+    "editable_scripts": ["scripts/clean.py"],
+    "verification_resources": ["scripts/verify_report.py", "scripts/judge.py", "prompts/report-quality.txt"]
+  }
+}

@@ -19,7 +19,7 @@ from .local_host import LocalExecutionHost
 from .service import GenomeService
 
 PROTOCOL = 1
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ACTIVE = {"queued", "running", "cancelling"}
 
 
@@ -86,6 +86,7 @@ class LocalService:
         request_id = message.get("request_id", message["id"])
         if action in {"run", "validate"}:
             if action == "validate":
+                self.service.check_capabilities(args["asset_id"], args["version"], set())
                 result = self.service.submit(scope, request_id, args["asset_id"], args["version"],
                                              args["params"], allow_draft=True)
             else:

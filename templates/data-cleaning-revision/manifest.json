@@ -1,0 +1,29 @@
+{
+  "id": "data-cleaning",
+  "version": "1.1.0",
+  "name": "CSV 数据清洗",
+  "description": "清洗 CSV 中的重复行和空字段，生成清洗数据及统计报告；需明确提供分隔符，支持一次业务脚本或参数修订。",
+  "parameters": {
+    "data_file": {
+      "type": "path",
+      "description": "输入 CSV 路径"
+    },
+    "delimiter": {
+      "type": "string",
+      "description": "输入 CSV 的单字符分隔符，例如逗号 , 或分号 ;；清洗输出统一为逗号 CSV。"
+    }
+  },
+  "outputs": {
+    "report": "JSON，包含 rows 和 columns"
+  },
+  "revision": {
+    "safe_to_rerun": true,
+    "editable_scripts": [
+      "scripts/clean.py",
+      "scripts/summarize.py"
+    ],
+    "verification_resources": [
+      "scripts/verify_report.py"
+    ]
+  }
+}

@@ -59,7 +59,7 @@ def handshake(graph: Any, ports: Ports) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     for need, port in (("llm", ports.ai), ("human", ports.human)):
         node = first_node(need)
-        if node is not None and port is None:
+        if node is not None and port is None and not (need == "llm" and ports.agent_task):
             diagnostics.append(
                 Diagnostic("E_NEEDS_PORT_ABSENT", node, f"节点需要 {need} 端口，但未注入")
             )

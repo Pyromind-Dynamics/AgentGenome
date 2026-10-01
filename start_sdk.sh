@@ -12,9 +12,10 @@ if [[ $# -gt 0 ]]; then shift; fi
 case "${mode}" in
   -h|--help|help)
     cat <<'HELP'
-Usage: ./start_sdk.sh [test|start]
+Usage: ./start_sdk.sh [test|test-revision|start]
   test   Run two CSV batches in SDK's Pi OS sandbox, then publish data-cleaning.
          No model key, DataFlow runtime or business platform is needed.
+  test-revision  Validate legacy CSV revision, regression cases and automatic latest publication.
   start  Start the SDK server with the AgentGenome plugin enabled.
 
 Environment:
@@ -27,7 +28,7 @@ independent AgentGenome service. For source changes, rebuild SDK's pinned
 wheel/npm package first; see docs/sdk-v1.md.
 HELP
     exit 0 ;;
-  test|start) ;;
+  test|test-revision|start) ;;
   *) echo "Unknown mode: ${mode}; use --help." >&2; exit 2 ;;
 esac
 if [[ $# -ne 0 ]]; then
@@ -83,9 +84,15 @@ export PYROMIND_PI_RUNTIME="${pi_runtime}/dist/index.js"
 echo "Validating with SDK Pi os-sandbox (no model calls)."
 echo "Shared assets: ${AGENTGENOME_HOME}"
 echo "Stop any SDK instance using this registry before continuing."
+template="${AGENTGENOME_DIR}/templates/data-cleaning"
+validation_args=()
+if [[ "${mode}" == "test-revision" ]]; then
+  template="${AGENTGENOME_DIR}/templates/data-cleaning"
+  validation_args+=(--test-revisions)
+fi
 uv run --no-sync python scripts/validate_agentgenome.py \
-  --template "${AGENTGENOME_DIR}/templates/data-cleaning" \
+  --template "${template}" \
   --home "${AGENTGENOME_HOME}" \
-  --workspace "${WORKSPACE_DIR}/genome-validation"
-echo "Validation passed: both batches succeeded; data-cleaning 1.0.0 is published."
+  --workspace "${WORKSPACE_DIR}/genome-validation" "${validation_args[@]}"
+echo "Validation passed; the validated data-cleaning version is published."
 echo "Next: ${AGENTGENOME_DIR}/start_sdk.sh start"

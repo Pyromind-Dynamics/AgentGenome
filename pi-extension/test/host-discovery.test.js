@@ -19,7 +19,7 @@ test("same default entry discovers a host without native execution or notificati
   const binding = provideGenomeHost(h.events, async (...args) => { requests.push(args); return { id: "hosted", status: "queued" }; });
   agentGenome(h.pi);
   assert.equal(binding.discovered, true);
-  assert.equal(h.tools.length, 5);
+  assert.equal(h.tools.length, 8);
   assert.deepEqual(h.hooks, ["before_agent_start"]);
   assert.deepEqual(h.commands, []);
   await h.tools.find((tool) => tool.name === "genome_run").execute("call", { params: {} });

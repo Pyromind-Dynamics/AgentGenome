@@ -40,12 +40,12 @@ test("default entry loads standalone; SDK factory registers no native lifecycle"
   const hooks = [], tools = [], commands = [];
   const pi = { events: { emit() {} }, on: (name) => hooks.push(name), registerTool: (tool) => tools.push(tool.name), registerCommand: (name) => commands.push(name) };
   agentGenome(pi);
-  assert.equal(tools.length, 5);
+  assert.equal(tools.length, 8);
   assert.deepEqual(commands, ["genome"]);
   assert.ok(hooks.includes("session_start"));
   hooks.length = tools.length = commands.length = 0;
   createGenomeExtension(createBridgeHost(async () => {}))(pi);
-  assert.equal(tools.length, 5);
+  assert.equal(tools.length, 8);
   assert.deepEqual(hooks, ["before_agent_start"]);
   assert.equal(commands.length, 0);
 });

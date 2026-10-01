@@ -42,6 +42,7 @@ def main():
         service.claim_execution_owner()
         try:
             service.recover()
+            service.check_capabilities(args.asset_id, args.version, set())
             state = service.submit("local-validation", uuid4().hex, args.asset_id, args.version,
                                    json.loads(args.params), allow_draft=True)
             result = service.execute("local-validation", state["id"], LocalHost(service.root), lambda event: None)
