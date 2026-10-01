@@ -5,7 +5,7 @@ import pytest
 
 from adapters import LocalShell
 from agentgenome.cli import LocalHost
-from agentgenome.service import GenomeService
+from agentgenome.service import GenomeService, RunCancelled
 from core.artifacts import LocalArtifacts
 from core.ports import Ports
 
@@ -105,3 +105,24 @@ def test_registry_has_one_execution_owner(catalog):
         catalog.release_execution_owner()
     other.claim_execution_owner()
     other.release_execution_owner()
+
+
+@pytest.mark.parametrize("cancelled,confirmed", [(False, False), (True, False), (True, True)])
+def test_preparation_interruption_preserves_stop_evidence(catalog, tmp_path, cancelled, confirmed):
+    state = submit(catalog, tmp_path / "data.csv")
+    evidence = {"execution_id": "remote-1", "phase": "starting",
+                "started": False, "stopped": confirmed, "error_code": "startup_timeout"}
+
+    class Host:
+        def prepare(self, run_id, package, params, paths, cancel, emit):
+            emit({"event": "execution", "execution": evidence})
+            if cancelled:
+                cancel.set()
+            if confirmed:
+                raise RunCancelled()
+            raise RuntimeError("Execution infrastructure interrupted: startup_timeout")
+
+    result = catalog.execute("validation", state["id"], Host(), lambda _: None)
+    assert result["status"] == ("cancelled" if confirmed else "interrupted")
+    assert result["result"]["execution"] == {"log_tail": "", **evidence}
+    assert not (catalog.root / "runs" / state["id"] / "checkpoint.json").exists()

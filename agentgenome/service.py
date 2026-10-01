@@ -295,6 +295,8 @@ class GenomeService:
             if cancel.is_set():
                 raise RunCancelled()
         def event(payload: dict[str, Any]) -> Any:
+            if isinstance(payload.get("execution"), dict):
+                execution_evidence.update(payload["execution"])
             if payload.get("command"):
                 execution_evidence.update(command=payload['command'], node=payload.get('node'))
             if payload.get("rc") is not None:
@@ -371,7 +373,7 @@ class GenomeService:
             details["instruction"] = RECOVERY_INSTRUCTION
         with self._lock, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            if cancel.is_set():
+            if cancel.is_set() and status != "interrupted":
                 status = "cancelled"
             if status == "succeeded" and promotion:
                 try:
