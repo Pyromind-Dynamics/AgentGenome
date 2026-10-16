@@ -45,8 +45,8 @@ def validate_cases(cases):
         if not isinstance(case['assertions'], list) or not case['assertions']:
             raise ValueError('each case requires expected output assertions')
         for assertion in case['assertions']:
-            if not isinstance(assertion, dict) or set(assertion) != {'node', 'output', 'kind', 'expected'} or assertion['kind'] not in {'json', 'csv', 'text'}:
-                raise ValueError('assertion requires node, output, kind (json/csv/text), expected')
+            if not isinstance(assertion, dict) or set(assertion) != {'node', 'output', 'kind', 'expected'} or assertion['kind'] not in {'json', 'csv', 'text', 'hash'}:
+                raise ValueError('assertion requires node, output, kind (json/csv/text/hash), expected')
     return cases
 
 
@@ -108,16 +108,19 @@ class Regressions:
         for assertion in case['assertions']:
             try:
                 artifact = nodes[assertion['node']]['outputs'][assertion['output']]
-                text = ports.artifacts.read_text(artifact['path'])
                 kind, expected = assertion['kind'], assertion['expected']
-                if kind == 'json':
-                    value = json.loads(text)
-                    matched = (all(value.get(k) == v for k, v in expected.items())
-                               if isinstance(value, dict) and isinstance(expected, dict) else value == expected)
-                elif kind == 'csv':
-                    matched = list(csv.reader(io.StringIO(text))) == expected
+                if kind == 'hash':
+                    matched = artifact['sha256'] == expected
                 else:
-                    matched = text == expected
+                    text = ports.artifacts.read_text(artifact['path'])
+                    if kind == 'json':
+                        value = json.loads(text)
+                        matched = (all(value.get(k) == v for k, v in expected.items())
+                                   if isinstance(value, dict) and isinstance(expected, dict) else value == expected)
+                    elif kind == 'csv':
+                        matched = list(csv.reader(io.StringIO(text))) == expected
+                    else:
+                        matched = text == expected
                 if not matched:
                     raise RegressionFailure(f"case {case['id']}: {assertion['node']}.{assertion['output']} does not match expected {kind}")
             except (KeyError, TypeError, json.JSONDecodeError) as exc:

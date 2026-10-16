@@ -1,6 +1,6 @@
 {
   "name": "@agentgenome/pi-extension",
-  "version": "0.3.0",
+  "version": "0.6.13",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
@@ -16,6 +16,7 @@
     "native-client.js",
     "native-extension.js",
     "host-discovery.js",
+    "session-trace.js",
     "python/",
     "README.md",
     "LICENSE"
@@ -26,7 +27,7 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.2"
+    "@earendil-works/pi-coding-agent": "0.84.2 || 0.87.0"
   },
   "scripts": {
     "test": "node --test test/*.test.js",

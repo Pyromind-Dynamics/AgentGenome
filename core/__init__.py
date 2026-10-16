@@ -14,11 +14,13 @@ from .ports import (
     ShellPort,
     ShellResult,
     ShellUnavailable,
+    ToolPort,
+    ToolResult,
 )
 
 __all__ = [
     "run", "resume", "handshake", "RunResult", "RunStatus", "Diagnostic",
     "CheckpointError", "Ports", "ShellPort", "ShellResult", "AIPort",
     "HumanPort", "JudgeResult", "Answer", "FailDecl", "Candidate",
-    "PortError", "ShellUnavailable",
+    "PortError", "ShellUnavailable", "ToolPort", "ToolResult",
 ]

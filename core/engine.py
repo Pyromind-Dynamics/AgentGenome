@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import shlex
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,7 +26,11 @@ if TYPE_CHECKING:
 from .artifacts import LocalArtifacts
 from .checkpoint import Checkpoint
 from .ledger import Ledger
-from .ports import Answer, Candidate, FailDecl, JudgeResult, PortError, Ports, ShellResult
+from .ports import (Answer, Candidate, FailDecl, JudgeResult, PortError, Ports,
+                    ShellResult, ToolResult)
+
+_SLOT = re.compile(r"\{(artifact|tried\.[^{}]+|(?:input|output)\.[^{}]+)\}")
+_EXACT_SLOT = re.compile(r"\{(artifact|tried\.[^{}]+|(?:input|output)\.[^{}]+)\}\Z")
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,16 @@ class NodeAbandoned(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class NodeWaiting(Exception):
+    """A human node parked: the run stops here and continues when the answer arrives."""
+
+    def __init__(self, node: str, question: str, artifact: str) -> None:
+        self.node = node
+        self.question = question
+        self.artifact = artifact
+        super().__init__(question)
 
 
 class Engine:
@@ -78,8 +94,8 @@ class Engine:
             return refs
         if entry and entry.get("status") == "failed":
             raise NodeFailed(Failure(node.path, "do", 0, "该节点已在断点中失败"))
-        if entry and entry.get("status") == "abandoned":
-            self.checkpoint.reenter_abandoned(node.path)
+        if entry and entry.get("status") in {"abandoned", "waiting"}:
+            self.checkpoint.reenter(node.path)
             entry = self.checkpoint.entry(node.path)
 
         retries = entry.get("retries", 0) if entry else 0
@@ -88,6 +104,13 @@ class Engine:
             self.ledger.append("node_enter", node=node.path, attempt=attempt)
             try:
                 refs = self._attempt(node, attempt)
+            except NodeWaiting as waiting:
+                self.checkpoint.mark_waiting(node.path, retries)
+                self.ledger.append(
+                    "node_waiting", node=node.path, attempt=attempt,
+                    question=self.ledger.log_ref("question", waiting.question),
+                )
+                raise
             except NodeAbandoned as abandoned:
                 self.checkpoint.mark_abandoned(node.path, retries)
                 self.ledger.append(
@@ -177,9 +200,13 @@ class Engine:
     def _attempt(self, node: Node, attempt: int) -> dict[str, dict[str, Any]]:
         if node.danger:
             self._danger_gate(node, attempt)
-        if node.do is not None:
+        if node.do is not None or node.tool is not None:
             artifact = self._artifact_path(node)
-            if node.do_kind == "llm":
+            if node.tool is not None:
+                seq = self._call_tool(node, artifact, attempt)
+            elif node.do_kind == "human":
+                seq = self._human_work(node, artifact, attempt)
+            elif node.do_kind == "llm":
                 prompt = self._fill(node.do, node, artifact, quote=False)
                 seq = self._ai_work(prompt, node, attempt)
             else:
@@ -195,7 +222,8 @@ class Engine:
             refs = self._try_children(node) if node.mode == "try" else self._sequence_children(node)
 
         for index, rule in enumerate(node.verify):
-            failure = self._verify(rule, index, node, attempt, refs, artifact if node.do is not None else None)
+            leaf = node.do is not None or node.tool is not None
+            failure = self._verify(rule, index, node, attempt, refs, artifact if leaf else None)
             if failure:
                 raise NodeFailed(failure)
         return refs
@@ -251,13 +279,23 @@ class Engine:
         )
         return chosen
 
+    def _declaration(self, node: Node, artifact: Path | None) -> Any:
+        """What a leaf is about to run, for the danger gate's evidence."""
+        if node.tool is not None:
+            return {"tool": node.tool.name,
+                    "args": self._fill_json(dict(node.tool.args), node, artifact)}
+        if node.do_kind == "llm":
+            return self._fill(node.do, node, artifact, quote=False)
+        return self._fill(node.do, node, artifact)
+
     def _danger_gate(self, node: Node, attempt: int) -> None:
         human = self.ports.human
         if human is None:
             self._verify_port_error("human", node, attempt, "未注入 human 端口")
         assert human is not None
-        artifact = self._artifact_path(node) if node.do is not None else None
-        execution = self._fill(node.do, node, artifact, quote=node.do_kind != "llm") if node.do else None
+        leaf = node.do is not None or node.tool is not None
+        artifact = self._artifact_path(node) if leaf else None
+        execution = self._declaration(node, artifact) if leaf else None
         evidence = {
             "node": node.path,
             "execution": execution,
@@ -451,7 +489,103 @@ class Engine:
         return result, seq
 
     def _artifact_path(self, node: Node) -> Path:
-        return Path("artifacts") / f"{node.path.replace('.', '--')}.out"
+        return Path("artifacts") / (
+            f"{node.path.replace('.', '--')}{node.artifact_ext or '.out'}"
+        )
+
+    def _call_tool(self, node: Node, artifact: Path, attempt: int) -> int:
+        """Run a fixed host tool call and materialize its result as the node artifact."""
+        port = self.ports.tool
+        if port is None:
+            self._verify_port_error("tool", node, attempt, "未注入 tool 端口")
+        assert port is not None and node.tool is not None
+        arguments = self._fill_json(dict(node.tool.args), node, artifact)
+        started = time.monotonic()
+        try:
+            if self.ports.check_cancel:
+                self.ports.check_cancel()
+            result = port.call(node.tool.name, arguments)
+            if not isinstance(result, ToolResult):
+                raise PortError("ToolPort.call 返回不符合协议", kind="bad_output")
+            if self.ports.check_cancel:
+                self.ports.check_cancel()
+        except PortError as exc:
+            self.ledger.append(
+                "port_error", node=node.path, attempt=attempt,
+                port="tool", kind=exc.kind, message=str(exc),
+            )
+            raise
+        payload = dict(result.result) or {"text": result.text}
+        self.artifacts.write_text(
+            str(artifact), json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        )
+        seq = self.ledger.append(
+            "call_tool", node=node.path, attempt=attempt, tool=node.tool.name,
+            arguments=arguments, is_error=result.is_error, message=result.text,
+            artifact=self.artifacts.describe(str(artifact)),
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        if result.is_error:
+            raise NodeFailed(
+                Failure(node.path, "do", seq,
+                        result.text or f"工具 {node.tool.name} 返回错误")
+            )
+        return seq
+
+    def _human_work(self, node: Node, artifact: Path, attempt: int) -> int:
+        """A human step: the question is the work order, the artifact is their output.
+
+        A pending answer parks the run instead of failing it, so the person can take
+        as long as they need; the node is re-entered on resume and asks again.
+        """
+        human = self.ports.human
+        if human is None:
+            self._verify_port_error("human", node, attempt, "未注入 human 端口")
+        assert human is not None
+        question = self._fill(node.do, node, artifact, quote=False)
+        evidence = {
+            "node": node.path,
+            "artifact": self.artifacts.path(str(artifact)),
+            "inputs": {key: self._input_slot(node, key) for key in node.input},
+            "outputs": sorted(node.output),
+        }
+        started = time.monotonic()
+        try:
+            answer = human.ask(question, evidence)
+            if (not isinstance(answer, Answer) or not isinstance(answer.approve, bool)
+                    or (not answer.approve and not answer.feedback and not answer.pending)):
+                raise PortError("HumanPort.ask 返回不符合协议", kind="bad_output")
+        except PortError as exc:
+            self._verify_port_error("human", node, attempt, str(exc), exc.kind)
+        seq = self.ledger.append(
+            "call_human", node=node.path, attempt=attempt,
+            question=self.ledger.log_ref("question", question), evidence=evidence,
+            approve=answer.approve, feedback=answer.feedback, pending=answer.pending,
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
+        if answer.pending:
+            raise NodeWaiting(node.path, question, evidence["artifact"])
+        if not answer.approve:
+            raise NodeAbandoned(answer.feedback or "人拒绝人工节点")
+        return seq
+
+    def _slot_value(
+        self, token: str, node: Node, artifact: Path | None,
+        refs: dict[str, dict[str, Any]],
+    ) -> Any:
+        if token == "artifact":
+            if artifact is None:
+                raise RuntimeError("{artifact} 仅可用于有产物的叶子")
+            return self.artifacts.path(str(artifact))
+        scope, key = token.split(".", 1)
+        if scope == "tried":
+            candidate, field = key.split(".", 1)
+            return getattr(self.tried[candidate], field)
+        if scope == "input":
+            return self._input_slot(node, key)
+        if scope == "output":
+            return self.artifacts.path(refs[key]["path"])
+        raise RuntimeError(f"无效槽位 {token}")
 
     def _fill(
         self, template: str, node: Node, artifact: Path | None,
@@ -460,26 +594,26 @@ class Engine:
         refs = refs or self.refs.get(node.path, {})
 
         def replacement(match: Any) -> str:
-            token = match.group(1)
-            if token == "artifact":
-                if artifact is None:
-                    raise RuntimeError("{artifact} 仅可用于有产物的叶子")
-                value: Any = self.artifacts.path(str(artifact))
-            else:
-                scope, key = token.split(".", 1)
-                if scope == "tried":
-                    candidate, field = key.split(".", 1)
-                    value = getattr(self.tried[candidate], field)
-                elif scope == "input":
-                    value = self._input_slot(node, key)
-                elif scope == "output":
-                    value = self.artifacts.path(refs[key]["path"])
-                else:
-                    raise RuntimeError(f"无效槽位 {token}")
+            value = self._slot_value(match.group(1), node, artifact, refs)
             return shlex.quote(str(value)) if quote else str(value)
 
-        import re
-        return re.sub(r"\{(artifact|tried\.[^{}]+|(?:input|output)\.[^{}]+)\}", replacement, template)
+        return _SLOT.sub(replacement, template)
+
+    def _fill_json(self, value: Any, node: Node, artifact: Path | None) -> Any:
+        """Resolve a tool call's args: an exact slot keeps its JSON type, the rest interpolate."""
+        if isinstance(value, str):
+            exact = _EXACT_SLOT.fullmatch(value)
+            if exact is not None:
+                return self._slot_value(
+                    exact.group(1), node, artifact, self.refs.get(node.path, {})
+                )
+            return self._fill(value, node, artifact, quote=False)
+        if isinstance(value, Mapping):
+            return {str(key): self._fill_json(item, node, artifact)
+                    for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._fill_json(item, node, artifact) for item in value]
+        return value
 
     def _input_slot(self, node: Node, key: str) -> Any:
         source = node.input[key].source

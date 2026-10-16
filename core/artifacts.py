@@ -10,6 +10,7 @@ class ArtifactPort(Protocol):
     def path(self, name: str) -> str: ...
     def describe(self, name: str) -> dict[str, Any]: ...
     def read_text(self, name: str) -> str: ...
+    def write_text(self, name: str, text: str) -> None: ...
 
 
 class LocalArtifacts:
@@ -26,3 +27,8 @@ class LocalArtifacts:
 
     def read_text(self, name: str) -> str:
         return (self.root / name).read_text(encoding="utf-8")
+
+    def write_text(self, name: str, text: str) -> None:
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")

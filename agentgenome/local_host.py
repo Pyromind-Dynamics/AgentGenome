@@ -11,10 +11,11 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+from adapters.terminal_human import TerminalHuman
 from core.artifacts import LocalArtifacts
-from core.ports import Ports, ShellResult, ShellUnavailable
+from core.ports import Ports, ShellResult, ShellUnavailable, ToolResult
 from .service import RunCancelled
 
 
@@ -82,14 +83,44 @@ class NativeArtifacts(LocalArtifacts):
         return data.decode("utf-8")
 
 
-class LocalExecutionHost:
-    def __init__(self, root: Path, cwd: Path) -> None:
-        self.root, self.cwd = root, cwd
+class LocalTool:
+    """A local host has no platform tools, so a tool node gets an echoed result.
 
-    def prepare(self, run_id, package, params, path_parameters, cancel, emit):
+    A local replay can only prove the node is fed the declared arguments and that the
+    result lands in the declared artifact; the call itself needs the real port, which
+    is why reuse runs on the host that owns the tool.
+    """
+
+    def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        return ToolResult(False, {"tool": name, "arguments": arguments}, f"{name} (local)")
+
+
+class LocalExecutionHost:
+    def __init__(self, root: Path, cwd: Path, human: Any = None) -> None:
+        self.root, self.cwd = root, cwd
+        self.human = human if human is not None else TerminalHuman()
+
+    def _target(self, path: str) -> Path:
+        target = Path(path).expanduser()
+        return target if target.is_absolute() else self.cwd / target
+
+    def read(self, path: str) -> bytes:
+        return self._target(path).read_bytes()
+
+    def head(self, path: str, limit: int) -> bytes:
+        with self._target(path).open("rb") as stream:
+            return stream.read(limit)
+
+    def prepare(self, run_id, package, params, path_parameters, cancel, emit,
+                **options):
+        # A local run asks its terminal human again on resume; `resuming` only tells
+        # a headless host which parked node the wakeup answers.
         directory = self.root / "runs" / run_id / "work"
         scripts = directory / "package"
-        shutil.copytree(package, scripts)
+        # A parked run keeps its work directory; resuming re-enters prepare and
+        # must reuse the package copy the parked attempt already validated.
+        if not scripts.exists():
+            shutil.copytree(package, scripts)
         from builder import package_pin
         if package_pin(scripts) != package_pin(package):
             raise ValueError("package changed while copying scripts")
@@ -98,4 +129,5 @@ class LocalExecutionHost:
             path = Path(values[key]).expanduser()
             values[key] = str((self.cwd / path).resolve())
         return Ports(shell=StreamingShell(cancel, emit), cwd=scripts,
-                     artifacts=NativeArtifacts(directory)), values
+                     artifacts=NativeArtifacts(directory), tool=LocalTool(),
+                     human=self.human), values

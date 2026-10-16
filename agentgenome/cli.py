@@ -13,7 +13,8 @@ class LocalHost:
     def __init__(self, root: Path):
         self.root = root
 
-    def prepare(self, run_id, package, params, path_parameters, cancel, emit):
+    def prepare(self, run_id, package, params, path_parameters, cancel, emit,
+                **options):
         return Ports(shell=LocalShell()), {
             key: str(Path(value).resolve()) if key in path_parameters else value
             for key, value in params.items()

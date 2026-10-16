@@ -20,15 +20,20 @@ from .models import (
     OutputRef,
     OutputSpec,
     SourceRef,
+    ToolCall,
     VerifyRule,
     freeze_mapping,
 )
 
 _ID = re.compile(r"^[a-z][a-z0-9_-]*$")
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SLOT = re.compile(r"\{(artifact|(?:input|output)\.[^{}]+)\}")
 _TRIED_SLOT = re.compile(r"\{tried\.([a-z][a-z0-9_-]*)\.(stage|reason|attempt)\}")
 _TYPES = {"text", "json", "path", "number", "bool"}
-_NEEDS = {"shell", "llm", "human"}
+_NEEDS = {"shell", "llm", "human", "tool"}
+_ARTIFACT_EXT = re.compile(r"[A-Za-z0-9]{1,12}")
+_DO_SHAPE = ("do 必须是 {run: <shell 字符串>}、{llm: <prompt 模板>}、"
+             "{tool: {name, args}} 或 {human: <问题模板>}")
 
 
 class _Compiler:
@@ -162,7 +167,10 @@ class _Compiler:
                 self.error("E_TRY_CANDIDATE", path, "try 的候选 output 声明必须同构")
         input_specs = self.inputs(inputs_raw, path, ancestors, prior_siblings)
         verifies = self.verifies(raw.get("verify"), path, output_specs)
-        command, do_kind = self.command(raw.get("do"), path) if has_do else (None, None)
+        command, do_kind, tool = (
+            self.command(raw.get("do"), path) if has_do else (None, None, None)
+        )
+        artifact_ext = self.artifact(raw.get("artifact"), path, is_leaf)
         retry, on_fail = self.on_fail(raw.get("on_fail"), path)
         needs = self.needs(raw, path)
 
@@ -186,6 +194,8 @@ class _Compiler:
         # Slots are checked after declarations have been inspected.
         if command is not None:
             self.slots(command, path, set(input_specs), set(output_specs), allow_artifact=True)
+        if tool is not None:
+            self.slots_value(dict(tool.args), path, set(input_specs), set(output_specs))
         for rule in verifies:
             if rule.kind in {"run", "llm", "human"}:
                 self.slots(rule.value, path, set(input_specs), set(output_specs), allow_artifact=True)
@@ -205,6 +215,8 @@ class _Compiler:
             danger,
             route,
             route_hint,
+            artifact_ext,
+            tool,
         )
 
     def tried_slots(self, children: list[Any], path: str, route: Any) -> None:
@@ -225,7 +237,7 @@ class _Compiler:
             if not isinstance(declared_raw, list) or any(
                 not isinstance(item, str) or item not in _NEEDS for item in declared_raw
             ):
-                self.error("E_NEEDS", path, "needs 必须是 shell/llm/human 的子集列表")
+                self.error("E_NEEDS", path, "needs 必须是 shell/llm/human/tool 的子集列表")
             else:
                 declared = set(declared_raw)
 
@@ -236,6 +248,10 @@ class _Compiler:
                 inferred.add("shell")
             elif "llm" in do:
                 inferred.add("llm")
+            elif "tool" in do:
+                inferred.add("tool")
+            elif "human" in do:
+                inferred.add("human")
         verify = raw.get("verify")
         if isinstance(verify, list):
             for rule in verify:
@@ -254,6 +270,22 @@ class _Compiler:
         if declared_raw is not None and missing:
             self.error("E_NEEDS", path, f"needs 声明缺少结构推导需求：{', '.join(sorted(missing))}")
         return frozenset(declared | inferred)
+
+    def artifact(self, raw: Any, path: str, is_leaf: bool) -> str | None:
+        """`{artifact}` 的后缀；读取方按扩展名选解析器，缺省 .out 保持兼容。"""
+        if raw is None:
+            return None
+        if not is_leaf:
+            self.error("E_ARTIFACT", path, "artifact 仅可声明在叶子 do 节点")
+            return None
+        if not isinstance(raw, dict) or set(raw) != {"ext"}:
+            self.error("E_ARTIFACT", path, "artifact 必须是 {ext: <后缀>}")
+            return None
+        ext = str(raw["ext"]).lstrip(".")
+        if not _ARTIFACT_EXT.fullmatch(ext):
+            self.error("E_ARTIFACT", path, "artifact.ext 必须是不带点的短后缀，例如 jsonl")
+            return None
+        return f".{ext.lower()}"
 
     def outputs(
         self, raw: dict[str, Any], path: str, is_group: bool, child_outputs: dict[str, Any]
@@ -358,15 +390,44 @@ class _Compiler:
         self.error("E_INPUT_FROM", path, f"无效输入来源 {value!r}")
         return None
 
-    def command(self, raw: Any, path: str) -> tuple[str | None, str | None]:
+    def command(self, raw: Any, path: str) -> tuple[str | None, str | None, ToolCall | None]:
         if not isinstance(raw, dict) or len(raw) != 1:
-            self.error("E_NODE_KIND", path, "do 必须是 {run: <shell 字符串>} 或 {llm: <prompt 模板>}")
-            return None, None
+            self.error("E_NODE_KIND", path, _DO_SHAPE)
+            return None, None, None
         kind, value = next(iter(raw.items()))
-        if kind not in {"run", "llm"} or not isinstance(value, str):
-            self.error("E_NODE_KIND", path, "do 必须是 {run: <shell 字符串>} 或 {llm: <prompt 模板>}")
-            return None, None
-        return value, kind
+        if kind == "tool":
+            return None, "tool", self.tool_call(value, path)
+        if kind not in {"run", "llm", "human"} or not isinstance(value, str):
+            self.error("E_NODE_KIND", path, _DO_SHAPE)
+            return None, None, None
+        return value, kind, None
+
+    def tool_call(self, raw: Any, path: str) -> ToolCall | None:
+        """A host tool call: the leaf runs it directly, with no model in the loop."""
+        if (not isinstance(raw, dict) or set(raw) - {"name", "args"}
+                or not isinstance(raw.get("name"), str)):
+            self.error("E_TOOL_CALL", path, "tool 必须是 {name: <工具名>, args: <参数映射>}")
+            return None
+        name = raw["name"]
+        if not _TOOL_NAME.fullmatch(name):
+            self.error("E_TOOL_CALL", path, "tool.name 必须匹配 ^[a-z][a-z0-9_.-]*$")
+            return None
+        args = raw.get("args", {})
+        if not isinstance(args, dict):
+            self.error("E_TOOL_CALL", path, "tool.args 必须是映射")
+            return None
+        return ToolCall(name, freeze_mapping(args))
+
+    def slots_value(self, value: Any, path: str, inputs: set[str], outputs: set[str]) -> None:
+        """Every string in a tool call's args may carry slots; check them like a command."""
+        if isinstance(value, str):
+            self.slots(value, path, inputs, outputs, allow_artifact=True)
+        elif isinstance(value, dict):
+            for item in value.values():
+                self.slots_value(item, path, inputs, outputs)
+        elif isinstance(value, list):
+            for item in value:
+                self.slots_value(item, path, inputs, outputs)
 
     def on_fail(self, raw: Any, path: str) -> tuple[int | None, str]:
         if raw is None or raw == "report":

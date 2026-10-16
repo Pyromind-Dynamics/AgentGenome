@@ -19,7 +19,7 @@ Pi → genome_* 工具 → SDK Runtime → AgentGenome
 
 `test` 不调用模型、不需要 API Key，使用 SDK 的实际 Pi OS 沙箱；`start` 沿用 SDK 原有的模型和平台配置。默认 SDK 位于相邻的 `software-agent-sdk`，可通过 `SOFTWARE_AGENT_SDK_DIR` 修改。重复测试可设置 `AGENTGENOME_SKIP_INSTALL=1` 跳过依赖安装。
 
-两者共享 SDK 的 `workspace/agentgenome` 资产目录，也可用 `AGENTGENOME_HOME` 指定。测试前先停止占用该目录的 SDK。预期两批均输出 `succeeded`，最终输出 `published`；这不是独立的 AgentGenome 服务。
+两者共享 SDK 的 `workspace/.pyromind-agent/agentgenome` 资产目录，也可用 `AGENTGENOME_HOME` 指定。测试前先停止占用该目录的 SDK。预期两批均输出 `succeeded`，最终输出 `published`；这不是独立的 AgentGenome 服务。
 
 SDK 中的等价命令是 `./start_inference.sh --test-agentgenome` 和 `./start_inference.sh --agentgenome`。源码修改后须重新构建 SDK 锁定的 wheel/npm 包，命令见 SDK 的 `docs/agentgenome-v1.md`；启动脚本不会直接导入跨仓库源码。
 

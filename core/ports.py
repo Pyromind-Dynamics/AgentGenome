@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Protocol
+from typing import Any, Callable, ClassVar, Mapping, Protocol
 
 from .artifacts import ArtifactPort
 
@@ -50,12 +50,23 @@ class JudgeResult:
 
 @dataclass(frozen=True)
 class Answer:
-    approve: bool
+    """A human's verdict on one question.
+
+    `pending` is the pause: the person has not answered yet and the run parks at the
+    node instead of holding the worker. Everything else is a decision.
+    """
+
+    approve: bool = False
     feedback: str | None = None
     batch_approval: bool = False
     batch_reused: bool = False
+    pending: bool = False
 
     def __post_init__(self) -> None:
+        if self.pending:
+            if self.approve or self.batch_approval or self.batch_reused:
+                raise ValueError("待唤醒的答复不能同时批准")
+            return
         if not self.approve and not self.feedback:
             raise ValueError("否决必须提供非空 feedback")
         if self.batch_reused and not self.approve:
@@ -94,6 +105,19 @@ class HumanPort(Protocol):
 
 
 @dataclass(frozen=True)
+class ToolResult:
+    """A host tool call's outcome; `result` is the JSON object the node persists."""
+
+    is_error: bool
+    result: Mapping[str, Any]
+    text: str = ""
+
+
+class ToolPort(Protocol):
+    def call(self, name: str, arguments: dict[str, Any]) -> ToolResult: ...
+
+
+@dataclass(frozen=True)
 class Ports:
     shell: ShellPort
     ai: AIPort | None = None
@@ -104,3 +128,4 @@ class Ports:
     check_cancel: Callable[[], None] | None = None
     on_event: Callable[[dict[str, Any]], None] | None = None
     agent_task: Callable[[dict[str, Any]], str] | None = None
+    tool: ToolPort | None = None

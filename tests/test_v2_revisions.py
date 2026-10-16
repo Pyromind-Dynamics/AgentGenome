@@ -33,7 +33,7 @@ class RevisionHost(LocalExecutionHost):
     def collect_revision(self, draft, allowed):
         return {name: (Path(draft['editable_dir']) / name).read_bytes() for name in allowed}
 
-    def prepare(self, *args, verification_package=None):
+    def prepare(self, *args, verification_package=None, **options):
         ports, params = super().prepare(*args)
         return replace(ports, verification_cwd=verification_package), params
 
@@ -148,7 +148,7 @@ class PromptRevisionHost(RevisionHost):
         return {'editable_dir': str(directory), 'verification_dir': str(directory),
                 'verification_protection': 'prompt'}
 
-    def prepare(self, *args, verification_package=None):
+    def prepare(self, *args, verification_package=None, **options):
         return LocalExecutionHost.prepare(self, *args)
 
 

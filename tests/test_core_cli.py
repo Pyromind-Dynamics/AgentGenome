@@ -15,6 +15,7 @@ from core import (
     PortError,
     Ports,
     ShellResult,
+    ToolResult,
     handshake,
     resume,
     run,
@@ -35,6 +36,34 @@ def test_data_cleaning_run_records_all_port_calls(tmp_path: Path) -> None:
     assert checkpoint["nodes"]["clean-sop"]["status"] == "succeeded"
     for ref in result.outputs.values():
         assert (tmp_path / "run" / ref["path"]).is_file()
+
+
+def test_artifact_extension_names_the_run_artifact(tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "graph.yaml").write_text(
+        """\
+version: "gt/1.0"
+node:
+  id: hello
+  mode: sequence
+  output: {greeting: {type: text, compose: [greet.output.greeting]}}
+  verify: [{run: "test -s {output.greeting}"}]
+  children:
+    - id: greet
+      artifact: {ext: jsonl}
+      do: {run: "echo hello > {artifact}"}
+      output: {greeting: {type: text}}
+      verify: [{run: "test -s {output.greeting}"}]
+""",
+        encoding="utf-8",
+    )
+    graph = compile(package)
+    result = run(graph, {}, Ports(LocalShell()), tmp_path / "run")
+    assert result.status == "succeeded"
+    artifacts = tmp_path / "run" / "artifacts"
+    assert (artifacts / "hello--greet.jsonl").is_file()
+    assert not (artifacts / "hello--greet.out").exists()
 
 
 def test_failure_retries_then_propagates_to_root(tmp_path: Path) -> None:
@@ -191,6 +220,92 @@ def test_handshake_rejects_absent_or_noninteractive_ports(tmp_path: Path) -> Non
 def test_handshake_accepts_declared_ports_and_m0_data_cleaning() -> None:
     graph = compile("templates/data-cleaning")
     assert handshake(graph, Ports(LocalShell())) == []
+
+
+class RecordingTool:
+    """A host tool port that records its calls and answers with a fixed JSON body."""
+
+    def __init__(self, result: dict[str, object] | None = None, *,
+                 is_error: bool = False) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.result = {"task_id": "t-1"} if result is None else result
+        self.is_error = is_error
+
+    def call(self, name: str, arguments: dict[str, object]) -> ToolResult:
+        self.calls.append((name, arguments))
+        return ToolResult(self.is_error, dict(self.result),
+                          "提交失败" if self.is_error else "已提交")
+
+
+def _tool_graph(tmp_path: Path) -> object:
+    package = tmp_path / "pkg"
+    package.mkdir(parents=True)
+    (package / "graph.yaml").write_text(
+        """version: "gt/1.0"
+node:
+  id: submit-sop
+  mode: sequence
+  input:
+    dataset: {type: path, from: params.dataset}
+  output:
+    submission: {type: json, compose: [submit.output.submission]}
+  verify:
+    - metric: "submission.task_id"
+  children:
+    - id: submit
+      input:
+        dataset: {type: path, from: submit-sop.input.dataset}
+      do:
+        tool:
+          name: df_submit_pipeline
+          args:
+            dataset: "{input.dataset}"
+            task_name: pretag
+            retries: 2
+      output:
+        submission: {type: json}
+      verify:
+        - metric: "submission.task_id"
+""",
+        encoding="utf-8",
+    )
+    return compile(package)
+
+
+def test_tool_leaf_calls_the_host_tool_and_persists_its_result(tmp_path: Path) -> None:
+    tool = RecordingTool()
+    result = run(_tool_graph(tmp_path), {"dataset": "/data/raw.csv"},
+                 Ports(LocalShell(), tool=tool), tmp_path / "run")
+    assert result.status == "succeeded"
+    assert tool.calls == [("df_submit_pipeline",
+                           {"dataset": "/data/raw.csv", "task_name": "pretag",
+                            "retries": 2})]
+    events = [json.loads(line)
+              for line in (tmp_path / "run" / "ledger.jsonl").read_text().splitlines()]
+    call = next(item for item in events if item["event"] == "call_tool")
+    assert call["tool"] == "df_submit_pipeline"
+    assert call["is_error"] is False
+    artifact = tmp_path / "run" / result.outputs["submission"]["path"]
+    assert json.loads(artifact.read_text()) == {"task_id": "t-1"}
+
+
+def test_tool_leaf_error_fails_the_node_and_keeps_the_artifact(tmp_path: Path) -> None:
+    tool = RecordingTool({"code": "TASK_REJECTED"}, is_error=True)
+    result = run(_tool_graph(tmp_path), {"dataset": "/data/raw.csv"},
+                 Ports(LocalShell(), tool=tool), tmp_path / "run")
+    assert result.status == "failed"
+    assert result.failure["stage"] == "do"
+    assert "提交失败" in result.failure["summary"]
+    artifact = tmp_path / "run" / "artifacts" / "submit-sop--submit.out"
+    assert json.loads(artifact.read_text()) == {"code": "TASK_REJECTED"}
+
+
+def test_handshake_requires_the_tool_port(tmp_path: Path) -> None:
+    graph = _tool_graph(tmp_path)
+    absent = handshake(graph, Ports(LocalShell()))
+    assert [(item.code, item.node) for item in absent] == [
+        ("E_NEEDS_PORT_ABSENT", "submit-sop.submit")]
+    assert handshake(graph, Ports(LocalShell(), tool=RecordingTool())) == []
 
 
 def _llm_graph(tmp_path: Path, on_fail: str = "report") -> object:
@@ -585,6 +700,97 @@ node:
     call = next(event for event in events if event["event"] == "call_human")
     assert call["evidence"] == human.evidence
     assert call["feedback"] == "  Keep Mixed Case  "
+
+
+def test_human_node_parks_the_run_and_resume_continues_from_its_checkpoint(
+        tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "graph.yaml").write_text(
+        """version: "gt/1.0"
+node:
+  id: root
+  mode: sequence
+  output: {reviewed: {type: path, compose: [review.output.reviewed]}}
+  verify: [{run: "test -s {output.reviewed}"}]
+  children:
+    - id: review
+      do: {human: "请复核 {input.raw}，把结论写到 {artifact}"}
+      input: {raw: {type: path, from: params.raw}}
+      output: {reviewed: {type: path}}
+      verify: [{run: "test -s {artifact}"}]
+""",
+        encoding="utf-8",
+    )
+
+    class Human:
+        def __init__(self) -> None:
+            self.questions: list[str] = []
+
+        def ask(self, question: str, evidence: dict[str, object]) -> Answer:
+            self.questions.append(question)
+            if len(self.questions) == 1:
+                return Answer(False, pending=True)
+            Path(str(evidence["artifact"])).write_text("reviewed", encoding="utf-8")
+            return Answer(True)
+
+        def capabilities(self) -> dict[str, object]:
+            return {"interactive": True}
+
+    raw = tmp_path / "raw.csv"
+    raw.write_text("text\none\n", encoding="utf-8")
+    human = Human()
+    run_dir = tmp_path / "run"
+    graph = compile(package)
+
+    parked = run(graph, {"raw": str(raw)}, Ports(LocalShell(), human=human), run_dir)
+    assert parked.status == "waiting"
+    assert parked.waiting is not None
+    assert parked.waiting["node"] == "root.review"
+    assert "请复核" in parked.waiting["question"]
+    assert str(raw) in parked.waiting["question"]
+    checkpoint = json.loads((run_dir / "checkpoint.json").read_text())
+    assert checkpoint["nodes"]["root.review"]["status"] == "waiting"
+    assert "outputs" not in checkpoint["nodes"]["root.review"]
+    events = [json.loads(line) for line in (run_dir / "ledger.jsonl").read_text().splitlines()]
+    assert [item["event"] for item in events][-1] == "run_waiting"
+    call = next(item for item in events if item["event"] == "call_human")
+    assert call["pending"] is True
+    assert call["question"]["path"].startswith("logs/")
+    assert (run_dir / call["question"]["path"]).read_text() == parked.waiting["question"]
+
+    finished = resume(graph, Ports(LocalShell(), human=human), run_dir)
+    assert finished.status == "succeeded"
+    assert len(human.questions) == 2
+    assert (run_dir / "artifacts/root--review.out").read_text() == "reviewed"
+    events = [json.loads(line) for line in (run_dir / "ledger.jsonl").read_text().splitlines()]
+    assert [item["event"] for item in events][-1] == "run_succeeded"
+    assert [item["event"] for item in events].count("run_resumed") == 1
+
+
+def test_human_node_without_an_interactive_port_is_a_diagnostic(tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "graph.yaml").write_text(
+        """version: "gt/1.0"
+node:
+  id: root
+  do: {human: "复核 {artifact}"}
+  output: {reviewed: {type: path}}
+  verify: [{run: "test -s {artifact}"}]
+""",
+        encoding="utf-8",
+    )
+
+    class Batch:
+        def ask(self, question: str, evidence: dict[str, object]) -> Answer:
+            raise AssertionError("a non-interactive port must never be asked")
+
+        def capabilities(self) -> dict[str, object]:
+            return {"interactive": False}
+
+    diagnostics = handshake(compile(package), Ports(LocalShell(), human=Batch()))
+    assert [item.code for item in diagnostics] == ["E_NEEDS_NONINTERACTIVE"]
 
 
 def test_on_fail_ask_refused_is_hard_error(tmp_path: Path) -> None:

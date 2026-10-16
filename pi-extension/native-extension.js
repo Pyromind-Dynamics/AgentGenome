@@ -3,6 +3,7 @@ import { NativeClient, setupRuntime } from "./native-client.js";
 
 const ACTIVE = new Set(["queued", "running", "cancelling"]);
 const RECEIPT = "agentgenome.completed";
+const GATE = "agentgenome.waiting";
 
 export function deliveredRunIds(entries) {
   return new Set(entries.flatMap((entry) => {
@@ -14,8 +15,11 @@ export function deliveredRunIds(entries) {
 
 export function progressLines(run) {
   const progress = run.progress || {};
+  const waiting = run.status === "waiting" ? run.result?.waiting || {} : null;
   return [`历史经验 ${run.asset_id}@${run.version} · ${run.status}`,
-    `节点：${progress.node || run.node || "等待启动"} · ${progress.event || run.status}`,
+    `节点：${progress.node || waiting?.node || run.node || "等待启动"} · ${progress.event || run.status}`,
+    ...(waiting?.question ? [`待办：${waiting.question}`] : []),
+    ...(waiting?.artifact ? [`产物：${waiting.artifact}`] : []),
     ...(progress.command ? [`命令：${progress.command}`] : []),
     ...(progress.verdict ? [`验收：${progress.verdict}`] : []),
     ...(progress.tail ? [progress.tail.slice(-2000)] : [])];
@@ -32,7 +36,7 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
   function begin(ctx) {
     if (current) stop();
     const scope = `pi:${ctx.sessionManager.getSessionFile() || ctx.sessionManager.getSessionId()}`;
-    const state = { ctx, scope, ready: new Set(), sent: new Map(), closed: false };
+    const state = { ctx, scope, ready: new Set(), sent: new Map(), gates: new Map(), closed: false };
     state.client = clientFactory({ scope, cwd: ctx.cwd });
     current = state;
     const delivered = deliveredRunIds(entries(state));
@@ -55,6 +59,21 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     for (const run of runs) {
       if (!alive(state)) return false;
       show(state, progressLines(run));
+      if (run.status === "waiting") {
+        const waiting = run.result?.waiting || {};
+        const gate = `${waiting.node || ""}:${waiting.question || ""}`;
+        if (state.gates.get(run.id) !== gate) {
+          state.gates.set(run.id, gate);
+          try { pi.sendMessage({ customType: GATE, display: true,
+            details: { run_id: run.id, asset_id: run.asset_id, version: run.version },
+            content: `历史经验停在人工节点：${JSON.stringify({ run_id: run.id, ...waiting })}\n`
+              + "请把 node / question / artifact 告诉用户，等用户完成人工步骤并把结果写进该 artifact 后，"
+              + "用同一个 run_id 调用 genome_resume 唤醒这条 run；不要替用户伪造人工产物。",
+          }, { triggerTurn: true, deliverAs: "followUp" }); }
+          catch (error) { state.gates.delete(run.id); throw error; }
+        }
+        continue;
+      }
       if (ACTIVE.has(run.status)) continue;
       if (delivered.has(run.id) || run.status === "cancelled") {
         await state.client.request("ack", { run_id: run.id, receipt: true });
@@ -68,13 +87,16 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
       const { token } = await state.client.request("claim", { run_id: run.id });
       if (!token || !alive(state)) continue;
       state.sent.set(run.id, token);
+      const capture = run.result?.capture;
+      const guidance = capture
+        ? `这是轨迹沉淀的回放验证。请读取报告 ${capture.report}，向用户说明是否已发布为可复用经验、泛化结论以及草稿位置。`
+        : run.status === "succeeded"
+          ? "请读取结果中的实际产物并向用户汇报，给出真实本地文件路径。"
+          : "请向用户解释失败或中断原因，不要自动重复执行历史经验。";
       // A completion belongs to this session, never whichever session was switched to later.
       try { pi.sendMessage({ customType: RECEIPT, display: true,
         details: { run_id: run.id, asset_id: run.asset_id, version: run.version },
-        content: `历史经验执行结束：${JSON.stringify(run)}\n`
-          + (run.status === "succeeded"
-            ? "请读取结果中的实际产物并向用户汇报，给出真实本地文件路径。"
-            : "请向用户解释失败或中断原因，不要自动重复执行历史经验。"),
+        content: `历史经验执行结束：${JSON.stringify(run)}\n${guidance}`,
       }, { triggerTurn: true, deliverAs: "followUp" }); }
       catch (error) {
         state.sent.delete(run.id);
@@ -119,6 +141,10 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     watch(state);
   }
 
+  function rememberCapture(state, result) {
+    if (result?.run_id) remember(state, { id: result.run_id, status: "queued" });
+  }
+
   pi.on("session_start", (_event, ctx) => { begin(ctx); });
   pi.on("session_shutdown", () => { stop(); });
   pi.on("agent_end", async () => { if (current?.ready.size) await startReady(current); });
@@ -154,7 +180,8 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     async invoke(action, args, callId, _signal, ctx) {
       const state = current || begin(ctx);
       const result = await state.client.request(action, args, callId);
-      if (action === "run") remember(state, result);
+      if (action === "run" || action === "resume") remember(state, result);
+      else if (action === "capture" || action === "distill") rememberCapture(state, result);
       else if (action === "cancel") watch(state);
       return result;
     },

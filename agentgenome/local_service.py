@@ -19,7 +19,7 @@ from .local_host import LocalExecutionHost
 from .service import GenomeService
 
 PROTOCOL = 1
-VERSION = "0.3.0"
+VERSION = "0.6.13"
 ACTIVE = {"queued", "running", "cancelling"}
 
 
@@ -84,16 +84,21 @@ class LocalService:
     async def dispatch(self, scope: str, cwd: str, message: dict) -> dict:
         action, args = message["action"], message.get("arguments", {})
         request_id = message.get("request_id", message["id"])
-        if action in {"run", "validate"}:
+        if action in {"run", "validate", "capture", "distill"}:
+            host = LocalExecutionHost(self.root, Path(cwd))
             if action == "validate":
                 self.service.check_capabilities(args["asset_id"], args["version"], set())
                 result = self.service.submit(scope, request_id, args["asset_id"], args["version"],
                                              args["params"], allow_draft=True)
             else:
-                result = invoke(self.service, scope, action, args, request_id)
-            with self.service._db() as db:
-                db.execute("INSERT OR IGNORE INTO native_runs(run_id,cwd) VALUES(?,?)",
-                           (result["id"], cwd))
+                result = invoke(self.service, scope, action, args, request_id, host=host)
+            # A capture or distill reuses an existing version without queueing a run.
+            run_id = (result.get("run_id") if action in {"capture", "distill"}
+                      else result["id"])
+            if run_id:
+                with self.service._db() as db:
+                    db.execute("INSERT OR IGNORE INTO native_runs(run_id,cwd) VALUES(?,?)",
+                               (run_id, cwd))
             return result
         if action == "start":
             run_id = args["run_id"]

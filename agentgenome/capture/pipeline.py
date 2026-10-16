@@ -1,0 +1,288 @@
+"""Capture pipeline: traces in, published experience out.
+
+The heavy lifting lives in the stage modules; this module only wires them and
+decides what to do when a stage degrades (no new parameters, failing replay).
+Every degradation is written into the report, never swallowed.
+
+Nothing here executes a graph: replay A is queued on the host and replay B runs
+when that run finalizes, so a capture call returns as soon as the package is
+frozen.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+from uuid import uuid4
+
+from builder import CompileError
+
+from ..service import GenomeService
+from .align import DEFAULT_THRESHOLD, Alignment, align_traces, render_alignment
+from .emit import (DEFAULT_VERSION, EmitError, Package, build_package, render_emit,
+                   source_for, unresolved_literals)
+from .replay import queue_replay, render_plan
+from .sample import sample_inputs
+from .slice import OUTPUT_CONTRACT_HINT, Slice, SliceError, render_slice, reverse_slice
+from .trace import KIND_SHELL, Trace
+
+_SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)\Z")
+
+
+class CaptureError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class CapturePlan:
+    capture_id: str
+    asset_id: str
+    version: str
+    pin: str
+    package_dir: Path
+    scope: str
+    run_id: str | None
+    reused: bool
+    generalized: bool | None
+    notes: tuple[str, ...]
+    report_path: Path
+    samples: dict[str, Any] | None = None
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "capture_id": self.capture_id,
+            "asset_id": self.asset_id,
+            "version": self.version,
+            "pin": self.pin,
+            "scope": self.scope,
+            "run_id": self.run_id,
+            "reused": self.reused,
+            "generalized": self.generalized,
+            "notes": list(self.notes),
+            "report": str(self.report_path),
+            "package": str(self.package_dir),
+            "samples": (self.samples or {}).get("index"),
+        }
+
+
+def next_version(versions: Sequence[str]) -> str:
+    parsed = [tuple(int(part) for part in match.groups())
+              for value in versions if (match := _SEMVER.fullmatch(value))]
+    if not parsed:
+        raise CaptureError("无法自动递增版本，请显式指定 version")
+    major, minor, patch = max(parsed)
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def _header(capture_id: str, label: str, package: Package, traces: Sequence[Trace]) -> str:
+    ids = "、".join(f"`{trace.trace_id}`" for trace in traces)
+    return "\n".join([
+        "# 轨迹沉淀报告", "",
+        f"- capture：`{capture_id}`",
+        f"- 经验名：{label}",
+        f"- 资产：`{package.asset_id}` v{package.version}（owner {package.owner}）",
+        f"- 轨迹：{ids}",
+        f"- 步骤：{'、'.join(f'{trace.trace_id} {len(trace.steps)} 条' for trace in traces)}",
+        "",
+    ])
+
+
+def _report(capture_id: str, label: str, package: Package, traces: Sequence[Trace],
+            alignment: Alignment, slice_: Slice, plan: str,
+            samples: Mapping[str, Any] | None = None) -> str:
+    sections = [render_alignment(alignment), render_slice(slice_, alignment.slots),
+                render_emit(package)]
+    if samples:
+        sections.append(render_samples(samples))
+    return "".join([_header(capture_id, label, package, traces), "\n",
+                    "\n".join(sections), "\n", plan])
+
+
+def render_samples(samples: Mapping[str, Any]) -> str:
+    """The sampled inputs, as the report tells them: what was kept and what was not."""
+    lines = ["### 输入采样", ""]
+    if samples.get("error"):
+        lines.append(f"- 采样失败：{samples['error']}")
+    files = samples.get("files") or ()
+    if not files:
+        lines.append("- 本条链路没有可采样的根输入")
+    for entry in files:
+        schema = entry.get("schema") or {}
+        names = schema.get("columns") or schema.get("fields") or []
+        detail = "、".join(f"`{name}`" for name in names)
+        size = "大小未知" if entry.get("bytes") is None else f"{entry['bytes']} B"
+        lines.append(
+            f"- `{entry.get('key')}` ← `{entry.get('path')}`：{entry.get('format')}"
+            + (f"，字段 {detail}" if detail else "")
+            + f"，{size}"
+            + ("，只采样文件头部" if entry.get("truncated") else "")
+            + (f"，{entry['note']}" if entry.get("note") else ""))
+    lines.extend(["", f"- 采样索引：`{samples.get('index')}`", ""])
+    return "\n".join(lines)
+
+
+def _samples(workspace: Any, bound: Mapping[str, Any], directory: Path) -> dict[str, Any]:
+    """Sampling is evidence: a broken input is reported, never raised."""
+    try:
+        return sample_inputs(source_for(workspace), bound, directory)
+    except Exception as exc:
+        return {"index": None, "files": [], "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+def _failure_report(capture_id: str, label: str, traces: Sequence[Trace],
+                    alignment: Alignment, slice_: Slice | None, package_dir: Path,
+                    error: str) -> str:
+    """The report a failed build leaves behind: what was planned, and why it stopped."""
+    lines = [
+        "# 轨迹沉淀报告（构建失败）", "",
+        f"- capture：`{capture_id}`",
+        f"- 经验名：{label}",
+        f"- 轨迹：{'、'.join(f'`{trace.trace_id}`' for trace in traces)}",
+        f"- 草稿：`{package_dir}`",
+        f"- 错误：{error}",
+        f"- 契约：{OUTPUT_CONTRACT_HINT}",
+        "",
+        render_alignment(alignment),
+        "",
+    ]
+    lines.append("反向切片未生成：最终产物无法回溯。\n" if slice_ is None
+                 else render_slice(slice_, alignment.slots) + "\n")
+    return "\n".join(lines)
+
+
+def _probe_plan(package: Package, new_params: Mapping[str, Any] | None,
+                bound: Mapping[str, Any]) -> tuple[dict[str, str] | None, str]:
+    """Replay B's parameters, or None plus the note explaining why there is none."""
+    allowed = {key for key, _ in package.params}
+    requested = {key: str(value) for key, value in (new_params or {}).items()
+                 if key in allowed}
+    if not requested:
+        return None, "未提供换参数回放数据，本条经验未经泛化验证"
+    dropped = sorted({key for key in (new_params or {})} - allowed)
+    note = "换参数回放将在回放 A 成功后由服务执行"
+    if dropped:
+        note += f"（忽略已物化的参数：{'、'.join(f'`{key}`' for key in dropped)}）"
+    if requested == dict(bound):
+        return None, "换参数回放与原参数相同，不构成泛化证据"
+    return requested, note
+
+
+def _require_solidified(package: Package) -> None:
+    """A chain is either frozen whole or refused; a half-covered graph is not an asset."""
+    if not package.not_solidifiable:
+        return
+    dropped = "；".join(f"#{order} {reason}"
+                        for order, reason in package.not_solidifiable)
+    raise EmitError(
+        f"链路里有无法固化的步骤：{dropped}。"
+        "历史经验只收完整固化的链路，先把这些步骤变成可执行节点再沉淀："
+        "固定命令用 run、宿主工具调用用 tool、agent 裁量用 llm、人工门禁用 human"
+        "（都用 genome_distill 的 steps 提交）；"
+        "如果这些步骤不在最终产物的依赖里，用 final_artifact 重新切片；"
+        "如果它们是本次任务特有的输入，把它们声明成 `{{参数名}}` 输入边界（配 params）。")
+
+
+def _forbid_replay_literals(traces: Sequence[Trace], workspace: Any) -> None:
+    """A captured command may not carry a workspace-relative literal into the graph.
+
+    The graph replays a command with the package as its working directory, so a flag
+    value the parser could not classify (`--images-root storage`) has to become a
+    parameter instead of a literal that only resolves in the session's own cwd.
+    """
+    source = source_for(workspace)
+    for trace in traces:
+        for step in trace.steps:
+            if step.kind != KIND_SHELL or not step.command:
+                continue
+            for flag, value in unresolved_literals(source, step.command):
+                raise EmitError(
+                    f"步骤 `{trace.trace_id}:{step.seq}` 的命令里 `{flag} {value}` "
+                    "没有被识别成路径，但它在会话工作目录里真实存在：回放的工作目录是包目录"
+                    "而不是会话目录，这个字面量在回放时会指向不存在的位置。"
+                    "请用 genome_distill 提交这条链路，把这类值写成 `{参数名}` 占位符"
+                    "并在 params 里给出它在会话里的真实值。")
+
+
+def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: str,
+                    workspace: Any, scope: str, final_artifact: str | None = None,
+                    threshold: float = DEFAULT_THRESHOLD, new_params: Mapping[str, Any] | None = None,
+                    owner: str = "local", description: str | None = None,
+                    version: str | None = None, capture_id: str | None = None,
+                    asset_id: str | None = None,
+                    declarations: Mapping[str, Any] | None = None,
+                    replay_params: Mapping[str, Any] | None = None,
+                    bindings: Mapping[str, Any] | None = None) -> CapturePlan:
+    traces = list(traces)
+    if not traces:
+        raise CaptureError("至少需要一条轨迹")
+    capture_id = capture_id or uuid4().hex
+    directory = service.root / "captures" / capture_id
+    alignment = align_traces(traces, threshold)
+    package_dir = directory / "package"
+    slice_: Slice | None = None
+
+    def build(candidate: str) -> Package:
+        assert slice_ is not None
+        return build_package(package_dir, alignment=alignment, slice_=slice_, traces=traces,
+                             label=label, workspace=workspace, owner=owner,
+                             version=candidate, description=description, asset_id=asset_id,
+                             declarations=declarations, bindings=bindings)
+
+    try:
+        slice_ = reverse_slice(alignment, final_artifact, bindings)
+        package = build(version or DEFAULT_VERSION)
+        _forbid_replay_literals(traces, workspace)
+        _require_solidified(package)
+    except (SliceError, EmitError, CompileError) as exc:
+        report = _failure_report(capture_id, label, traces, alignment, slice_,
+                                 package_dir, str(exc))
+        service.captures.failed(
+            capture_id, asset_id=asset_id or "", label=label, report=report,
+            error=str(exc), traces=[trace.trace_id for trace in traces],
+            package=package_dir)
+        raise CaptureError(
+            f"capture {capture_id} 构建失败：{exc}"
+            f"（草稿：{package_dir}；报告见 genome_capture_status capture_id={capture_id}）"
+        ) from exc
+    versions = {item["version"]: item for item in service.versions(package.asset_id)}
+    existing = {name: item["pin"] for name, item in versions.items()}
+    if existing.get(package.version) == package.pin:
+        notes = ("与已有版本字节一致，未产生新版本",)
+        previous = service.captures.for_asset(package.asset_id, package.version) or {}
+        report = _report(capture_id, label, package, traces, alignment, slice_,
+                         render_plan(None, None, notes))
+        state = service.captures.create(
+            capture_id, asset_id=package.asset_id, version=package.version, pin=package.pin,
+            scope=scope, run_id=None, package=package.directory, report=report,
+            traces=[trace.trace_id for trace in traces],
+            generalized=bool(previous.get("generalized")),
+            probe=None, notes=notes, reused=True,
+            published=bool(versions[package.version]["published"]),
+            samples=previous.get("samples"))
+        return CapturePlan(capture_id, package.asset_id, package.version, package.pin,
+                           package.directory, scope, None, True, state["generalized"],
+                           notes, Path(state["report"]), state.get("samples"))
+    if version is None and package.version in existing:
+        package = build(next_version(list(existing)))
+
+    bound = dict(replay_params) if replay_params is not None else dict(package.params)
+    samples = _samples(workspace, bound, directory / "samples")
+    probe, note = _probe_plan(package, new_params, bound)
+    notes = (note,)
+    try:
+        case = queue_replay(service, package, bound, scope=scope,
+                            request_id=capture_id, name="same")
+    except ValueError as exc:
+        raise CaptureError(f"草稿导入失败：{exc}") from exc
+    report = _report(capture_id, label, package, traces, alignment, slice_,
+                     render_plan(probe, case.run_id), samples)
+    state = service.captures.create(
+        capture_id, asset_id=package.asset_id, version=package.version, pin=package.pin,
+        scope=scope, run_id=case.run_id, package=package.directory, report=report,
+        traces=[trace.trace_id for trace in traces],
+        generalized=False if probe is None else None, probe=probe, notes=notes,
+        samples=samples)
+    return CapturePlan(capture_id, package.asset_id, package.version, package.pin,
+                       package.directory, scope, case.run_id, False, state["generalized"],
+                       notes, Path(state["report"]), samples)

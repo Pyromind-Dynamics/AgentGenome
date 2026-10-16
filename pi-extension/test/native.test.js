@@ -9,7 +9,7 @@ async function until(predicate) {
   assert.fail("condition not reached");
 }
 
-function harness(t, { records = [], history = [], delivered = true, snapshot, onSend = () => {} } = {}) {
+function harness(t, { records = [], history = [], delivered = true, snapshot, capture, onSend = () => {} } = {}) {
   const hooks = new Map(), calls = [], messages = [], widgets = [];
   const pi = {
     on: (name, callback) => hooks.set(name, callback), registerCommand() {}, registerTool() {},
@@ -25,6 +25,8 @@ function harness(t, { records = [], history = [], delivered = true, snapshot, on
   const client = { close() {}, async request(action, args) {
     calls.push({ action, args });
     if (action === "run") return { id: "r1", status: "queued" };
+    if (action === "resume") return { id: args.run_id, status: "queued" };
+    if (action === "capture") return capture ?? { capture_id: "c1", run_id: "r2", reused: false };
     if (action === "snapshot") return snapshot ? snapshot() : { runs: [...records] };
     if (action === "claim") return { token: "lease" };
     if (action === "ack") records.splice(records.findIndex((run) => run.id === args.run_id), 1);
@@ -40,12 +42,12 @@ test("default entry loads standalone; SDK factory registers no native lifecycle"
   const hooks = [], tools = [], commands = [];
   const pi = { events: { emit() {} }, on: (name) => hooks.push(name), registerTool: (tool) => tools.push(tool.name), registerCommand: (name) => commands.push(name) };
   agentGenome(pi);
-  assert.equal(tools.length, 8);
+  assert.equal(tools.length, 13);
   assert.deepEqual(commands, ["genome"]);
   assert.ok(hooks.includes("session_start"));
   hooks.length = tools.length = commands.length = 0;
   createGenomeExtension(createBridgeHost(async () => {}))(pi);
-  assert.equal(tools.length, 8);
+  assert.equal(tools.length, 13);
   assert.deepEqual(hooks, ["before_agent_start"]);
   assert.equal(commands.length, 0);
 });
@@ -82,6 +84,58 @@ test("busy agent notification is acknowledged only after custom_message is persi
   h.history.push({ type: "custom_message", ...h.messages[0].message });
   await until(() => h.calls.some((call) => call.action === "ack"));
   assert.match(h.messages[0].message.content, /不要自动重复/);
+});
+
+test("a parked run reports the human gate once and resumes the same run", async (t) => {
+  const h = harness(t);
+  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  const parked = { id: "r1", status: "waiting", asset_id: "prelabel-clean", version: "0.1.0",
+    result: { waiting: { node: "review", question: "请到 Label Studio 复核 prelabeled.csv",
+      artifact: "/runs/r1/artifacts/review.out" } } };
+  assert.match(progressLines(parked).join("\n"), /Label Studio/);
+  h.records.push(parked);
+  await until(() => h.messages.length === 1);
+  await delay(1100);
+  assert.equal(h.messages.length, 1);
+  assert.equal(h.calls.some((call) => call.action === "claim"), false);
+  assert.equal(h.calls.some((call) => call.action === "ack"), false);
+  assert.match(h.messages[0].message.content, /genome_resume/);
+  assert.match(h.messages[0].message.content, /review\.out/);
+  h.records[0] = { ...parked, status: "queued", result: {} };
+  assert.equal((await h.host.invoke("resume", { run_id: "r1" }, "call2", undefined, h.ctx)).status, "queued");
+  await h.hooks.get("agent_end")();
+  assert.deepEqual(h.calls.filter((call) => call.action === "start").map((call) => call.args),
+    [{ run_id: "r1" }]);
+  h.records[0] = { ...parked, result: { waiting: { node: "export", question: "导出复核结果",
+    artifact: "/runs/r1/artifacts/export.out" } } };
+  await until(() => h.messages.length === 2);
+  assert.match(h.messages[1].message.content, /export\.out/);
+});
+
+test("capture queues its replay run and reports the sink result when it finishes", async (t) => {
+  const h = harness(t);
+  const result = await h.host.invoke("capture", { trace_refs: [], label: "预打标到清洗" }, "call", undefined, h.ctx);
+  assert.equal(result.capture_id, "c1");
+  assert.equal(h.calls.some((call) => call.action === "start"), false);
+  await h.hooks.get("agent_end")();
+  assert.deepEqual(h.calls.filter((call) => call.action === "start").map((call) => call.args),
+    [{ run_id: "r2" }]);
+  h.records.push({ id: "r2", status: "succeeded", asset_id: "prelabel-clean", version: "0.1.0",
+    result: { capture: { stage: "published", report: "/home/captures/c1/report.md" } } });
+  await until(() => h.messages.length === 1);
+  assert.match(h.messages[0].message.content, /轨迹沉淀/);
+  assert.match(h.messages[0].message.content, /report\.md/);
+  await until(() => h.calls.some((call) => call.action === "ack"));
+});
+
+test("a reused capture without a queued run does not wake the agent", async (t) => {
+  const h = harness(t, { capture: { capture_id: "c2", run_id: null, reused: true } });
+  const result = await h.host.invoke("capture", { trace_refs: [], label: "x" }, "call", undefined, h.ctx);
+  assert.equal(result.run_id, null);
+  await h.hooks.get("agent_end")();
+  assert.equal(h.calls.some((call) => call.action === "start"), false);
+  assert.equal(h.history.some((entry) => entry.customType === "agentgenome.run"), false);
+  assert.equal(h.messages.length, 0);
 });
 
 test("restart recognizes real Pi receipts and cancellation never wakes the model", async (t) => {

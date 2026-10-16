@@ -20,14 +20,16 @@ def server(tmp_path):
     home = tmp_path / "catalog"
 
     def launch():
+        # A child that fails to start prints a traceback longer than a small pipe
+        # buffer, so an undrained stderr pipe can block it before it exits.
         process = subprocess.Popen(
             [sys.executable, "-m", "agentgenome.local_service", "--home", str(home), "--idle-seconds", "2"],
-            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env={**os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}"})
         processes.append(process)
         return process
 
-    def connect(scope="one", version=VERSION):
+    def connect(scope="one", version=VERSION, cwd=None):
         for _ in range(200):
             client = socket.socket(socket.AF_UNIX)
             client.settimeout(5)
@@ -51,7 +53,8 @@ def server(tmp_path):
                 raise ValueError(reply["error"])
             return reply["result"]
 
-        request("hello", {"scope": scope, "cwd": str(tmp_path), "protocol": PROTOCOL, "version": version})
+        request("hello", {"scope": scope, "cwd": str(cwd or tmp_path), "protocol": PROTOCOL,
+                          "version": version})
         return request
 
     process = launch()
@@ -62,7 +65,6 @@ def server(tmp_path):
         if process.poll() is None:
             process.terminate()
         process.wait(timeout=5)
-        process.stderr.close()
 
 
 def wait_run(client, run_id):
@@ -211,3 +213,120 @@ def test_two_sessions_can_execute_concurrently_and_node_change_clears_progress(s
         assert (home / "runs" / run["id"] / "work/artifacts/clean-sop--clean.out").exists()
         progress = client("snapshot")["runs"][0]["progress"]
         assert "clean.py" not in progress.get("command", "")
+
+
+PRELABEL = '''import csv, json, sys
+
+raw, rules = sys.argv[1], sys.argv[2]
+prefix = json.load(open(rules)).get("prefix", "")
+for row in csv.DictReader(open(raw)):
+    print(json.dumps({"text": prefix + row["text"], "label": row["label"]}))
+'''
+
+CLEAN = '''import csv, json, sys
+
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+writer = csv.DictWriter(sys.stdout, fieldnames=["text", "label"])
+writer.writeheader()
+for row in rows:
+    writer.writerow(row)
+'''
+
+
+def captured_workspace(root):
+    """A workspace whose exported traces point at scripts that actually run."""
+    for name, source in (("prelabel", PRELABEL), ("clean", CLEAN)):
+        path = root / "public_data" / "scripts" / f"{name}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    (root / "public_data" / "rules.json").write_text('{"prefix": "p-"}', encoding="utf-8")
+    (root / "public_data" / "data").mkdir(parents=True, exist_ok=True)
+    (root / "public_data" / "data" / "raw.csv").write_text("text,label\none,a\n", encoding="utf-8")
+    (root / "public_data" / "out").mkdir(parents=True, exist_ok=True)
+    (root / "public_data" / "out" / "review.jsonl").write_text(
+        '{"text": "p-one", "label": "a"}\n', encoding="utf-8")
+    commands = [
+        "python3 public_data/scripts/prelabel.py public_data/data/raw.csv "
+        "public_data/rules.json > public_data/out/prelabeled.jsonl",
+        "python3 public_data/scripts/clean.py public_data/out/review.jsonl "
+        "> public_data/out/clean.csv",
+    ]
+    refs = []
+    for trace_id in ("s1", "s2"):
+        steps = [{"kind": "tool", "entry_id": f"{trace_id}-{index}", "tool": "bash",
+                  "call_id": f"{trace_id}-{index}", "timestamp": "2026-01-01T00:00:01Z",
+                  "args": {"command": command},
+                  "result": {"is_error": False, "text": "ok"}}
+                 for index, command in enumerate(commands, start=1)]
+        document = {"trace_version": 1, "trace_id": trace_id, "session_id": trace_id,
+                    "step_count": len(steps), "steps": steps}
+        relative = f"public_data/agentgenome-traces/{trace_id}.json"
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(document), encoding="utf-8")
+        refs.append({"trace_id": trace_id, "path": relative})
+    return refs
+
+
+def test_distill_over_the_socket_publishes_and_reuses_a_graph(server, tmp_path):
+    home, _, _, connect = server
+    workspace = tmp_path / "distill-workspace"
+    captured_workspace(workspace)
+    client = connect("distill", cwd=str(workspace))
+    arguments = {
+        "label": "预打标到清洗", "asset_id": "prelabel-clean-distilled",
+        "final_artifact": "public_data/out/clean.csv",
+        "steps": [
+            {"run": "python3 public_data/scripts/prelabel.py public_data/data/raw.csv "
+                    "public_data/rules.json > public_data/out/prelabeled.jsonl",
+             "from": "s1:1"},
+            {"run": "python3 public_data/scripts/clean.py "
+                    "public_data/out/prelabeled.jsonl > public_data/out/clean.csv",
+             "from": "s1:2"},
+        ],
+    }
+
+    plan = client("distill", arguments, "distill-1")
+    assert plan["reused"] is False
+    assert plan["run_id"]
+    assert plan["distilled"]["trace_id"].startswith("distilled-")
+    assert [node["id"] for node in plan["distilled"]["nodes"]] == ["prelabel", "clean"]
+
+    client("start", {"run_id": plan["run_id"]})
+    state = wait_run(client, plan["run_id"])
+    assert state["status"] == "succeeded"
+    assert state["result"]["capture"]["stage"] == "published"
+    assert client("capture_status", {"capture_id": plan["capture_id"]})["stage"] == "published"
+    assert (home / "captures" / plan["capture_id"] / "report.md").is_file()
+
+    again = client("distill", arguments, "distill-2")
+    assert again["reused"] is True
+    assert again["run_id"] is None
+
+
+def test_capture_over_the_socket_publishes_and_reuses_a_graph(server, tmp_path):
+    home, _, _, connect = server
+    workspace = tmp_path / "capture-workspace"
+    refs = captured_workspace(workspace)
+    client = connect("capture", cwd=str(workspace))
+
+    plan = client("capture", {"trace_refs": refs, "label": "预打标到清洗",
+                              "asset_id": "prelabel-clean"}, "capture-1")
+    assert plan["reused"] is False
+    assert plan["generalized"] is False
+    assert plan["run_id"]
+
+    client("start", {"run_id": plan["run_id"]})
+    state = wait_run(client, plan["run_id"])
+    assert state["status"] == "succeeded"
+    assert state["result"]["capture"]["stage"] == "published"
+    assert [item["id"] for item in client("list")["assets"]] == ["prelabel-clean"]
+    assert client("capture_status", {"capture_id": plan["capture_id"]})["stage"] == "published"
+    assert client("snapshot")["runs"][0]["asset_id"] == "prelabel-clean"
+    assert (home / "captures" / plan["capture_id"] / "report.md").is_file()
+
+    again = client("capture", {"trace_refs": refs, "label": "预打标到清洗",
+                               "asset_id": "prelabel-clean"}, "capture-2")
+    assert again["reused"] is True
+    assert again["run_id"] is None
+    assert len([item for item in client("snapshot")["runs"]]) == 1

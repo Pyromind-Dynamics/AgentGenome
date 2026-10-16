@@ -25,6 +25,12 @@ RECOVERY_INSTRUCTION = (
     'regression cases. Unvalidated draft cases may be corrected and must pass the original baseline again.'
 )
 
+WAITING_INSTRUCTION = (
+    'This run is parked at a human node: nothing is executing and no worker is held. '
+    'Do the manual work the question asks for, put the result where the node declared it, '
+    'then call genome_resume with this run ID to continue from its checkpoint.'
+)
+
 STOPPED = {'succeeded', 'failed', 'interrupted', 'cancelled'}
 
 
@@ -198,6 +204,8 @@ class Revisions:
             pending = json.loads(prior['promotion']) if prior and prior['promotion'] else None
             inherited = self.service.regressions.suite(state['asset_id'], baseline['version'])
             pending_baseline = pending['baseline_cases'] if pending else []
+            generated = self.service.captures.baseline_cases(
+                state['asset_id'], baseline['version']) or []
             pending_new = [c for c in pending['cases'] if c['id'] not in {b['id'] for b in pending_baseline}] if pending else []
             draft = host.prepare_revision(revision_id, package, allowed)
             result = {**draft, 'revision_id': revision_id, 'parent_run_id': run_id,
@@ -205,7 +213,7 @@ class Revisions:
                       'reason': reason, 'instruction': REVISION_INSTRUCTION,
                       'verification_resources': manifest['revision'].get('verification_resources', []),
                       'regression_cases': inherited,
-                      'baseline_cases': inherited or pending_baseline,
+                      'baseline_cases': inherited or pending_baseline or generated,
                       'pending_regression_cases': pending_new if baseline['version'] != (pending or {}).get('version') else [],
                       'baseline_version': baseline['version'], 'baseline_pin': baseline['pin'],
                       'parameters': manifest['parameters'],

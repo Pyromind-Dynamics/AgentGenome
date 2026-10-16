@@ -61,6 +61,14 @@ class VerifyRule:
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    """A leaf that delegates to a host tool: no model in the loop, only a fixed call."""
+
+    name: str
+    args: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class Node:
     id: str
     path: str
@@ -77,6 +85,8 @@ class Node:
     danger: bool
     route: str | None
     route_hint: str
+    artifact_ext: str | None = None
+    tool: ToolCall | None = None
 
 
 @dataclass(frozen=True)

@@ -13,10 +13,13 @@ from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from builder import compile, package_pin
-from core.api import handshake, run
+from core.api import handshake, resume as resume_run, run
 from core.ports import Ports, PortError
+from .captures import Captures
+from .manifest import validate as validate_manifest
+from .manifest import view as manifest_view
 from .stages import StageRequests
-from .revisions import Revisions, RECOVERY_INSTRUCTION
+from .revisions import Revisions, RECOVERY_INSTRUCTION, WAITING_INSTRUCTION
 from .regressions import Regressions, RegressionFailure
 
 
@@ -27,10 +30,22 @@ class RunCancelled(Exception):
 class Host(Protocol):
     def prepare(self, run_id: str, package: Path, params: dict[str, Any],
                 path_parameters: list[str], cancel: threading.Event,
-                emit: Callable[[dict[str, Any]], None]) -> tuple[Ports, dict[str, Any]]: ...
+                emit: Callable[[dict[str, Any]], None], **options: Any
+                ) -> tuple[Ports, dict[str, Any]]:
+        """Build the ports for one attempt.
+
+        `options["resuming"]` names the human node a wakeup already answered, so a
+        host that parks human nodes can approve exactly that node and park the rest.
+        """
+
+    def read(self, path: str) -> bytes:
+        """Read a workspace file: exported traces and captured scripts."""
 
 
+# A parked run holds no worker: `waiting` is where a human gate leaves it, and
+# `resume` is what puts it back in the queue.
 _ACTIVE = ("queued", "running", "cancelling")
+_PARKED = ("waiting",)
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 
 
@@ -64,6 +79,7 @@ class GenomeService:
         self.stages = StageRequests(self)
         self.regressions = Regressions(self)
         self.revisions = Revisions(self)
+        self.captures = Captures(self)
 
     def claim_execution_owner(self) -> None:
         if os.name != "posix":
@@ -98,10 +114,19 @@ class GenomeService:
     def recover(self) -> None:
         """Single owner startup: never replay commands whose effects are unknown."""
         self.stages.recover()
+        error = _json({"error": "Host restarted; execution effects may be incomplete. "
+                               "No automatic replay."})
         with self._db() as db:
+            stopped = [row["id"] for row in db.execute(
+                "SELECT id FROM runs WHERE status IN ('queued','running','cancelling')").fetchall()]
             db.execute("UPDATE runs SET status='interrupted', result=? "
-                       "WHERE status IN ('queued','running','cancelling')",
-                       (_json({"error": "Host restarted; execution effects may be incomplete. No automatic replay."}),))
+                       "WHERE status IN ('queued','running','cancelling')", (error,))
+        for run_id in stopped:
+            capture = self.captures.for_run(run_id)
+            if capture:
+                # A restart is a verdict too: the capture must not sit in "replaying" forever.
+                self.captures.finish(capture["capture_id"], status="interrupted",
+                                     result=json.loads(error), host=None, emit=None)
 
     def import_asset(self, source: str | Path) -> dict[str, Any]:
         source = Path(source).resolve()
@@ -112,6 +137,7 @@ class GenomeService:
         for key in ("name", "description"):
             if not isinstance(manifest.get(key), str) or not manifest[key].strip():
                 raise ValueError(f"missing asset {key}")
+        validate_manifest(manifest)
         graph = compile(source)
         self._supported_graph(graph.node)
         inputs = manifest.get("parameters", {})
@@ -143,8 +169,9 @@ class GenomeService:
 
     @staticmethod
     def _supported_graph(node: Any) -> None:
-        if (node.needs - {"shell", "llm"} or node.mode == "try"
-                or any(rule.kind not in {"run", "metric"} for rule in node.verify)):
+        if (node.needs - {"shell", "llm", "human", "tool"} or node.mode == "try"
+                or any(rule.kind not in {"run", "metric", "human", "llm"}
+                       for rule in node.verify)):
             raise ValueError("supports fixed script sequences and agent tasks only")
         if "llm" in node.needs and node.do_kind != "llm" and not any("llm" in child.needs for child in node.children):
             raise ValueError("fixed script node declares unsupported llm requirement")
@@ -155,12 +182,20 @@ class GenomeService:
     def _requires_agent(node: Any) -> bool:
         return node.do_kind == "llm" or any(GenomeService._requires_agent(child) for child in node.children)
 
+    @staticmethod
+    def _requires_tool(node: Any) -> bool:
+        return "tool" in node.needs or any(
+            GenomeService._requires_tool(child) for child in node.children
+        )
+
     def check_capabilities(self, asset_id: str, version: str, capabilities: set[str]) -> None:
         graph = compile(self.root / "assets" / asset_id / version)
         asset = self.get(asset_id, version)
         required = set(asset.get("requires", []))
         if self._requires_agent(graph.node):
             required.add("agent_task")
+        if self._requires_tool(graph.node):
+            required.add("tool")
         if missing := required - capabilities:
             raise ValueError(f"execution host lacks capabilities: {sorted(missing)}")
 
@@ -168,7 +203,14 @@ class GenomeService:
         with self._db() as db:
             rows = db.execute("SELECT a.* FROM assets a WHERE published=1 AND publication="
                               "(SELECT MAX(publication) FROM assets b WHERE b.id=a.id AND b.published=1) ORDER BY id").fetchall()
-        return [{k: self._asset(row)[k] for k in ("id", "version", "name", "description")} for row in rows]
+        return [manifest_view(self._asset(row)) for row in rows]
+
+    def versions(self, asset_id: str) -> list[dict[str, Any]]:
+        with self._db() as db:
+            rows = db.execute("SELECT version, pin, published FROM assets WHERE id=? ORDER BY rowid",
+                              (asset_id,)).fetchall()
+        return [{"version": row["version"], "pin": row["pin"], "published": bool(row["published"])}
+                for row in rows]
 
     @staticmethod
     def _asset(row: sqlite3.Row) -> dict[str, Any]:
@@ -181,7 +223,8 @@ class GenomeService:
             raise ValueError("asset version not found")
         return self._asset(row)
 
-    def publish(self, asset_id: str, version: str) -> dict[str, Any]:
+    def publish(self, asset_id: str, version: str, *, evidence: str | None = None) -> dict[str, Any]:
+        """Publish a frozen version; ``evidence`` is the run finalizing right now."""
         asset = self.get(asset_id, version)
         if package_pin(self.root / "assets" / asset_id / version) != asset["pin"]:
             raise ValueError("frozen package has changed")
@@ -192,9 +235,11 @@ class GenomeService:
                 candidate = json.loads(row["promotion"])
                 if candidate["version"] == version and candidate.get("asset_id") == asset_id and not asset["published"]:
                     raise ValueError("revision candidates publish only after their regression suite passes")
-            evidence = db.execute("SELECT 1 FROM runs WHERE asset_id=? AND version=? AND pin=? AND status='succeeded'",
-                                  (asset_id, version, asset["pin"])).fetchone()
-            if evidence is None:
+            proof = db.execute(
+                "SELECT 1 FROM runs WHERE asset_id=? AND version=? AND pin=? "
+                "AND (status='succeeded' OR id=?)",
+                (asset_id, version, asset["pin"], evidence)).fetchone()
+            if proof is None:
                 raise ValueError("publication requires a successful validation run")
             db.execute("UPDATE assets SET published=1, publication=(SELECT COALESCE(MAX(publication),0)+1 FROM assets) "
                        "WHERE id=? AND version=? AND published=0", (asset_id, version))
@@ -260,6 +305,10 @@ class GenomeService:
             stage = db.execute("SELECT id FROM stage_requests WHERE run_id=? AND state='pending'", (run_id,)).fetchone()
         if stage and state['status'] in _ACTIVE:
             state.update(phase='waiting_agent', stage_request_id=stage['id'])
+        if state['status'] in _PARKED:
+            waiting = (state.get('result') or {}).get('waiting')
+            state.update(phase='waiting_human',
+                         waiting=waiting if isinstance(waiting, dict) else None)
         revision = self.revisions.for_run(run_id)
         if revision:
             state.update(parent_run_id=revision['parent'], revision_id=revision['id'])
@@ -275,22 +324,49 @@ class GenomeService:
                 with self._db() as db:
                     db.execute("UPDATE runs SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancelling' END "
                                "WHERE id=? AND status IN ('queued','running')", (run_id,))
+            elif state["status"] in _PARKED:
+                # Nothing is running: a parked run only has to be taken out of the queue
+                # the resume would put it back into.
+                with self._db() as db:
+                    db.execute("UPDATE runs SET status='cancelled' WHERE id=? AND status='waiting'",
+                               (run_id,))
+        return self.status(scope, run_id)
+
+    def resume(self, scope: str, run_id: str) -> dict[str, Any]:
+        """Put a parked run back in the queue; the host's worker picks it up from here."""
+        with self._lock:
+            state = self.status(scope, run_id)
+            if state["status"] not in _PARKED:
+                return state
+            with self._db() as db:
+                db.execute("UPDATE runs SET status='queued' WHERE id=? AND status='waiting'",
+                           (run_id,))
         return self.status(scope, run_id)
 
     def execute(self, scope: str, run_id: str, host: Host,
                 emit: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
         with self._lock:
             state = self.status(scope, run_id)
-            if state["status"] != "queued":
+            if state["status"] not in ("queued", *_PARKED):
                 return state
+            resuming = state["status"] in _PARKED
+            parked = (state.get("result") or {}).get("waiting") if resuming else None
+            resuming_node = (
+                str(parked.get("node"))
+                if isinstance(parked, dict) and parked.get("node")
+                else None
+            )
             cancel = self._signals.setdefault(run_id, threading.Event())
             with self._db() as db:
-                changed = db.execute("UPDATE runs SET status='running' WHERE id=? AND status='queued'", (run_id,)).rowcount
+                changed = db.execute(
+                    "UPDATE runs SET status='running' "
+                    "WHERE id=? AND status IN ('queued','waiting')", (run_id,)).rowcount
             if not changed:
                 return self.status(scope, run_id)
         execution_evidence = {"log_tail": ""}
         promotion = None
         revision = None
+        evidence_dir = self.root / "runs" / run_id
         def check_cancel() -> None:
             if cancel.is_set():
                 raise RunCancelled()
@@ -334,7 +410,8 @@ class GenomeService:
                 if package_pin(original) != baseline['pin']:
                     raise ValueError("original verification package changed")
                 options['verification_package'] = original
-            ports, params = host.prepare(run_id, package, state["params"], paths, cancel, event, **options)
+            ports, params = host.prepare(run_id, package, state["params"], paths, cancel,
+                                         event, resuming=resuming_node, **options)
             if package_pin(package) != state["pin"]:
                 raise ValueError("package changed while preparing execution")
             agent_task = None
@@ -343,10 +420,13 @@ class GenomeService:
             ports = replace(ports, check_cancel=check_cancel, on_event=event, agent_task=agent_task)
             if handshake(graph, ports):
                 raise ValueError("unsupported graph capabilities")
-            result = run(graph, params, ports, self.root / "runs" / run_id)
+            result = (resume_run(graph, ports, evidence_dir) if resuming
+                      else run(graph, params, ports, evidence_dir))
             check_cancel()
-            status = "succeeded" if result.status == "succeeded" else "failed"
-            details = {"outputs": result.outputs, "failure": result.failure, "abandonment": result.abandonment}
+            status = {"succeeded": "succeeded", "waiting": "waiting"}.get(
+                str(result.status), "failed")
+            details = {"outputs": result.outputs, "failure": result.failure,
+                       "abandonment": result.abandonment, "waiting": result.waiting}
             if status == "succeeded" and revision and revision["promotion"]:
                 promotion = self.regressions.validate(revision, host, cancel, event, check_cancel, self.root / "runs" / run_id / "regressions")
         except RegressionFailure as exc:
@@ -358,7 +438,6 @@ class GenomeService:
         except Exception as exc:
             status, details = "interrupted", {"error": str(exc)}
         details["execution"] = execution_evidence
-        evidence_dir = self.root / "runs" / run_id
         checkpoint = evidence_dir / "checkpoint.json"
         if checkpoint.exists():
             nodes = json.loads(checkpoint.read_text()).get("nodes", {})
@@ -371,6 +450,21 @@ class GenomeService:
             details["evidence"] = {"checkpoint": str(checkpoint), "ledger": str(evidence_dir / "ledger.jsonl")}
         if status == "failed":
             details["instruction"] = RECOVERY_INSTRUCTION
+        elif status == "waiting":
+            details["instruction"] = WAITING_INSTRUCTION
+        capture = self.captures.for_run(run_id)
+        if capture:
+            # The run stays "running" until its capture verdict is part of the same
+            # row, so no observer sees a finished capture run without its decision.
+            # Replay B runs here, in the run's worker thread, never inside a tool call.
+            if cancel.is_set() and status != "interrupted":
+                status = "cancelled"
+            try:
+                details["capture"] = self.captures.finish(
+                    capture["capture_id"], status=status, result=details, host=host,
+                    emit=emit, cancel=cancel)
+            except Exception as exc:
+                details["capture"] = {"capture_id": capture["capture_id"], "error": str(exc)}
         with self._lock, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             if cancel.is_set() and status != "interrupted":

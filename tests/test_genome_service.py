@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -75,7 +76,7 @@ def test_failure_does_not_run_downstream_and_remote_artifacts(catalog, tmp_path)
     execution_root = tmp_path / "separate-execution-host"
 
     class Host:
-        def prepare(self, run_id, package, params, paths, cancel, emit):
+        def prepare(self, run_id, package, params, paths, cancel, emit, **options):
             return Ports(shell=LocalShell(), artifacts=LocalArtifacts(execution_root)), params
 
     state = submit(catalog, data, request="remote")
@@ -114,7 +115,7 @@ def test_preparation_interruption_preserves_stop_evidence(catalog, tmp_path, can
                 "started": False, "stopped": confirmed, "error_code": "startup_timeout"}
 
     class Host:
-        def prepare(self, run_id, package, params, paths, cancel, emit):
+        def prepare(self, run_id, package, params, paths, cancel, emit, **options):
             emit({"event": "execution", "execution": evidence})
             if cancelled:
                 cancel.set()

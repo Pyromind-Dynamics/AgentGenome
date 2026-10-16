@@ -61,6 +61,36 @@ node:
     assert check(write_graph(tmp_path / "skeleton", skeleton)) == []
 
 
+LEAF_DO = '      do: {run: "echo \'{\\"rows\\": 1}\' > {artifact}"}\n'
+
+
+def test_artifact_extension_is_declared_per_leaf(tmp_path: Path) -> None:
+    body = VALID.replace(LEAF_DO, "      artifact: {ext: jsonl}\n" + LEAF_DO)
+    package = write_graph(tmp_path, body)
+    assert check(package) == []
+    assert compile(package).node.children[0].artifact_ext == ".jsonl"
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["artifact: {ext: 'json.l'}", "artifact: {suffix: jsonl}", "artifact: jsonl"],
+)
+def test_artifact_declaration_must_be_a_short_extension(
+    tmp_path: Path, declaration: str
+) -> None:
+    body = VALID.replace(LEAF_DO, f"      {declaration}\n" + LEAF_DO)
+    diagnostics = check(write_graph(tmp_path, body))
+    assert [item.code for item in diagnostics] == ["E_ARTIFACT"]
+
+
+def test_artifact_declaration_is_rejected_on_a_group(tmp_path: Path) -> None:
+    body = VALID.replace(
+        "  verify:\n    - metric:", "  artifact: {ext: jsonl}\n  verify:\n    - metric:"
+    )
+    diagnostics = check(write_graph(tmp_path, body))
+    assert [item.code for item in diagnostics] == ["E_ARTIFACT"]
+
+
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
@@ -171,6 +201,71 @@ def test_needs_are_normalized_and_cannot_omit_inferred_requirements(tmp_path: Pa
         '      needs: [database]\n      do: {run: "echo \'{\\"rows\\": 1}\' > {artifact}"}\n',
     )
     assert "E_NEEDS" in {item.code for item in check(write_graph(tmp_path / "invalid", invalid))}
+
+
+TOOL_PACKAGE = """\
+version: "gt/1.0"
+node:
+  id: submit-sop
+  mode: sequence
+  input:
+    dataset: {type: path, from: params.dataset}
+  output:
+    submission: {type: json, compose: [submit.output.submission]}
+  verify:
+    - metric: "submission.task_id"
+  children:
+    - id: submit
+      input:
+        dataset: {type: path, from: submit-sop.input.dataset}
+      do:
+        tool:
+          name: df_submit_pipeline
+          args:
+            dataset: "{input.dataset}"
+            task_name: pretag
+            retries: 2
+      output:
+        submission: {type: json}
+      verify:
+        - metric: "submission.task_id"
+"""
+
+
+def test_tool_leaf_compiles_and_infers_needs(tmp_path: Path) -> None:
+    package = write_graph(tmp_path, TOOL_PACKAGE)
+    assert check(package) == []
+    node = compile(package).node.children[0]
+    assert node.needs == frozenset({"tool"})
+    assert node.do is None
+    assert node.do_kind == "tool"
+    assert node.tool is not None
+    assert node.tool.name == "df_submit_pipeline"
+    assert dict(node.tool.args) == {"dataset": "{input.dataset}", "task_name": "pretag",
+                                    "retries": 2}
+
+
+def test_tool_declaration_is_checked(tmp_path: Path) -> None:
+    bad_name = TOOL_PACKAGE.replace("name: df_submit_pipeline", "name: DF Submit")
+    codes = {item.code for item in check(write_graph(tmp_path / "name", bad_name))}
+    assert "E_TOOL_CALL" in codes
+
+    bad_args = TOOL_PACKAGE.replace(
+        '          args:\n            dataset: "{input.dataset}"\n'
+        '            task_name: pretag\n            retries: 2\n',
+        "          args: [dataset]\n")
+    codes = {item.code for item in check(write_graph(tmp_path / "args", bad_args))}
+    assert "E_TOOL_CALL" in codes
+
+    bad_slot = TOOL_PACKAGE.replace("task_name: pretag", 'task_name: "{input.nope}"')
+    codes = {item.code for item in check(write_graph(tmp_path / "slot", bad_slot))}
+    assert "E_SLOT" in codes
+
+
+def test_tool_leaf_needs_declaration_may_not_omit_the_port(tmp_path: Path) -> None:
+    missing = TOOL_PACKAGE.replace("    - id: submit\n", "    - id: submit\n      needs: []\n")
+    codes = {item.code for item in check(write_graph(tmp_path, missing))}
+    assert "E_NEEDS" in codes
 
 
 def test_tried_slots_require_static_prior_candidate(tmp_path: Path) -> None:

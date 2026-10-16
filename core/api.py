@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkpoint import Checkpoint, CheckpointError
-from .engine import Engine, NodeAbandoned, NodeFailed
+from .engine import Engine, NodeAbandoned, NodeFailed, NodeWaiting
 from .ledger import Ledger
 from .ports import Ports
 
@@ -26,6 +26,8 @@ class RunStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     ABANDONED = "abandoned"
+    # A human node parked the run. Not a verdict: resume continues from its checkpoint.
+    WAITING = "waiting"
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,7 @@ class RunResult:
     outputs: dict[str, dict[str, Any]] | None = None
     failure: dict[str, Any] | None = None
     abandonment: dict[str, Any] | None = None
+    waiting: dict[str, Any] | None = None
 
 
 def _paths(node: Any) -> set[str]:
@@ -57,7 +60,7 @@ def handshake(graph: Any, ports: Ports) -> list[Diagnostic]:
         )
 
     diagnostics: list[Diagnostic] = []
-    for need, port in (("llm", ports.ai), ("human", ports.human)):
+    for need, port in (("llm", ports.ai), ("human", ports.human), ("tool", ports.tool)):
         node = first_node(need)
         if node is not None and port is None and not (need == "llm" and ports.agent_task):
             diagnostics.append(
@@ -111,6 +114,12 @@ def _result_abandoned(graph: Any, run_dir: Path, abandoned: NodeAbandoned, check
     )
 
 
+def _result_waiting(run_dir: Path, waiting: NodeWaiting) -> RunResult:
+    return RunResult(RunStatus.WAITING, run_dir.name, run_dir,
+                     waiting={"node": waiting.node, "question": waiting.question,
+                              "artifact": waiting.artifact})
+
+
 def run(graph: Any, params: dict[str, Any], ports: Ports, run_dir: str | Path) -> RunResult:
     directory = Path(run_dir)
     checkpoint = Checkpoint.create(directory, graph.pin, params)
@@ -128,6 +137,10 @@ def run(graph: Any, params: dict[str, Any], ports: Ports, run_dir: str | Path) -
     engine = Engine(graph, ports, directory, checkpoint, ledger)
     try:
         outputs = engine.execute()
+    except NodeWaiting as parked:
+        result = _result_waiting(directory, parked)
+        ledger.append("run_waiting", waiting=result.waiting)
+        return result
     except NodeAbandoned as abandoned:
         result = _result_abandoned(graph, directory, abandoned, checkpoint)
         ledger.append("run_abandoned", abandonment=result.abandonment)
@@ -151,6 +164,10 @@ def resume(graph: Any, ports: Ports, run_dir: str | Path) -> RunResult:
     engine = Engine(graph, ports, directory, checkpoint, ledger)
     try:
         outputs = engine.execute()
+    except NodeWaiting as parked:
+        result = _result_waiting(directory, parked)
+        ledger.append("run_waiting", waiting=result.waiting)
+        return result
     except NodeAbandoned as abandoned:
         result = _result_abandoned(graph, directory, abandoned, checkpoint)
         ledger.append("run_abandoned", abandonment=result.abandonment)

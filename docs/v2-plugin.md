@@ -1,12 +1,43 @@
-# v2 插件能力（包版本 0.3.0）
+# v2 插件能力（包版本 0.6.0）
 
 同一个 Pi 标准插件入口负责 `genome_*` 工具，Python 服务管理资产、节点请求、验收和连续修订。SDK 只提供当前会话、执行环境和模型适配，不注册另一套工具，也不再通过扩展工厂加载插件。
+
+轨迹沉淀（`genome_trace` / `genome_capture` / `genome_distill` / `genome_capture_status`）见 `docs/v2-capture.md`。
 
 ## 节点交接
 
 `do.llm` 使用带上下文的 `Ports.agent_task`；原有 `AIPort.work(prompt)` 继续兼容。请求包含运行、节点、尝试、输入、资源目录和预期产物。宿主安排当前 Agent 会话执行，工具 `genome_step_result` 只登记回执；对应轮次正常结束且回执匹配后，内核才检查文件和执行验收。消息交付确认不是节点结果。
 
 节点记录在 SQLite 的 `stage_requests`。重启将未结束请求标记中断，不投递旧任务、不重放脚本。等待不持有终端锁，状态与取消仍可用。SDK 使用它的通用阶段任务端口；原生宿主尚未接通阶段任务，会在运行前拒绝。
+
+## 人工门禁与唤醒
+
+人工门禁是 graph 里的普通节点（`do: {human}`）。回放跑到这里会停下等人：
+
+- 运行状态变成 `waiting`，结果里带 `node` / `question` / `artifact`（人工产物要写到
+  的确切路径），checkpoint 保留，执行线程释放；capture 回放停在人工节点时，沉淀报告
+  写明「停在人工节点」，不会当成回放失败；
+- 工具 `genome_resume(run_id)` 唤醒同一条 run：回到队列后从停下的节点继续，只批准
+  这一个已答过的门禁，后面的门禁照常停下；run 不在 `waiting` 时只返回当前状态；
+- 宿主必须提供交互式 human 端口（`capabilities()["interactive"] is True`），否则
+  handshake 报 `E_NEEDS_NONINTERACTIVE`；SDK 桥接与原生插件都在停下时把
+  node/question/artifact 交给 agent 转达用户，用户做完人工步骤后由 agent 唤醒；
+- SDK 侧 `waiting` 不算终态：不发布 `operation.completed`，operation 保持打开；会话
+  不在线时通知转为 pending，下一次会话开始再投递，门禁不会丢；
+- agent 不得替用户伪造人工产物，也不能自己重放 graph 里的节点来「绕过」门禁。
+
+## 沉淀范围复核
+
+`genome_distill` 的计划比会话窄时，先由 `_scope_split` 判断被落下的步骤是否和链路相连：
+相连的（产物喂给链路、或接在链路后面）直接报「链路范围需要用户复核」并列出，agent
+必须先把这些步骤给用户看，用户确认这次只要后半段后，才带 `review_confirmed=true` +
+`review_reason` 重新提交，确认过的边界写进报告；不相连的旁支（本地试跑小样、只写调试
+文件的探测、被后续步骤取代的尝试）不挡沉淀，写进报告的「旁支步骤（未进链路，链路不
+依赖它）」段，agent 不需要为它们问用户，也不该把它们硬塞进 `steps`。
+`genome_capture` 侧的对应约束是：链路只收完整固化的图（`_require_solidified`）。
+无法机械固化的步骤不会被声明进 manifest 蒙混过关，capture 直接失败并列出每一步的
+序号与原因；改用 `genome_distill` 把这些步骤换成 `run` / `llm` / `tool` / `human`
+节点，或者用 `final_artifact` 重新切片、把本次特有的产物声明成 `{参数名}` 输入边界。
 
 ## 修订与接手
 
