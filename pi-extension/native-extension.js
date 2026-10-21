@@ -4,6 +4,7 @@ import { NativeClient, setupRuntime } from "./native-client.js";
 const ACTIVE = new Set(["queued", "running", "cancelling"]);
 const RECEIPT = "agentgenome.completed";
 const GATE = "agentgenome.waiting";
+const STAGE = "agentgenome.stage";
 
 function gateKey(waiting) {
   return JSON.stringify([waiting.node || "", waiting.question || "", waiting.artifact || ""]);
@@ -78,11 +79,37 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
   }
 
   async function refresh(state) {
-    const { runs } = await state.client.request("snapshot");
+    const { runs, stages = [] } = await state.client.request("snapshot");
     if (!alive(state)) return false;
     const delivered = deliveredRunIds(entries(state));
+    if (!state.stage && (state.ctx.isIdle?.() ?? true)) {
+      const pending = stages.find((stage) => !stage.claimed);
+      if (pending) {
+        const claim = await state.client.request("stage_claim", { request_id: pending.request.request_id });
+        if (claim.claimed && alive(state)) {
+          const stage = { ...claim, active: false };
+          state.stage = stage;
+          try {
+            pi.sendMessage({ customType: STAGE, display: false,
+              details: { request_id: claim.request.request_id, execution_id: claim.execution_id, scope: state.scope },
+              content: `执行历史经验的 llm 阶段：${JSON.stringify(claim.request)}\n`
+                + "只执行本阶段任务，写入指定产物后调用 genome_step_result，再立即结束当前轮次。不要新建或恢复其他图，不要重跑上下游脚本。",
+            }, { triggerTurn: true, deliverAs: "followUp" });
+          } catch (error) {
+            state.stage = undefined;
+            // Closing the owner connection fails the handoff; never re-deliver it.
+            state.client.close();
+            throw error;
+          }
+        }
+      }
+    }
     for (const run of runs) {
       if (!alive(state)) return false;
+      if (state.stage?.request.run_id === run.id && !ACTIVE.has(run.status)) {
+        if (state.stage.active) state.ctx.abort?.();
+        state.stage = undefined;
+      }
       show(state, progressLines(run));
       if (run.status === "waiting") {
         const waiting = run.result?.waiting || {};
@@ -130,7 +157,7 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
       }
       // Ack only after the actual custom_message appears in Pi history, not when queued.
     }
-    return runs.length > 0;
+    return runs.length > 0 || stages.length > 0;
   }
 
   function watch(state) {
@@ -172,7 +199,46 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
 
   pi.on("session_start", (_event, ctx) => { begin(ctx); });
   pi.on("session_shutdown", () => { stop(); });
-  pi.on("agent_end", async () => { if (current?.ready.size) await startReady(current); });
+  pi.on("message_start", async (event) => {
+    const state = current, stage = state?.stage, message = event.message;
+    if (message?.role !== "custom" || message.customType !== STAGE) return;
+    const live = stage && message.details?.request_id === stage.request.request_id
+      && message.details?.execution_id === stage.execution_id && message.details?.scope === state.scope;
+    if (!live) {
+      if (state) {
+        // A delivered stage message whose handoff is already dead (cancelled run,
+        // switched session) must never reach the model; abort the turn it arrived in.
+        state.ctx.abort?.();
+        show(state, ["已拦截失效的 llm 阶段消息：运行已取消或阶段已结束，本轮中止。"]);
+      }
+      return;
+    }
+    try {
+      await state.client.request("stage_begin", {
+        request_id: stage.request.request_id, execution_id: stage.execution_id,
+      });
+      if (alive(state) && state.stage === stage) stage.active = true;
+    } catch (error) {
+      if (alive(state)) {
+        state.ctx.abort?.();
+        show(state, [`阶段已失效：${error.message}`]);
+      }
+    }
+  });
+  pi.on("agent_end", async (event) => {
+    const state = current, stage = state?.stage;
+    if (stage?.active) {
+      const last = [...(event?.messages || [])].reverse().find((message) => message.role === "assistant");
+      const status = last?.stopReason === "stop" ? "completed" : last?.stopReason === "aborted" ? "aborted" : "failed";
+      try {
+        await state.client.request("stage_finish", {
+          request_id: stage.request.request_id, execution_id: stage.execution_id, status,
+        });
+      } catch (error) { if (alive(state)) show(state, [`阶段结束确认失败：${error.message}`]); }
+      finally { if (state.stage === stage) state.stage = undefined; }
+    }
+    if (current?.ready.size) await startReady(current);
+  });
   pi.registerCommand("genome", {
     description: "AgentGenome: setup | import <path> | validate <id> <version> <JSON params> | publish <id> <version>",
     async handler(input, ctx) {
@@ -204,10 +270,25 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
   return {
     async invoke(action, args, callId, _signal, ctx) {
       const state = current || begin(ctx);
+      if (state.stage?.active) {
+        if (["run", "resume", "capture", "distill", "prepare_revision"].includes(action)) {
+          throw new Error("An llm stage cannot start or resume another graph");
+        }
+      }
+      if (action === "step_result") {
+        const stage = state.stage;
+        if (!stage?.active || args.request_id !== stage.request.request_id) {
+          throw new Error("genome_step_result must belong to this active llm stage round");
+        }
+        args = { ...args, execution_id: stage.execution_id };
+      }
       const result = await state.client.request(action, args, callId);
       if (action === "run" || action === "resume") remember(state, result);
       else if (action === "capture" || action === "distill") rememberCapture(state, result);
-      else if (action === "cancel") watch(state);
+      else if (action === "cancel") {
+        if (state.stage?.active && state.stage.request.run_id === args.run_id) state.ctx.abort?.();
+        watch(state);
+      }
       return result;
     },
   };

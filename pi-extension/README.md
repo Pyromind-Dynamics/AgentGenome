@@ -129,6 +129,26 @@ is approved, declared verification still runs, and subsequent gates wait again.
 Already delivered work orders are not repeated when reopening the same session.
 After resume is queued, end the agent turn and wait for the completion message.
 
+Native Pi also supports `do.llm` stages (`requires: [agent_task]`) in the current
+interactive session. The plugin delivers one stage when the session is idle;
+write its declared output, call `genome_step_result`, then end the turn. A receipt
+alone does not finish the stage: the matching model round must end successfully
+before scripts verify the files and the graph continues. Do not poll or start
+another graph from a stage. Stage handoffs expire after 30 minutes; cancellation,
+owner disconnection or service restart never re-delivers an old stage. Switching
+sessions closes the old handoff and fails it rather than sending it to the new
+session. A handoff is only created or kept while its own session still has a
+connected stage-capable client; if that session has already exited, the stage is
+interrupted instead of parking the run. A delivered stage message whose round is
+already dead is intercepted and its turn aborted before the model acts on it.
+Later runs need an explicit new submission.
+
+Use `templates/native-agent-task-check` to test script → Agent → script. This does
+not enable native `model_judge`, revision or read-only verification protection;
+`data-cleaning-v2` still requires additional host capabilities. Capture's separate
+new-parameter probe is not covered by this stage handoff; do not infer generalized
+reuse from a successful main run alone.
+
 ## Development / packaging
 
 From the AgentGenome repository:

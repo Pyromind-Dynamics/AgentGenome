@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from .dispatch import invoke
 from .local_host import LocalExecutionHost, NativeHuman
+from .native_stages import NativeStages
 from .service import GenomeService
 
 PROTOCOL = 1
@@ -52,10 +53,14 @@ class LocalService:
         # Freeze the identity at process startup, not after files are replaced.
         self.runtime_fingerprint = runtime_fingerprint()
         self.service = GenomeService(root)
+        self.stages = NativeStages(self.service,
+                                   deliverable=lambda scope: scope in self.stage_scopes())
         self.root = self.service.root
         self.idle_seconds = idle_seconds
         self.jobs: dict[str, asyncio.Task] = {}
         self.clients: set[asyncio.StreamWriter] = set()
+        self.client_scopes: dict[str, str] = {}
+        self.stage_clients: set[str] = set()
         self.last_used = time.monotonic()
         with self.service._db() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS native_runs (
@@ -87,26 +92,44 @@ class LocalService:
             db.execute("UPDATE native_runs SET progress=? WHERE run_id=?",
                        (json.dumps(state), run_id))
 
+    def stage_scopes(self) -> set[str]:
+        return {scope for key, scope in self.client_scopes.items() if key in self.stage_clients}
+
     async def execute(self, scope: str, run_id: str, cwd: str) -> None:
+        loop = asyncio.get_running_loop()
+
+        async def handoff(request):
+            if scope not in self.stage_scopes():
+                return {"status": "interrupted"}
+            return await self.stages.wait(scope, request)
+
+        def emit(event):
+            self.progress(run_id, event)
+            if event["event"] == "waiting_agent":
+                return asyncio.run_coroutine_threadsafe(
+                    handoff(event["request"]), loop).result()
+
         try:
             await asyncio.to_thread(self.service.execute, scope, run_id,
                                     LocalExecutionHost(self.root, Path(cwd), human=NativeHuman()),
-                                    lambda event: self.progress(run_id, event))
+                                    emit)
         finally:
             self.jobs.pop(run_id, None)
             self.last_used = time.monotonic()
 
-    async def dispatch(self, scope: str, cwd: str, message: dict) -> dict:
+    async def dispatch(self, scope: str, cwd: str, message: dict, connection_id: str | None = None) -> dict:
         action, args = message["action"], message.get("arguments", {})
+        capabilities = {"agent_task"} if connection_id in self.stage_clients else set()
         request_id = message.get("request_id", message["id"])
         if action in {"run", "validate", "capture", "distill"}:
             host = LocalExecutionHost(self.root, Path(cwd))
             if action == "validate":
-                self.service.check_capabilities(args["asset_id"], args["version"], set())
+                self.service.check_capabilities(args["asset_id"], args["version"], capabilities)
                 result = self.service.submit(scope, request_id, args["asset_id"], args["version"],
                                              args["params"], allow_draft=True)
             else:
-                result = invoke(self.service, scope, action, args, request_id, host=host)
+                result = invoke(self.service, scope, action, args, request_id,
+                                host=host, capabilities=capabilities)
             # A capture or distill reuses an existing version without queueing a run.
             run_id = (result.get("run_id") if action in {"capture", "distill"}
                       else result["id"])
@@ -126,7 +149,14 @@ class LocalService:
                 self.jobs[run_id] = asyncio.create_task(self.execute(scope, run_id, row[0]))
             return state
         if action == "snapshot":
-            return {"runs": self.records(scope)}
+            return {"runs": self.records(scope), "stages": self.stages.snapshot(scope)}
+        if action in {"stage_claim", "stage_begin", "stage_finish", "step_result"}:
+            if "agent_task" not in capabilities:
+                raise ValueError("native stages require a stage-capable Pi client")
+            if action == "stage_claim":
+                return self.stages.claim(scope, args["request_id"], connection_id)
+            method = {"stage_begin": "begin", "stage_finish": "finish", "step_result": "receipt"}[action]
+            return getattr(self.stages, method)(scope, args, connection_id)
         if action in {"claim", "ack", "renew", "release"}:
             run_id = args["run_id"]
             state = self.service.status(scope, run_id)
@@ -158,10 +188,11 @@ class LocalService:
             return self.service.import_asset(Path(cwd) / args["source"])
         if action == "publish":
             return self.service.publish(args["asset_id"], args["version"])
-        return invoke(self.service, scope, action, args, request_id)
+        return invoke(self.service, scope, action, args, request_id, capabilities=capabilities)
 
     async def client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.clients.add(writer)
+        connection_id = uuid4().hex
         scope = cwd = None
         try:
             while line := await reader.readline():
@@ -180,12 +211,15 @@ class LocalService:
                         if not isinstance(args.get("scope"), str) or not args["scope"] or not Path(args["cwd"]).is_absolute():
                             raise ValueError("hello requires session scope and absolute cwd")
                         scope, cwd = args["scope"], args["cwd"]
+                        self.client_scopes[connection_id] = scope
+                        if args.get("stage_protocol") == 1:
+                            self.stage_clients.add(connection_id)
                         result = {"protocol": PROTOCOL, "version": VERSION,
                                   "runtime_fingerprint": self.runtime_fingerprint}
                     elif scope is None:
                         raise ValueError("hello required")
                     else:
-                        result = await self.dispatch(scope, cwd, message)
+                        result = await self.dispatch(scope, cwd, message, connection_id)
                     response = {"id": message["id"], "result": result}
                 except Exception as exc:
                     response = {"id": message.get("id"), "error": str(exc)}
@@ -195,6 +229,11 @@ class LocalService:
             pass
         finally:
             self.clients.discard(writer)
+            self.client_scopes.pop(connection_id, None)
+            self.stage_clients.discard(connection_id)
+            remaining = [s for key, s in self.client_scopes.items() if key in self.stage_clients]
+            abandoned = scope if scope not in remaining else None
+            self.stages.disconnect(connection_id, abandoned_scope=abandoned)
             self.last_used = time.monotonic()
             writer.close()
             try:

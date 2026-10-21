@@ -147,7 +147,7 @@ export class NativeClient {
     }
     try {
       const hello = await this.send("hello", { protocol: PROTOCOL, version: VERSION,
-        runtime_fingerprint: fingerprint, scope: this.scope, cwd: this.cwd });
+        runtime_fingerprint: fingerprint, stage_protocol: 1, scope: this.scope, cwd: this.cwd });
       if (hello.runtime_fingerprint !== fingerprint) {
         throw new Error("AgentGenome service build mismatch: an older service is still running. Finish existing runs, close all Pi clients and wait for idle exit before reconnecting; no runs were restarted.");
       }

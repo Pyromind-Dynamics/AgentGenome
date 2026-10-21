@@ -29,7 +29,7 @@ def server(tmp_path):
         processes.append(process)
         return process
 
-    def connect(scope="one", version=VERSION, cwd=None):
+    def connect(scope="one", version=VERSION, cwd=None, stage_protocol=1):
         for _ in range(200):
             client = socket.socket(socket.AF_UNIX)
             client.settimeout(5)
@@ -54,7 +54,8 @@ def server(tmp_path):
             return reply["result"]
 
         request("hello", {"scope": scope, "cwd": str(cwd or tmp_path), "protocol": PROTOCOL,
-                          "version": version})
+                          "version": version, "stage_protocol": stage_protocol})
+        request.close = lambda: (stream.close(), client.close())
         return request
 
     process = launch()
@@ -98,6 +99,192 @@ node:
     - run: "test -s {artifact}"
 ''')
     return source
+
+
+def native_stage(client):
+    client("import", {"source": str(ROOT / "templates/native-agent-task-check")})
+    run = client("validate", {"asset_id": "native-agent-task-check", "version": "1.0.0", "params": {}})
+    client("start", {"run_id": run["id"]})
+    for _ in range(200):
+        stages = client("snapshot")["stages"]
+        if stages:
+            return run, stages[0]["request"]
+        time.sleep(.02)
+    raise AssertionError("stage was not handed off")
+
+
+def test_legacy_native_client_rejects_llm_before_submission(server):
+    home, _, _, connect = server
+    client = connect(stage_protocol=None)
+    client("import", {"source": str(ROOT / "templates/native-agent-task-check")})
+    with pytest.raises(ValueError, match="agent_task"):
+        client("validate", {"asset_id": "native-agent-task-check", "version": "1.0.0", "params": {}})
+    assert client("snapshot")["runs"] == []
+
+
+@pytest.mark.parametrize("mode,expected", [
+    ("ok", "succeeded"), ("missing_receipt", "failed"),
+    ("missing_file", "failed"), ("bad_report", "failed"), ("aborted", "failed"),
+])
+def test_native_llm_stage_waits_for_round_and_verifies_outputs(server, tmp_path, mode, expected):
+    home, _, _, connect = server
+    client = connect()
+    run, request = native_stage(client)
+    stage_id = request["request_id"]
+    assert request["node_id"] == "agent-check.explain"
+    assert request["resource_dir"].endswith("work/package")
+    peer = connect()
+    claim = client("stage_claim", {"request_id": stage_id})
+    assert peer("stage_claim", {"request_id": stage_id}) == {"claimed": False}
+    args = {"request_id": stage_id, "execution_id": claim["execution_id"]}
+    receipt = {**args, "outcome": "completed", "summary": "Report written"}
+    with pytest.raises(ValueError, match="not started"):
+        client("step_result", receipt)
+    with pytest.raises(ValueError, match="another connection"):
+        peer("stage_begin", args)
+    with pytest.raises(ValueError, match="execution round"):
+        client("stage_begin", {**args, "execution_id": "wrong"})
+    other = connect("other")
+    assert other("snapshot")["stages"] == []
+    with pytest.raises(ValueError, match="not active"):
+        other("stage_claim", {"request_id": stage_id})
+    client("stage_begin", args)
+    if mode != "missing_file":
+        Path(request["expected_outputs"][0]).write_text(json.dumps({
+            "rows": 99 if mode == "bad_report" else 2,
+            "names": ["Ada", "Cy"], "summary": "两条记录。",
+        }))
+    if mode != "missing_receipt":
+        assert client("step_result", receipt)["awaiting_verification"]
+        assert client("step_result", receipt)["accepted"]
+    assert client("status", {"run_id": run["id"]})["status"] == "running"
+    assert not (home / "runs" / run["id"] / "work/artifacts/agent-check--verify.out").exists()
+    client("stage_finish", {**args, "status": "aborted" if mode == "aborted" else "completed"})
+    finished = wait_run(client, run["id"])
+    assert finished["status"] == expected, finished
+    assert client("snapshot")["stages"] == []
+    with pytest.raises(ValueError, match="not active"):
+        client("step_result", receipt)
+    if mode == "ok":
+        report = Path(finished["result"]["outputs"]["report"]["execution_path"])
+        assert json.loads(report.read_text()) == {"passed": True, "rows": 2, "names": ["Ada", "Cy"]}
+
+
+@pytest.mark.parametrize("mode", ["cancel", "disconnect", "disconnect_unclaimed", "restart"])
+def test_native_stage_interruption_never_redelivers_old_work(server, tmp_path, mode):
+    home, process, launch, connect = server
+    client = connect()
+    observer = connect()
+    run, request = native_stage(client)
+    if mode != "disconnect_unclaimed":
+        claim = client("stage_claim", {"request_id": request["request_id"]})
+        args = {"request_id": request["request_id"], "execution_id": claim["execution_id"]}
+        client("stage_begin", args)
+    if mode == "cancel":
+        observer("cancel", {"run_id": run["id"]})
+        expected = "cancelled"
+    elif mode == "disconnect":
+        client.close()
+        expected = "failed"
+    elif mode == "disconnect_unclaimed":
+        connect("unrelated-session")
+        observer.close()
+        client.close()
+        time.sleep(.15)
+        observer = connect()
+        expected = "failed"
+    else:
+        process.terminate()
+        process.wait(timeout=5)
+        launch()
+        observer = connect()
+        expected = "interrupted"
+    assert wait_run(observer, run["id"])["status"] == expected
+    assert observer("snapshot")["stages"] == []
+    assert not Path(request["expected_outputs"][0]).exists()
+    with pytest.raises(ValueError, match="not active"):
+        observer("stage_claim", {"request_id": request["request_id"]})
+
+
+def gated_stage_package(tmp_path):
+    """The pre-stage script blocks until a release file exists, so the test decides
+    exactly when the handoff is attempted relative to session exit."""
+    source = tmp_path / "gated-stage"
+    source.mkdir()
+    (source / "manifest.json").write_text(json.dumps({
+        "id": "native-gated-stage-check", "version": "1.0.0", "name": "会话退出阶段验证",
+        "description": "前置脚本等待放行文件后再进入 llm 节点", "parameters": {},
+        "requires": ["agent_task"], "outputs": {"report": "Agent 报告"},
+    }))
+    gate = tmp_path / "release"
+    (source / "graph.yaml").write_text(f'''version: "gt/1.0"
+node:
+  id: agent-check
+  mode: sequence
+  output:
+    report: {{type: json, compose: [explain.output.report]}}
+  verify:
+    - metric: "report.rows == 2"
+  children:
+    - id: prepare
+      do:
+        run: "until [ -f {gate} ]; do sleep 0.05; done; printf 'name,age' > {{artifact}}"
+      output:
+        source: {{type: path}}
+      verify:
+        - run: "test -s {{artifact}}"
+    - id: explain
+      input:
+        source: {{type: path, from: prepare.output.source}}
+      do:
+        llm: "读取 CSV {{input.source}}，将 JSON 报告写入 {{artifact}}，然后调用 genome_step_result 并结束轮次。"
+      output:
+        report: {{type: json}}
+      verify:
+        - run: "test -s {{artifact}}"
+''')
+    return source
+
+
+def test_native_stage_interrupted_when_session_exits_before_handoff(server, tmp_path):
+    home, _, _, connect = server
+    source = gated_stage_package(tmp_path)
+    client = connect()
+    stranger = connect("other")
+    client("import", {"source": str(source)})
+    run = client("validate", {"asset_id": "native-gated-stage-check", "version": "1.0.0", "params": {}})
+    client("start", {"run_id": run["id"]})
+    client.close()
+    # Release the pre-stage script only after the owning session has no client left;
+    # the still-connected stranger must not keep the handoff alive for 30 minutes.
+    (tmp_path / "release").write_text("go")
+    artifact = home / "runs" / run["id"] / "work/artifacts/agent-check--prepare.out"
+    for _ in range(300):
+        if artifact.exists():
+            break
+        time.sleep(.02)
+    else:
+        raise AssertionError("pre-stage script did not finish")
+    # The handoff decision follows the artifact within milliseconds; only reconnect
+    # once it has certainly happened, or the reopened session would be deliverable.
+    time.sleep(.5)
+    reopened = connect()
+    finished = wait_run(reopened, run["id"])
+    assert finished["status"] == "failed", finished
+    assert reopened("snapshot")["stages"] == []
+
+
+def test_native_stage_timeout_releases_pending_handoff(tmp_path):
+    import asyncio
+    from agentgenome.native_stages import NativeStages
+    from agentgenome.service import GenomeService
+
+    async def check():
+        stages = NativeStages(GenomeService(tmp_path / "catalog"), timeout=.01)
+        result = await stages.wait("one", {"request_id": "expired", "run_id": "run"})
+        assert result["status"] == "failed"
+        assert stages.snapshot("one") == []
+    asyncio.run(check())
 
 
 def test_native_human_node_parks_without_a_terminal_or_fabricated_artifact(server, tmp_path):

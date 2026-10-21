@@ -1,0 +1,35 @@
+version: "gt/1.0"
+node:
+  id: agent-check
+  mode: sequence
+  output:
+    report: {type: json, compose: [verify.output.report]}
+  verify:
+    - metric: "report.rows == 2"
+  children:
+    - id: prepare
+      do:
+        run: "printf 'name,age\\nAda,36\\nCy,12\\n' > {artifact}"
+      output:
+        source: {type: path}
+      verify:
+        - run: "test -s {artifact}"
+    - id: explain
+      input:
+        source: {type: path, from: prepare.output.source}
+      do:
+        llm: "读取 CSV {input.source}，将 JSON 报告写入 {artifact}。rows 为不含表头的数据行数；names 为按原始顺序排列的 name 列列表；summary 为一句非空中文说明。只能读取输入并写报告，不要重新执行 prepare 或 verify 的脚本。写完后用本阶段 request_id 调用 genome_step_result，outcome=completed，再结束当前轮次，等待图执行后续验收。"
+      output:
+        report: {type: json}
+      verify:
+        - run: "test -s {artifact}"
+    - id: verify
+      input:
+        source: {type: path, from: prepare.output.source}
+        report: {type: path, from: explain.output.report}
+      do:
+        run: "python3 scripts/verify.py {input.source} {input.report} > {artifact}"
+      output:
+        report: {type: json}
+      verify:
+        - run: "test -s {artifact}"

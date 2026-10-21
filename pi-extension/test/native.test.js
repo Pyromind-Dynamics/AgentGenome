@@ -9,8 +9,8 @@ async function until(predicate) {
   assert.fail("condition not reached");
 }
 
-function harness(t, { records = [], history = [], delivered = true, snapshot, capture, onSend = () => {} } = {}) {
-  const hooks = new Map(), calls = [], messages = [], widgets = [];
+function harness(t, { records = [], stages = [], history = [], delivered = true, snapshot, capture, onSend = () => {} } = {}) {
+  const hooks = new Map(), calls = [], messages = [], widgets = [], aborts = [];
   const pi = {
     on: (name, callback) => hooks.set(name, callback), registerCommand() {}, registerTool() {},
     appendEntry: (customType, data) => history.push({ type: "custom", customType, data }),
@@ -20,14 +20,20 @@ function harness(t, { records = [], history = [], delivered = true, snapshot, ca
       if (delivered) history.push({ type: "custom_message", ...message });
     },
   };
-  const ctx = { cwd: "/tmp", hasUI: true, ui: { setWidget: (_key, lines) => widgets.push(lines) },
+  const ctx = { cwd: "/tmp", hasUI: true, abort: () => aborts.push("abort"),
+    ui: { setWidget: (_key, lines) => widgets.push(lines) },
     sessionManager: { getSessionFile: () => "/tmp/pi-session", getSessionId: () => "session", getEntries: () => history } };
   const client = { close() {}, async request(action, args) {
     calls.push({ action, args });
     if (action === "run") return { id: "r1", status: "queued" };
     if (action === "resume") return { id: args.run_id, status: "queued" };
     if (action === "capture") return capture ?? { capture_id: "c1", run_id: "r2", reused: false };
-    if (action === "snapshot") return snapshot ? snapshot() : { runs: [...records] };
+    if (action === "snapshot") return snapshot ? snapshot() : { runs: [...records], stages };
+    if (action === "stage_claim") {
+      const stage = stages.find((s) => s.request.request_id === args.request_id);
+      stage.claimed = true;
+      return { claimed: true, execution_id: "round-1", request: stage.request };
+    }
     if (action === "claim") return { token: "lease" };
     if (action === "ack") records.splice(records.findIndex((run) => run.id === args.run_id), 1);
     return {};
@@ -35,7 +41,7 @@ function harness(t, { records = [], history = [], delivered = true, snapshot, ca
   const host = nativeHost(pi, { clientFactory: () => client });
   hooks.get("session_start")({}, ctx);
   t.after(() => hooks.get("session_shutdown")());
-  return { hooks, calls, messages, widgets, host, ctx, history, records };
+  return { hooks, calls, messages, widgets, aborts, host, ctx, history, records };
 }
 
 test("default entry loads standalone; SDK factory registers no native lifecycle", () => {
@@ -50,6 +56,64 @@ test("default entry loads standalone; SDK factory registers no native lifecycle"
   assert.equal(tools.length, 13);
   assert.deepEqual(hooks, ["before_agent_start"]);
   assert.equal(commands.length, 0);
+});
+
+test("native stage binds receipt and completion to the delivered model round", async (t) => {
+  const request = { request_id: "stage-1", run_id: "r1", node_id: "flow.llm", prompt: "Write report", expected_outputs: ["/tmp/report"] };
+  const h = harness(t, { stages: [{ request, claimed: false }] });
+  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await until(() => h.messages.some((m) => m.message.customType === "agentgenome.stage"));
+  const message = h.messages.find((m) => m.message.customType === "agentgenome.stage").message;
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] });
+  assert.equal(h.calls.some((c) => c.action === "stage_finish"), false);
+  await assert.rejects(h.host.invoke("step_result", { request_id: "stage-1", outcome: "completed" }, "early", undefined, h.ctx), /active llm stage/);
+  await h.hooks.get("message_start")({ message: { role: "custom", ...message } });
+  await assert.rejects(h.host.invoke("run", {}, "nested", undefined, h.ctx), /cannot start/);
+  await assert.rejects(h.host.invoke("step_result", { request_id: "other", outcome: "completed" }, "wrong", undefined, h.ctx), /active llm stage/);
+  await h.host.invoke("step_result", { request_id: "stage-1", outcome: "completed", summary: "done" }, "receipt", undefined, h.ctx);
+  const receipt = h.calls.find((c) => c.action === "step_result");
+  assert.equal(receipt.args.execution_id, "round-1");
+  assert.equal(h.calls.some((c) => c.action === "stage_finish"), false);
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] });
+  assert.deepEqual(h.calls.find((c) => c.action === "stage_finish").args,
+    { request_id: "stage-1", execution_id: "round-1", status: "completed" });
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] });
+  assert.equal(h.calls.filter((c) => c.action === "stage_finish").length, 1);
+});
+
+test("stages wait for an idle session and stale callbacks cannot complete a switched session", async (t) => {
+  const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
+  const h = harness(t, { stages: [{ request, claimed: false }] });
+  let idle = false;
+  h.ctx.isIdle = () => idle;
+  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await until(() => h.calls.some((c) => c.action === "snapshot"));
+  assert.equal(h.messages.length, 0);
+  idle = true;
+  await until(() => h.messages.length === 1);
+  const message = h.messages[0].message;
+  h.hooks.get("session_shutdown")();
+  h.hooks.get("session_start")({}, h.ctx);
+  await h.hooks.get("message_start")({ message: { role: "custom", ...message } });
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] });
+  assert.equal(h.calls.some((c) => c.action === "stage_finish"), false);
+});
+
+test("a stage message whose round was cancelled is intercepted before the model acts", async (t) => {
+  const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
+  const records = [{ id: "r1", status: "running" }];
+  const h = harness(t, { records, stages: [{ request, claimed: false }] });
+  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await until(() => h.messages.some((m) => m.message.customType === "agentgenome.stage"));
+  const message = h.messages.find((m) => m.message.customType === "agentgenome.stage").message;
+  records[0].status = "cancelled";
+  await until(() => h.widgets.some((lines) => lines.some((line) => line.includes("cancelled"))));
+  assert.equal(h.aborts.length, 0);
+  await h.hooks.get("message_start")({ message: { role: "custom", ...message } });
+  assert.equal(h.aborts.length, 1);
+  assert.equal(h.calls.some((c) => c.action === "stage_begin"), false);
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "aborted" }] });
+  assert.equal(h.calls.some((c) => c.action === "stage_finish"), false);
 });
 
 test("SDK bridge owns wire conversion and propagates failures without local fallback", async () => {

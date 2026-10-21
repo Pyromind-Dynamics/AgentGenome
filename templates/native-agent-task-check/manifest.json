@@ -1,0 +1,9 @@
+{
+  "id": "native-agent-task-check",
+  "version": "1.0.0",
+  "name": "原生 Pi 阶段任务验证",
+  "description": "脚本准备 CSV，Agent 生成统计报告，再由脚本核对。仅要求 agent_task。",
+  "parameters": {},
+  "requires": ["agent_task"],
+  "outputs": {"report": "脚本核验后的行数和姓名列表"}
+}

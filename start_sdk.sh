@@ -85,14 +85,15 @@ echo "Validating with SDK Pi os-sandbox (no model calls)."
 echo "Shared assets: ${AGENTGENOME_HOME}"
 echo "Stop any SDK instance using this registry before continuing."
 template="${AGENTGENOME_DIR}/templates/data-cleaning"
-validation_args=()
+# Positional arguments also support an empty list under macOS Bash 3.2 + nounset.
+set --
 if [[ "${mode}" == "test-revision" ]]; then
   template="${AGENTGENOME_DIR}/templates/data-cleaning"
-  validation_args+=(--test-revisions)
+  set -- --test-revisions
 fi
 uv run --no-sync python scripts/validate_agentgenome.py \
   --template "${template}" \
   --home "${AGENTGENOME_HOME}" \
-  --workspace "${WORKSPACE_DIR}/genome-validation" "${validation_args[@]}"
+  --workspace "${WORKSPACE_DIR}/genome-validation" "$@"
 echo "Validation passed; the validated data-cleaning version is published."
 echo "Next: ${AGENTGENOME_DIR}/start_sdk.sh start"
