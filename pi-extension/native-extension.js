@@ -5,6 +5,30 @@ const ACTIVE = new Set(["queued", "running", "cancelling"]);
 const RECEIPT = "agentgenome.completed";
 const GATE = "agentgenome.waiting";
 
+function gateKey(waiting) {
+  return JSON.stringify([waiting.node || "", waiting.question || "", waiting.artifact || ""]);
+}
+
+function deliveredGates(entries) {
+  const gates = new Map();
+  for (const entry of entries) {
+    const message = entry.type === "custom_message" ? entry
+      : entry.type === "message" && entry.message?.role === "custom" ? entry.message : null;
+    if (message?.customType !== GATE || !message.details?.run_id) continue;
+    if (typeof message.details.gate_key === "string") {
+      gates.set(message.details.run_id, message.details.gate_key);
+    } else if (typeof message.content === "string") {
+      // Existing sessions have the work order in the first line, without a key.
+      try {
+        const firstLine = message.content.split("\n")[0];
+        const waiting = JSON.parse(firstLine.slice(firstLine.indexOf("{")));
+        if (waiting.node && waiting.artifact) gates.set(message.details.run_id, gateKey(waiting));
+      } catch {}
+    }
+  }
+  return gates;
+}
+
 export function deliveredRunIds(entries) {
   return new Set(entries.flatMap((entry) => {
     const message = entry.type === "custom_message" ? entry
@@ -36,7 +60,8 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
   function begin(ctx) {
     if (current) stop();
     const scope = `pi:${ctx.sessionManager.getSessionFile() || ctx.sessionManager.getSessionId()}`;
-    const state = { ctx, scope, ready: new Set(), sent: new Map(), gates: new Map(), closed: false };
+    const state = { ctx, scope, ready: new Set(), sent: new Map(),
+      gates: deliveredGates(ctx.sessionManager.getEntries()), closed: false };
     state.client = clientFactory({ scope, cwd: ctx.cwd });
     current = state;
     const delivered = deliveredRunIds(entries(state));
@@ -61,11 +86,11 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
       show(state, progressLines(run));
       if (run.status === "waiting") {
         const waiting = run.result?.waiting || {};
-        const gate = `${waiting.node || ""}:${waiting.question || ""}`;
+        const gate = gateKey(waiting);
         if (state.gates.get(run.id) !== gate) {
           state.gates.set(run.id, gate);
           try { pi.sendMessage({ customType: GATE, display: true,
-            details: { run_id: run.id, asset_id: run.asset_id, version: run.version },
+            details: { run_id: run.id, asset_id: run.asset_id, version: run.version, gate_key: gate },
             content: `历史经验停在人工节点：${JSON.stringify({ run_id: run.id, ...waiting })}\n`
               + "请把 node / question / artifact 告诉用户，等用户完成人工步骤并把结果写进该 artifact 后，"
               + "用同一个 run_id 调用 genome_resume 唤醒这条 run；不要替用户伪造人工产物。",

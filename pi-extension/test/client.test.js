@@ -3,7 +3,42 @@ import test from "node:test";
 import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { NativeClient, socketPath } from "../native-client.js";
+import { createServer } from "node:net";
+import { createInterface } from "node:readline";
+import { NativeClient, socketPath, VERSION, PROTOCOL } from "../native-client.js";
+
+for (const fingerprint of [undefined, "0".repeat(64)]) {
+  test(`same-version ${fingerprint ? "different" : "legacy"} service is rejected without replacing it`, {
+    skip: !process.env.AGENTGENOME_TEST_PYTHON,
+  }, async (t) => {
+    const home = await mkdtemp(join(tmpdir(), "genome-build-check-"));
+    const path = await socketPath(home);
+    const calls = [], sockets = [];
+    const server = createServer((socket) => {
+      sockets.push(socket);
+      const lines = createInterface({ input: socket });
+      lines.on("line", (line) => {
+        const message = JSON.parse(line);
+        calls.push(message.action);
+        socket.write(JSON.stringify({ id: message.id, result: {
+          protocol: PROTOCOL, version: VERSION,
+          ...(fingerprint ? { runtime_fingerprint: fingerprint } : {}),
+        } }) + "\n");
+      });
+    });
+    await new Promise((done) => server.listen(path, done));
+    const client = new NativeClient({ home, scope: "test", cwd: home,
+      python: process.env.AGENTGENOME_TEST_PYTHON });
+    t.after(async () => {
+      client.close();
+      for (const socket of sockets) socket.destroy();
+      await new Promise((done) => server.close(done));
+    });
+    await assert.rejects(client.request("list"), /service build mismatch/);
+    assert.deepEqual(calls, ["hello"]);
+    assert.equal(server.listening, true);
+  });
+}
 
 // Run against an installed wheel, not source imports or a mocked transport.
 test("installed Python service auto-starts for concurrent Pi clients and preserves request IDs", {

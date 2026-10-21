@@ -112,6 +112,28 @@ test("a parked run reports the human gate once and resumes the same run", async 
   assert.match(h.messages[1].message.content, /export\.out/);
 });
 
+test("restoring a session does not wake the agent for an already delivered human gate", async (t) => {
+  const waiting = { node: "review", question: "Review", artifact: "/runs/r1/review.out" };
+  const record = { id: "r1", status: "waiting", result: { waiting } };
+  // Legacy persisted notifications must also survive upgrades without replaying.
+  const history = [
+    { type: "custom", customType: "agentgenome.run", data: { run_id: "r1" } },
+    { type: "custom_message", customType: "agentgenome.waiting", details: { run_id: "r1" },
+      content: `历史经验停在人工节点：${JSON.stringify({ run_id: "r1", ...waiting })}\n请等待用户。` },
+  ];
+  const h = harness(t, { records: [record], history });
+  await until(() => h.calls.some((call) => call.action === "snapshot"));
+  assert.equal(h.messages.length, 0);
+  // A distinct artifact is a new work order, even with the same node/question.
+  h.records[0] = { ...record, result: { waiting: { ...waiting, artifact: "/runs/r1/new.out" } } };
+  await until(() => h.messages.length === 1);
+  assert.ok(h.messages[0].message.details.gate_key);
+  h.hooks.get("session_shutdown")();
+  h.hooks.get("session_start")({}, h.ctx);
+  await delay(100);
+  assert.equal(h.messages.length, 1);
+});
+
 test("capture queues its replay run and reports the sink result when it finishes", async (t) => {
   const h = harness(t);
   const result = await h.host.invoke("capture", { trace_refs: [], label: "预打标到清洗" }, "call", undefined, h.ctx);

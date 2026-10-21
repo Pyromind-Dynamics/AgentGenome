@@ -81,6 +81,171 @@ def validate(client, data="input.csv", request="first"):
                                "params": {"data_file": data}}, request)
 
 
+def human_package(tmp_path):
+    source = tmp_path / "human"
+    source.mkdir()
+    (source / "manifest.json").write_text(json.dumps({
+        "id": "native-human-check", "version": "1.0.0", "name": "人工节点验证",
+        "description": "等待用户写入人工产物", "parameters": {},
+    }))
+    (source / "graph.yaml").write_text('''version: "gt/1.0"
+node:
+  id: review
+  do: {human: "请用户写入 approved"}
+  output:
+    answer: {type: path}
+  verify:
+    - run: "test -s {artifact}"
+''')
+    return source
+
+
+def test_native_human_node_parks_without_a_terminal_or_fabricated_artifact(server, tmp_path):
+    home, _, _, connect = server
+    source = human_package(tmp_path)
+    client = connect()
+    client("import", {"source": str(source)})
+    run = client("validate", {"asset_id": "native-human-check", "version": "1.0.0", "params": {}})
+    client("start", {"run_id": run["id"]})
+    state = wait_run(client, run["id"])
+    assert state["status"] == "waiting", state
+    waiting = state["result"]["waiting"]
+    assert waiting["node"] == "review"
+    assert waiting["question"] == "请用户写入 approved"
+    assert Path(waiting["artifact"]) == home / "runs" / run["id"] / "work/artifacts/review.out"
+    assert not Path(waiting["artifact"]).exists()
+    assert client("snapshot")["runs"][0]["result"]["waiting"] == waiting
+    other = connect("other")
+    assert other("snapshot")["runs"] == []
+    with pytest.raises(ValueError, match="not found"):
+        other("status", {"run_id": run["id"]})
+    # Waiting has released the execution thread; status and cancel remain usable.
+    assert client("cancel", {"run_id": run["id"]})["status"] == "cancelled"
+
+
+def test_noninteractive_host_keeps_specific_handshake_diagnostic(tmp_path):
+    import io
+    from adapters.terminal_human import TerminalHuman
+    from agentgenome.local_host import LocalExecutionHost
+    from agentgenome.service import GenomeService
+
+    service = GenomeService(tmp_path / "catalog")
+    service.import_asset(human_package(tmp_path))
+    run = service.submit("one", "validate", "native-human-check", "1.0.0", {}, allow_draft=True)
+    host = LocalExecutionHost(service.root, tmp_path, human=TerminalHuman(io.StringIO()))
+    state = service.execute("one", run["id"], host, lambda _: None)
+    assert state["status"] == "interrupted"
+    assert "E_NEEDS_NONINTERACTIVE [review]" in state["result"]["error"]
+    assert "interactive: true" in state["result"]["error"]
+
+
+@pytest.mark.parametrize("content,expected", [(None, "failed"), ("approved\n", "succeeded")])
+@pytest.mark.parametrize("restart", [False, True])
+def test_native_human_resume_verifies_existing_artifact(server, tmp_path, content, expected, restart):
+    home, process, launch, connect = server
+    client = connect()
+    client("import", {"source": str(human_package(tmp_path))})
+    run = client("validate", {"asset_id": "native-human-check", "version": "1.0.0", "params": {}})
+    client("start", {"run_id": run["id"]})
+    state = wait_run(client, run["id"])
+    assert state["status"] == "waiting"
+    artifact = Path(state["result"]["waiting"]["artifact"])
+    if content is not None:
+        artifact.write_text(content)
+    if restart:
+        process.terminate()
+        process.wait(timeout=5)
+        launch()
+        client = connect()
+        assert client("status", {"run_id": run["id"]})["status"] == "waiting"
+    queued = client("resume", {"run_id": run["id"]})
+    assert queued["status"] == "queued"
+    assert "waiting" not in queued["result"]
+    assert "Resume queued" in queued["result"]["instruction"]
+    assert "waiting" not in client("snapshot")["runs"][0]["result"]
+    assert client("resume", {"run_id": run["id"]})["status"] == "queued"
+    client("start", {"run_id": run["id"]})
+    finished = wait_run(client, run["id"])
+    assert finished["id"] == run["id"]
+    assert finished["status"] == expected, finished
+    assert artifact.read_text() == content if content is not None else not artifact.exists()
+    events = [json.loads(line)["event"] for line in (home / "runs" / run["id"] / "ledger.jsonl").read_text().splitlines()]
+    assert events.count("run_start") == 1
+    assert events.count("run_resumed") == 1
+    assert client("resume", {"run_id": run["id"]})["status"] == expected
+
+
+def test_same_version_service_rejects_different_build_without_affecting_runs(server, tmp_path):
+    from agentgenome.local_service import runtime_fingerprint
+
+    home, process, _, connect = server
+    client = connect()
+    client("import", {"source": str(TEMPLATE)})
+    run = validate(client)
+    with pytest.raises(ValueError, match="build mismatch"):
+        client("hello", {"protocol": PROTOCOL, "version": VERSION,
+                         "scope": "other", "cwd": str(tmp_path), "runtime_fingerprint": "0" * 64})
+    assert process.poll() is None
+    assert client("status", {"run_id": run["id"]})["status"] == "queued"
+    hello = connect("fresh")
+    # A compatible client still uses the same registry after the rejected request.
+    assert hello("list") == {"assets": []}
+    assert len(runtime_fingerprint()) == 64
+
+
+def test_native_resume_skips_completed_scripts_and_approves_only_current_gate(server, tmp_path):
+    home, _, _, connect = server
+    source = human_package(tmp_path)
+    (source / "graph.yaml").write_text('''version: "gt/1.0"
+node:
+  id: flow
+  mode: sequence
+  output:
+    answer: {type: path, compose: [second.output.answer]}
+  verify:
+    - run: "test -s {output.answer}"
+  children:
+    - id: prepare
+      do: {run: "printf 'once\\n' >> {artifact}"}
+      output:
+        marker: {type: path}
+      verify:
+        - run: "test -s {artifact}"
+    - id: first
+      do: {human: "First approval"}
+      output:
+        answer: {type: path}
+      verify:
+        - run: "test -s {artifact}"
+    - id: second
+      do: {human: "Second approval"}
+      output:
+        answer: {type: path}
+      verify:
+        - run: "test -s {artifact}"
+''')
+    client = connect()
+    client("import", {"source": str(source)})
+    run = client("validate", {"asset_id": "native-human-check", "version": "1.0.0", "params": {}})
+    client("start", {"run_id": run["id"]})
+    for node in ("flow.first", "flow.second"):
+        state = wait_run(client, run["id"])
+        assert state["status"] == "waiting", state
+        assert state["result"]["waiting"]["node"] == node
+        artifact = Path(state["result"]["waiting"]["artifact"])
+        assert not artifact.exists()
+        artifact.write_text("approved\n")
+        client("resume", {"run_id": run["id"]})
+        client("start", {"run_id": run["id"]})
+    assert wait_run(client, run["id"])["status"] == "succeeded"
+    marker = home / "runs" / run["id"] / "work/artifacts/flow--prepare.out"
+    assert marker.read_text() == "once\n"
+    events = [json.loads(line) for line in (home / "runs" / run["id"] / "ledger.jsonl").read_text().splitlines()]
+    assert sum(e["event"] == "run_start" for e in events) == 1
+    assert sum(e["event"] == "run_resumed" for e in events) == 2
+    assert sum(e["event"] == "call_shell" and e.get("node") == "flow.prepare" for e in events) == 1
+
+
 def test_shared_service_two_batches_progress_receipts_and_isolation(server, tmp_path):
     home, process, _, connect = server
     first, second = connect(), connect("two")

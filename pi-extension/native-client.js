@@ -84,6 +84,27 @@ async function pythonPath() {
   return info.python;
 }
 
+async function runtimeFingerprint(python) {
+  return new Promise((done, reject) => {
+    const child = spawn(python, ["-I", "-c",
+      "from agentgenome.local_service import VERSION, runtime_fingerprint; print(VERSION); print(runtime_fingerprint())"],
+    { stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    const timer = setTimeout(() => { child.kill(); reject(new Error("AgentGenome runtime check timed out")); }, 10000);
+    child.stdout.on("data", (data) => { output = (output + data).slice(-4096); });
+    child.stderr.on("data", () => {});
+    child.on("error", (error) => { clearTimeout(timer); reject(error); });
+    // Wait for stdout to drain before validating the short identity response.
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const [version, fingerprint] = output.trim().split(/\r?\n/);
+      if (code !== 0 || version !== VERSION || !/^[a-f0-9]{64}$/.test(fingerprint || "")) {
+        reject(new Error("AgentGenome Python runtime is outdated or incompatible; run /genome setup or update AGENTGENOME_PYTHON"));
+      } else done(fingerprint);
+    });
+  });
+}
+
 export class NativeClient {
   constructor({ home = defaultHome(), scope, cwd, python } = {}) {
     this.home = resolve(home); this.scope = scope; this.cwd = cwd; this.python = python;
@@ -98,11 +119,12 @@ export class NativeClient {
   }
 
   async open() {
+    const python = this.python || await pythonPath();
+    const fingerprint = await runtimeFingerprint(python);
     const path = await socketPath(this.home);
     try { await this.openSocket(path); }
     catch (error) {
       if (this.closed || !["ENOENT", "ECONNREFUSED"].includes(error.code)) throw error;
-      const python = this.python || await pythonPath();
       if (this.closed) throw new Error("AgentGenome session has closed");
       const log = await open(join(this.home, "service.log"), "a", 0o600);
       let spawnError;
@@ -124,7 +146,11 @@ export class NativeClient {
       if (!connected) throw new Error(`Cannot start AgentGenome; check ${join(this.home, "service.log")}. Another SDK host may own this registry.`);
     }
     try {
-      await this.send("hello", { protocol: PROTOCOL, version: VERSION, scope: this.scope, cwd: this.cwd });
+      const hello = await this.send("hello", { protocol: PROTOCOL, version: VERSION,
+        runtime_fingerprint: fingerprint, scope: this.scope, cwd: this.cwd });
+      if (hello.runtime_fingerprint !== fingerprint) {
+        throw new Error("AgentGenome service build mismatch: an older service is still running. Finish existing runs, close all Pi clients and wait for idle exit before reconnecting; no runs were restarted.");
+      }
       this.ready = true;
     } catch (error) { this.socket?.destroy(); throw error; }
   }

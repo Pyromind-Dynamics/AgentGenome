@@ -117,6 +117,18 @@ Both respect the same execution lock, and a conflict is reported rather than
 recovered destructively. An incompatible running service is not replaced; close
 clients after its jobs finish, wait for idle exit, then use the upgraded plugin.
 
+Native clients also compare Python source fingerprints, so different builds with
+the same version cannot silently reuse an older service. A mismatch reports an
+error without replacing the service or replaying any runs. An explicitly selected
+`AGENTGENOME_PYTHON` must support this handshake as well.
+
+Human nodes park without holding a worker or reading the background service's
+stdin. Pi shows the work order and artifact path; after the user writes the
+artifact, `genome_resume` queues the same run from its checkpoint. Only that gate
+is approved, declared verification still runs, and subsequent gates wait again.
+Already delivered work orders are not repeated when reopening the same session.
+After resume is queued, end the agent turn and wait for the completion message.
+
 ## Development / packaging
 
 From the AgentGenome repository:

@@ -288,8 +288,17 @@ class GenomeService:
 
     @staticmethod
     def _run(row: sqlite3.Row) -> dict[str, Any]:
-        return {key: json.loads(row[key]) if key in {"params", "result"} and row[key] else row[key]
-                for key in ("id", "asset_id", "version", "pin", "params", "status", "node", "result")}
+        state = {key: json.loads(row[key]) if key in {"params", "result"} and row[key] else row[key]
+                 for key in ("id", "asset_id", "version", "pin", "params", "status", "node", "result")}
+        result = state.get("result")
+        if state["status"] in _ACTIVE and isinstance(result, dict) and result.get("waiting"):
+            result.pop("waiting")
+            result["instruction"] = {
+                "queued": "Resume queued. End this turn and wait for the completion notification; do not poll or call resume again.",
+                "running": "Resumed execution is running. Wait for the completion notification; do not call resume again.",
+                "cancelling": "Cancellation requested. Wait for execution to stop; do not call resume again.",
+            }[state["status"]]
+        return state
 
     def status(self, scope: str, run_id: str) -> dict[str, Any]:
         with self._db() as db:
@@ -349,13 +358,19 @@ class GenomeService:
             state = self.status(scope, run_id)
             if state["status"] not in ("queued", *_PARKED):
                 return state
-            resuming = state["status"] in _PARKED
-            parked = (state.get("result") or {}).get("waiting") if resuming else None
+            # resume() queues the same run but preserves its waiting result. Use
+            # that durable marker after queueing, including across worker handoff.
+            # Public status hides stale waiting instructions once queued. Read
+            # the persisted marker directly; rendering must not erase recovery.
+            with self._db() as db:
+                stored = db.execute("SELECT result FROM runs WHERE id=? AND scope=?", (run_id, scope)).fetchone()
+            parked = (json.loads(stored["result"]) if stored["result"] else {}).get("waiting")
             resuming_node = (
                 str(parked.get("node"))
                 if isinstance(parked, dict) and parked.get("node")
                 else None
             )
+            resuming = state["status"] in _PARKED or resuming_node is not None
             cancel = self._signals.setdefault(run_id, threading.Event())
             with self._db() as db:
                 changed = db.execute(
@@ -418,8 +433,13 @@ class GenomeService:
             if self._requires_agent(graph.node):
                 agent_task = lambda request: self.stages.execute(scope, run_id, request, event, check_cancel)
             ports = replace(ports, check_cancel=check_cancel, on_event=event, agent_task=agent_task)
-            if handshake(graph, ports):
-                raise ValueError("unsupported graph capabilities")
+            diagnostics = handshake(graph, ports)
+            if diagnostics:
+                reasons = "; ".join(
+                    f"{item.code} [{item.node or 'graph'}]: {item.message}"
+                    for item in diagnostics
+                )
+                raise ValueError(f"unsupported graph capabilities: {reasons}")
             result = (resume_run(graph, ports, evidence_dir) if resuming
                       else run(graph, params, ports, evidence_dir))
             check_cancel()

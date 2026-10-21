@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import importlib
 import os
 import stat
 import time
@@ -15,12 +16,24 @@ from pathlib import Path
 from uuid import uuid4
 
 from .dispatch import invoke
-from .local_host import LocalExecutionHost
+from .local_host import LocalExecutionHost, NativeHuman
 from .service import GenomeService
 
 PROTOCOL = 1
 VERSION = "0.6.13"
 ACTIVE = {"queued", "running", "cancelling"}
+
+
+def runtime_fingerprint() -> str:
+    """Identify Python code, independent of install paths and wheel metadata."""
+    digest = hashlib.sha256()
+    for name in ("agentgenome", "adapters", "builder", "core"):
+        root = Path(importlib.import_module(name).__file__).parent
+        for path in sorted(root.rglob("*.py")):
+            digest.update(f"{name}/{path.relative_to(root).as_posix()}\0".encode())
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def socket_path(root: Path) -> Path:
@@ -36,6 +49,8 @@ def socket_path(root: Path) -> Path:
 
 class LocalService:
     def __init__(self, root: Path, idle_seconds: float = 60) -> None:
+        # Freeze the identity at process startup, not after files are replaced.
+        self.runtime_fingerprint = runtime_fingerprint()
         self.service = GenomeService(root)
         self.root = self.service.root
         self.idle_seconds = idle_seconds
@@ -75,7 +90,7 @@ class LocalService:
     async def execute(self, scope: str, run_id: str, cwd: str) -> None:
         try:
             await asyncio.to_thread(self.service.execute, scope, run_id,
-                                    LocalExecutionHost(self.root, Path(cwd)),
+                                    LocalExecutionHost(self.root, Path(cwd), human=NativeHuman()),
                                     lambda event: self.progress(run_id, event))
         finally:
             self.jobs.pop(run_id, None)
@@ -158,12 +173,15 @@ class LocalService:
                         args = message["arguments"]
                         if args.get("protocol") != PROTOCOL or args.get("version") != VERSION:
                             raise ValueError("AgentGenome service version mismatch; finish existing runs before upgrading")
+                        if args.get("runtime_fingerprint", self.runtime_fingerprint) != self.runtime_fingerprint:
+                            raise ValueError("AgentGenome service build mismatch; finish existing runs and close all Pi clients before upgrading")
                         if scope is not None:
                             raise ValueError("connection already belongs to a session")
                         if not isinstance(args.get("scope"), str) or not args["scope"] or not Path(args["cwd"]).is_absolute():
                             raise ValueError("hello requires session scope and absolute cwd")
                         scope, cwd = args["scope"], args["cwd"]
-                        result = {"protocol": PROTOCOL, "version": VERSION}
+                        result = {"protocol": PROTOCOL, "version": VERSION,
+                                  "runtime_fingerprint": self.runtime_fingerprint}
                     elif scope is None:
                         raise ValueError("hello required")
                     else:

@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from adapters.terminal_human import TerminalHuman
 from core.artifacts import LocalArtifacts
-from core.ports import Ports, ShellResult, ShellUnavailable, ToolResult
+from core.ports import Answer, Ports, ShellResult, ShellUnavailable, ToolResult
 from .service import RunCancelled
 
 
@@ -95,6 +95,21 @@ class LocalTool:
         return ToolResult(False, {"tool": name, "arguments": arguments}, f"{name} (local)")
 
 
+class NativeHuman:
+    """Pi supplies human interaction; only an explicitly resumed gate is approved."""
+
+    def __init__(self, resuming: str | None = None) -> None:
+        self.resuming = resuming
+
+    def ask(self, question: str, evidence: dict) -> Answer:
+        if self.resuming is not None and evidence.get("node") == self.resuming:
+            return Answer(approve=True)
+        return Answer(pending=True)
+
+    def capabilities(self) -> dict:
+        return {"interactive": True}
+
+
 class LocalExecutionHost:
     def __init__(self, root: Path, cwd: Path, human: Any = None) -> None:
         self.root, self.cwd = root, cwd
@@ -128,6 +143,8 @@ class LocalExecutionHost:
         for key in path_parameters:
             path = Path(values[key]).expanduser()
             values[key] = str((self.cwd / path).resolve())
+        human = (NativeHuman(options.get("resuming"))
+                 if isinstance(self.human, NativeHuman) else self.human)
         return Ports(shell=StreamingShell(cancel, emit), cwd=scripts,
                      artifacts=NativeArtifacts(directory), tool=LocalTool(),
-                     human=self.human), values
+                     human=human), values
