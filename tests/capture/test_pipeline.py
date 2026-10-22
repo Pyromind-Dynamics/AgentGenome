@@ -3,7 +3,14 @@ import json
 import pytest
 import yaml
 
-from agentgenome.capture.pipeline import CaptureError, next_version, prepare_capture
+from agentgenome.capture.pipeline import (
+    CaptureError,
+    _probe_plan,
+    next_version,
+    prepare_capture,
+)
+from agentgenome.parameters import parameter_spec
+from types import SimpleNamespace
 
 
 def capture(service, host, workspace, traces, **kwargs):
@@ -134,6 +141,43 @@ def test_capture_carries_applicability_and_contracts(
     assert "has_gaps" not in listed
 
 
+def test_capture_rejects_truncated_export_before_queuing_replay(
+        service, host, pipeline_workspace, trace_factory, tool_entry):
+    from dataclasses import replace
+
+    trace = trace_factory([
+        tool_entry("c1", "python3 scripts/clean.py out/review.jsonl > out/clean.csv"),
+    ], trace_id="s1")
+    with pytest.raises(CaptureError, match="轨迹导出不完整.*s1 \\(30\\)"):
+        capture(service, host, pipeline_workspace,
+                [replace(trace, export_dropped_steps=30)],
+                final_artifact="out/clean.csv")
+    assert not (service.root / "captures").exists()
+    assert not (service.root / "runs").exists()
+
+
+def test_capture_rejects_a_declared_output_missing_from_compiled_graph(
+        service, host, pipeline_workspace, trace_factory, tool_entry, monkeypatch):
+    from dataclasses import replace
+    from agentgenome.capture import emit
+
+    compile_graph = emit.compile_graph
+
+    def drop_output(directory):
+        graph = compile_graph(directory)
+        child = graph.node.children[0]
+        return replace(graph, node=replace(graph.node,
+                       children=(replace(child, output={}), *graph.node.children[1:])))
+
+    monkeypatch.setattr(emit, "compile_graph", drop_output)
+    trace = trace_factory([
+        tool_entry("c1", "python3 scripts/clean.py out/review.jsonl > out/clean.csv"),
+    ])
+    with pytest.raises(CaptureError, match="图节点没有对应的 output"):
+        capture(service, host, pipeline_workspace, [trace], final_artifact="out/clean.csv")
+    assert not (service.root / "runs").exists()
+
+
 def test_capture_refuses_to_drop_unsolidifiable_steps(
         service, host, pipeline_workspace, trace_factory, tool_entry):
     """Inline code has no fixed invocation, so the chain is refused, not half-frozen."""
@@ -164,6 +208,63 @@ def test_capture_keeps_an_llm_step_as_a_graph_node(
     assert "scripts/clean.py" in manifest["revision"]["editable_scripts"]
     graph = (plan.package_dir / "graph.yaml").read_text(encoding="utf-8")
     assert "scripts/clean.py" in graph
+
+
+def test_human_gated_capture_does_not_schedule_an_unresumable_probe():
+    package = SimpleNamespace(
+        params=(("raw", "data/raw.csv"),),
+        graph=SimpleNamespace(node=SimpleNamespace(needs={"human", "shell"})),
+    )
+    probe, note = _probe_plan(package, {"raw": "data/raw2.csv"},
+                              {"raw": "data/raw.csv"})
+    assert probe is None
+    assert "人工门禁" in note
+
+
+def test_probe_plan_preserves_native_scalar_types():
+    package = SimpleNamespace(
+        params=(
+            ("data_file", "data/raw.csv"),
+            ("limit", "10"),
+            ("enabled", "true"),
+            ("records", "5"),
+        ),
+        parameter_specs={
+            "data_file": parameter_spec(
+                "data_file", type_name="path", source="data/raw.csv"
+            ),
+            "limit": parameter_spec("limit", type_name="number", source="10"),
+            "enabled": parameter_spec(
+                "enabled", type_name="boolean", source="true"
+            ),
+            "records": parameter_spec("records", type_name="records", source="5"),
+        },
+        graph=SimpleNamespace(node=SimpleNamespace(needs={"shell"})),
+    )
+
+    probe, note = _probe_plan(
+        package,
+        {
+            "data_file": "data/raw2.csv",
+            "limit": 10,
+            "enabled": True,
+            "records": 5,
+        },
+        {
+            "data_file": "data/raw.csv",
+            "limit": 7,
+            "enabled": False,
+            "records": 3,
+        },
+    )
+
+    assert "换参数回放" in note
+    assert probe == {
+        "data_file": "data/raw2.csv",
+        "limit": 10,
+        "enabled": True,
+        "records": 5,
+    }
 
 
 def test_replaying_the_recorded_parameters_is_not_generalization_evidence(
@@ -266,3 +367,59 @@ def test_restart_turns_a_queued_capture_into_a_draft(
     assert status["published"] is False
     assert status["generalized"] is False
     assert "回放 A（原参数）：interrupted" in plan.report_path.read_text(encoding="utf-8")
+
+
+def test_replay_requeue_queues_the_same_frozen_draft_again(
+        service, host, pipeline_workspace, pipeline_trace):
+    """A replay that died with the execution plane requeues without re-distilling."""
+    traces = [pipeline_trace("s1", reviewed="out/missing.jsonl"),
+              pipeline_trace("s2", prefix="b", reviewed="out/missing.jsonl")]
+    first = capture(service, host, pipeline_workspace, traces)
+    assert execute(service, host, first)["status"] == "failed"
+
+    queued = service.replay_requeue("conv-1", first.run_id)
+    assert queued["status"] == "queued"
+    assert queued["id"] != first.run_id
+    assert (queued["asset_id"], queued["version"]) == (first.asset_id, first.version)
+    status = service.captures.status(first.capture_id)
+    assert status["run_id"] == queued["id"]
+    assert status["stage"] == "replaying"
+
+    pipeline_workspace.write("out/missing.jsonl", '{"text": "p-four", "label": "d"}\n')
+    retry = SimpleNamespace(scope="conv-1", run_id=queued["id"])
+    state = execute(service, host, retry)
+    assert state["status"] == "succeeded", state["result"].get("error")
+    assert state["result"]["capture"]["capture_id"] == first.capture_id
+    assert service.get(first.asset_id, first.version)["published"] is True
+
+
+def test_replay_requeue_refuses_a_published_asset(
+        service, host, pipeline_workspace, pipeline_trace):
+    traces = [pipeline_trace("s1"), pipeline_trace("s2", prefix="b")]
+    plan = capture(service, host, pipeline_workspace, traces,
+                   new_params=new_data(pipeline_workspace))
+    assert execute(service, host, plan)["status"] == "succeeded"
+
+    with pytest.raises(ValueError, match="already published"):
+        service.replay_requeue("conv-1", plan.run_id)
+
+
+def test_same_bytes_queue_again_after_a_failed_replay(
+        service, host, pipeline_workspace, pipeline_trace):
+    """A dead replay must not strand its frozen version behind a reused capture."""
+    traces = [pipeline_trace("s1", reviewed="out/missing.jsonl"),
+              pipeline_trace("s2", prefix="b", reviewed="out/missing.jsonl")]
+    first = capture(service, host, pipeline_workspace, traces)
+    assert execute(service, host, first)["status"] == "failed"
+    assert service.captures.status(first.capture_id)["stage"] == "draft"
+
+    second = capture(service, host, pipeline_workspace, traces)
+    assert second.reused is True
+    assert second.run_id
+    assert (second.asset_id, second.version) == (first.asset_id, first.version)
+    assert service.captures.status(second.capture_id)["stage"] == "replaying"
+    assert "重新排队" in second.report_path.read_text(encoding="utf-8")
+
+    pipeline_workspace.write("out/missing.jsonl", '{"text": "p-four", "label": "d"}\n')
+    assert execute(service, host, second)["status"] == "succeeded"
+    assert service.get(second.asset_id, second.version)["published"] is True

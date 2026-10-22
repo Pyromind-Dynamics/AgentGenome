@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Mapping, Protocol
 
@@ -113,8 +113,49 @@ class ToolResult:
     text: str = ""
 
 
+@dataclass(frozen=True)
+class AwaitResult:
+    """One non-blocking look at the external task behind a receipt.
+
+    ``probe`` must answer now, never wait: the run parks on ``pending`` and the
+    host wakes it from the task's own callback. A host without callbacks may
+    probe again on its own schedule, but no probe may hold a worker or a shell.
+    """
+
+    status: str  # completed | failed | pending
+    product: str | None = None
+    error: str | None = None
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.status not in {"completed", "failed", "pending"}:
+            raise ValueError(f"unknown await status: {self.status}")
+
+
+class AwaitPort(Protocol):
+    """Resolve a receipt to the product an asynchronous task leaves behind."""
+
+    def probe(self, receipt_path: str) -> AwaitResult: ...
+
+
+@dataclass(frozen=True)
+class ToolCancellation:
+    """Whether the host proved that one tool call stopped."""
+
+    confirmed: bool
+    detail: str = ""
+
+
 class ToolPort(Protocol):
-    def call(self, name: str, arguments: dict[str, Any]) -> ToolResult: ...
+    def call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        execution_id: str,
+    ) -> ToolResult: ...
+
+    def cancel(self, execution_id: str) -> ToolCancellation: ...
 
 
 @dataclass(frozen=True)
@@ -129,3 +170,4 @@ class Ports:
     on_event: Callable[[dict[str, Any]], None] | None = None
     agent_task: Callable[[dict[str, Any]], str] | None = None
     tool: ToolPort | None = None
+    await_port: AwaitPort | None = None

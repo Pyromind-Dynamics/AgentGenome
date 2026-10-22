@@ -643,8 +643,19 @@ def test_shared_service_two_batches_progress_receipts_and_isolation(server, tmp_
     first("publish", {"asset_id": "data-cleaning", "version": "1.0.0"})
     assert len(second("list")["assets"]) == 1
     (tmp_path / "second.csv").write_text("name,age\nDee,20\n")
-    run = second("run", {"asset_id": "data-cleaning", "version": "1.0.0",
-                         "params": {"data_file": "second.csv"}})
+    prepared = second("run", {
+        "asset_id": "data-cleaning",
+        "version": "1.0.0",
+        "params": {"data_file": "second.csv"},
+        "execution_scope": {"mode": "full", "description": "验证一条新输入"},
+    })
+    assert prepared["run_id"] is None
+    assert prepared["requires_confirmation"] is True
+    confirmed = second("confirm_run", {
+        "plan_id": prepared["plan_id"],
+        "digest": prepared["digest"],
+    })
+    run = confirmed["run"]
     second("start", {"run_id": run["id"]})
     assert wait_run(second, run["id"])["status"] == "succeeded"
     assert draft["pin"] == run["pin"]
@@ -822,19 +833,55 @@ def test_distill_over_the_socket_publishes_and_reuses_a_graph(server, tmp_path):
     }
 
     plan = client("distill", arguments, "distill-1")
-    assert plan["reused"] is False
-    assert plan["run_id"]
-    assert plan["distilled"]["trace_id"].startswith("distilled-")
-    assert [node["id"] for node in plan["distilled"]["nodes"]] == ["prelabel", "clean"]
+    assert plan["status"] == "planned"
+    assert plan["requires_confirmation"] is True
+    assert plan["plan_id"]
+    assert "capture_id" not in plan
+    assert "run_id" not in plan
+    assert not (home / "captures").exists()
+    assert plan["review"]["plan_type"] == "structural"
+    assert [step["kind"] for step in plan["review"]["steps"]] == ["run", "run"]
+    assert plan["review"]["preflight"]["builds_package"] is False
 
-    client("start", {"run_id": plan["run_id"]})
-    state = wait_run(client, plan["run_id"])
+    minimal_plan = client("distill", {
+        **arguments,
+        "execution_scope": {"mode": "sample", "description": "定向验证小样"},
+        "validation_params": {
+            "raw": "public_data/data/raw.csv",
+            "rules": "public_data/rules.json",
+        },
+    }, "distill-minimal")
+    assert "run_id" not in minimal_plan
+    queued = client("confirm_distill", {
+        "plan_id": minimal_plan["plan_id"],
+        "digest": minimal_plan["digest"],
+    }, "confirm-minimal")
+    assert queued["preflight"]["trace_id"].startswith("distilled-")
+    assert [node["id"] for node in queued["preflight"]["nodes"]] == ["prelabel", "clean"]
+    assert queued["run_id"]
+    client("start", {"run_id": queued["run_id"]})
+    state = wait_run(client, queued["run_id"])
     assert state["status"] == "succeeded"
     assert state["result"]["capture"]["stage"] == "published"
-    assert client("capture_status", {"capture_id": plan["capture_id"]})["stage"] == "published"
-    assert (home / "captures" / plan["capture_id"] / "report.md").is_file()
+    assert (
+        client("capture_status", {"capture_id": queued["capture_id"]})["stage"]
+        == "published"
+    )
+    assert (home / "captures" / queued["capture_id"] / "report.md").is_file()
 
-    again = client("distill", arguments, "distill-2")
+    again_plan = client("distill", {
+        **arguments,
+        "execution_scope": {"mode": "sample", "description": "定向验证小样"},
+        "validation_params": {
+            "raw": "public_data/data/raw.csv",
+            "rules": "public_data/rules.json",
+        },
+    }, "distill-2")
+    assert "run_id" not in again_plan
+    again = client("confirm_distill", {
+        "plan_id": again_plan["plan_id"],
+        "digest": again_plan["digest"],
+    }, "confirm-again")
     assert again["reused"] is True
     assert again["run_id"] is None
 

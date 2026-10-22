@@ -22,7 +22,7 @@ from .native_stages import NativeStages
 from .service import GenomeService
 
 PROTOCOL = 1
-VERSION = "0.6.13"
+VERSION = "0.6.48"
 ACTIVE = {"queued", "running", "cancelling"}
 
 
@@ -141,7 +141,8 @@ class LocalService:
         if connection_id in self.stage_clients:
             capabilities.add("agent_task")
         request_id = message.get("request_id", message["id"])
-        if action in {"run", "validate", "capture", "distill", "prepare_revision"}:
+        if action in {"run", "validate", "capture", "distill", "prepare_revision",
+                      "prepare_run", "confirm_run", "confirm_distill"}:
             host = LocalExecutionHost(self.root, Path(cwd))
             if action == "validate":
                 self.service.check_capabilities(args["asset_id"], args["version"], capabilities)
@@ -153,9 +154,14 @@ class LocalService:
                 if action == "run" and "revision_id" in args:
                     # Submission collected the allowlisted files; reclaim the copy.
                     self.reclaim_draft(args["revision_id"])
-            # A capture or distill reuses an existing version without queueing a run.
-            run_id = (result.get("run_id") if action in {"capture", "distill"}
-                      else result.get("id"))
+            # A capture or distill reuses an existing version without queueing a run;
+            # a confirmed plan answers with the run it just queued.
+            if action in {"capture", "distill", "confirm_distill"}:
+                run_id = result.get("run_id")
+            elif action == "confirm_run":
+                run_id = (result.get("run") or {}).get("id")
+            else:
+                run_id = result.get("id")
             if run_id:
                 with self.service._db() as db:
                     db.execute("INSERT OR IGNORE INTO native_runs(run_id,cwd) VALUES(?,?)",

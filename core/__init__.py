@@ -14,6 +14,7 @@ from .ports import (
     ShellPort,
     ShellResult,
     ShellUnavailable,
+    ToolCancellation,
     ToolPort,
     ToolResult,
 )
@@ -22,5 +23,5 @@ __all__ = [
     "run", "resume", "handshake", "RunResult", "RunStatus", "Diagnostic",
     "CheckpointError", "Ports", "ShellPort", "ShellResult", "AIPort",
     "HumanPort", "JudgeResult", "Answer", "FailDecl", "Candidate",
-    "PortError", "ShellUnavailable", "ToolPort", "ToolResult",
+    "PortError", "ShellUnavailable", "ToolCancellation", "ToolPort", "ToolResult",
 ]

@@ -49,6 +49,13 @@ with open(data, newline="") as stream:
 print(json.dumps({"rows": len(rows), "epochs": int(settings["epochs"])}))
 '''
 
+WAIT = '''import json, sys
+
+receipt = json.load(open(sys.argv[1]))
+with open(sys.argv[2], "w") as stream:
+    stream.write(json.dumps({"status": "succeeded", "receipt": receipt}) + "\\n")
+'''
+
 
 @dataclass(frozen=True)
 class PipelineWorkspace:
@@ -68,7 +75,8 @@ def pipeline_workspace(tmp_path):
     """A workspace whose scripts actually run, so replays are real executions."""
     workspace = PipelineWorkspace(tmp_path / "workspace")
     for name, source in (("prelabel", PREL_LABEL), ("clean", CLEAN),
-                         ("train", TRAIN), ("evaluate", EVALUATE)):
+                         ("train", TRAIN), ("evaluate", EVALUATE),
+                         ("wait_pipeline", WAIT)):
         workspace.write(f"scripts/{name}.py", source)
     workspace.write("rules.json", json.dumps({"prefix": "p-"}))
     workspace.write("data/raw.csv", "text,label\none,a\ntwo,b\n")

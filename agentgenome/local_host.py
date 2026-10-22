@@ -15,7 +15,15 @@ from typing import Any, Callable
 
 from adapters.terminal_human import TerminalHuman
 from core.artifacts import LocalArtifacts
-from core.ports import Answer, Ports, ShellResult, ShellUnavailable, ToolResult
+from core.ports import (
+    Answer,
+    AwaitResult,
+    Ports,
+    ShellResult,
+    ShellUnavailable,
+    ToolCancellation,
+    ToolResult,
+)
 from .service import RunCancelled
 
 
@@ -91,8 +99,70 @@ class LocalTool:
     is why reuse runs on the host that owns the tool.
     """
 
-    def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+    def call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        execution_id: str,
+    ) -> ToolResult:
         return ToolResult(False, {"tool": name, "arguments": arguments}, f"{name} (local)")
+
+    def cancel(self, execution_id: str) -> ToolCancellation:
+        return ToolCancellation(True, f"{execution_id} is an inert local echo")
+
+
+class LocalAwait:
+    """Resolve a receipt against a local filesystem: the CLI/debug counterpart.
+
+    The SDK host probes the platform's Storage; a local run reads the same
+    ``report.json`` contract from disk. Both answer in one shot and never wait.
+    """
+
+    def __init__(self, cwd: Path) -> None:
+        self.cwd = cwd
+
+    def probe(self, receipt_path: str) -> AwaitResult:
+        import json
+
+        path = Path(receipt_path).expanduser()
+        if not path.is_absolute():
+            path = self.cwd / path
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return AwaitResult("pending", detail={"receipt": str(path)})
+        if not isinstance(receipt, dict):
+            return AwaitResult("pending", detail={"receipt": str(path)})
+        directory = receipt.get("output_dir")
+        if not isinstance(directory, str) or not directory.strip():
+            return AwaitResult("pending", detail={"receipt": str(path)})
+        candidates = [Path(directory), self.cwd / directory.lstrip("/")]
+        report = None
+        found = None
+        for candidate in candidates:
+            try:
+                report = json.loads((candidate / "report.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            found = candidate
+            break
+        if not isinstance(report, dict) or found is None:
+            return AwaitResult("pending", detail={
+                "output_dir": directory, "task_id": receipt.get("task_id")})
+        status = str(report.get("status") or "").lower()
+        if status in {"failed", "cancelled", "canceled", "error"}:
+            return AwaitResult("failed", error=f"platform run {status}", detail=report)
+        if status != "succeeded":
+            return AwaitResult("pending", detail={
+                "output_dir": str(found), "status": status,
+                "task_id": receipt.get("task_id")})
+        product = found / "processed.jsonl"
+        return AwaitResult(
+            "completed",
+            product=str(product) if product.is_file() else None,
+            detail={"output_dir": str(found), "status": status},
+        )
 
 
 class NativeHuman:
@@ -132,6 +202,16 @@ class LocalExecutionHost:
         # a headless host which parked node the wakeup answers.
         directory = self.root / "runs" / run_id / "work"
         scripts = directory / "package"
+        emit({
+            "event": "execution_prepared",
+            "execution": {
+                "execution_domain": "local",
+                "execution_path": str(scripts),
+                "workspace": str(self.cwd),
+                "package": str(package),
+                "artifacts_dir": str(directory),
+            },
+        })
         # A parked run keeps its work directory; resuming re-enters prepare and
         # must reuse the package copy the parked attempt already validated.
         if not scripts.exists():
@@ -149,7 +229,8 @@ class LocalExecutionHost:
                      artifacts=NativeArtifacts(directory), tool=LocalTool(),
                      human=human,
                      # Verify rules must run the frozen originals, not the run copy.
-                     verification_cwd=verification_package), values
+                     verification_cwd=verification_package,
+                     await_port=LocalAwait(self.cwd)), values
 
     def prepare_revision(self, revision_id, package, allowed):
         """Copy the frozen package for the agent to edit in place.

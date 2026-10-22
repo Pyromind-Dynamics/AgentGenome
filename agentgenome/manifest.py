@@ -8,11 +8,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .parameters import PARAMETER_TYPES
+
 DETERMINISM = ("script", "agent-assisted", "human-gated")
 MATCH_KEYS = ("applies_when", "not_applies_when", "input_contract", "output_contract",
               "determinism")
-_CONTRACT_KEYS = {"format", "fields", "required_fields", "optional_fields", "description"}
+_CONTRACT_KEYS = {"type", "format", "fields", "required_fields", "optional_fields", "description"}
 _LIST_KEYS = {"fields", "required_fields", "optional_fields"}
+PARAM_TYPES = PARAMETER_TYPES
 
 
 class ManifestError(ValueError):
@@ -31,31 +34,66 @@ def _text_list(value: Any, where: str) -> list[str]:
     return [_text(item, f"{where}[{index}]") for index, item in enumerate(value)]
 
 
-def _contract(value: Any, where: str) -> None:
+def _contract_problems(value: Any, where: str) -> list[str]:
     if not isinstance(value, Mapping):
-        raise ManifestError(f"{where} must be an object keyed by name")
+        return [f"{where} must be an object keyed by name"]
+    problems: list[str] = []
     for name, raw in value.items():
-        key = _text(name, f"{where} key")
+        try:
+            key = _text(name, f"{where} key")
+        except ManifestError as exc:
+            problems.append(str(exc))
+            continue
         if not isinstance(raw, Mapping):
-            raise ManifestError(f"{where}.{key} must be an object")
+            problems.append(f"{where}.{key} must be an object")
+            continue
         for field, item in raw.items():
             if field not in _CONTRACT_KEYS:
-                raise ManifestError(f"{where}.{key}.{field} is not supported")
+                problems.append(
+                    f"{where}.{key}.{field} is not supported; "
+                    f"allowed fields: {', '.join(sorted(_CONTRACT_KEYS))}"
+                )
+                continue
             if field in _LIST_KEYS:
-                _text_list(item, f"{where}.{key}.{field}")
+                try:
+                    _text_list(item, f"{where}.{key}.{field}")
+                except ManifestError as exc:
+                    problems.append(str(exc))
+            elif field == "type":
+                if item not in PARAM_TYPES:
+                    problems.append(
+                        f"{where}.{key}.type must be one of {list(PARAM_TYPES)}"
+                    )
             else:
-                _text(item, f"{where}.{key}.{field}")
+                try:
+                    _text(item, f"{where}.{key}.{field}")
+                except ManifestError as exc:
+                    problems.append(str(exc))
+    return problems
 
 
 def validate(manifest: Mapping[str, Any]) -> None:
+    problems: list[str] = []
     for key in ("applies_when", "not_applies_when"):
         if key in manifest:
-            _text_list(manifest[key], key)
+            try:
+                _text_list(manifest[key], key)
+            except ManifestError as exc:
+                problems.append(str(exc))
     for key in ("input_contract", "output_contract"):
         if key in manifest:
-            _contract(manifest[key], key)
+            problems.extend(_contract_problems(manifest[key], key))
     if "determinism" in manifest and manifest["determinism"] not in DETERMINISM:
-        raise ManifestError(f"determinism must be one of {list(DETERMINISM)}")
+        problems.append(f"determinism must be one of {list(DETERMINISM)}")
+    if len(problems) == 1:
+        raise ManifestError(problems[0])
+    if problems:
+        listed = "\n".join(
+            f"{index}. {problem}" for index, problem in enumerate(problems, start=1)
+        )
+        raise ManifestError(
+            f"manifest validation found {len(problems)} problems:\n{listed}"
+        )
 
 
 def view(manifest: Mapping[str, Any]) -> dict[str, Any]:

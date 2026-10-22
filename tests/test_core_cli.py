@@ -15,6 +15,7 @@ from core import (
     PortError,
     Ports,
     ShellResult,
+    ToolCancellation,
     ToolResult,
     handshake,
     resume,
@@ -64,6 +65,54 @@ node:
     artifacts = tmp_path / "run" / "artifacts"
     assert (artifacts / "hello--greet.jsonl").is_file()
     assert not (artifacts / "hello--greet.out").exists()
+
+
+def test_artifact_destination_follows_the_input_directory(tmp_path: Path) -> None:
+    """A product pinned to an input stays beside it, outside the run directory."""
+    source = tmp_path / "storage" / "m"
+    source.mkdir(parents=True)
+    (source / "images.jsonl").write_text('{"image": "a.bmp"}\n', encoding="utf-8")
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "graph.yaml").write_text(
+        """\
+version: "gt/1.0"
+node:
+  id: subset
+  mode: sequence
+  input: {images: {type: path}}
+  output: {sample: {type: text, compose: [sample.output.sample]}}
+  verify: [{run: "test -s {output.sample}"}]
+  children:
+    - id: sample
+      artifact: {ext: jsonl, at: '{input.images.dir}/manifest_10.jsonl'}
+      input: {images: {type: path, from: subset.input.images}}
+      do: {run: "head -1 {input.images} > {artifact}"}
+      output: {sample: {type: text}}
+      verify: [{run: "test -s {artifact}"}]
+""",
+        encoding="utf-8",
+    )
+    graph = compile(package)
+    result = run(
+        graph,
+        {"images": str(source / "images.jsonl")},
+        Ports(LocalShell()),
+        tmp_path / "run",
+    )
+    assert result.status == "succeeded"
+    assert (source / "manifest_10.jsonl").read_text() == '{"image": "a.bmp"}\n'
+    assert not (tmp_path / "run" / "artifacts" / "subset--sample.jsonl").exists()
+    assert result.outputs["sample"]["path"] == str(source / "manifest_10.jsonl")
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "ledger.jsonl").read_text().splitlines()
+    ]
+    leaf = next(
+        item for item in events
+        if item["event"] == "node_succeeded" and item["node"] == "subset.sample"
+    )
+    assert leaf["outputs"]["sample"]["path"] == str(source / "manifest_10.jsonl")
 
 
 def test_failure_retries_then_propagates_to_root(tmp_path: Path) -> None:
@@ -231,10 +280,19 @@ class RecordingTool:
         self.result = {"task_id": "t-1"} if result is None else result
         self.is_error = is_error
 
-    def call(self, name: str, arguments: dict[str, object]) -> ToolResult:
+    def call(
+        self,
+        name: str,
+        arguments: dict[str, object],
+        *,
+        execution_id: str,
+    ) -> ToolResult:
         self.calls.append((name, arguments))
         return ToolResult(self.is_error, dict(self.result),
                           "提交失败" if self.is_error else "已提交")
+
+    def cancel(self, execution_id: str) -> ToolCancellation:
+        return ToolCancellation(True, execution_id)
 
 
 def _tool_graph(tmp_path: Path) -> object:
@@ -643,6 +701,35 @@ node:
         def ask(self, question: str, evidence: dict[str, object]) -> Answer: return Answer(True)
         def capabilities(self) -> dict[str, object]: return {"interactive": True}
     assert run(compile(package), {}, Ports(Shell(), human=Human()), tmp_path / "run").status == "succeeded"
+
+
+def test_on_fail_ask_pending_parks_the_run_instead_of_hanging(tmp_path: Path) -> None:
+    """后台回放没有人回答失败提问：run 必须停在 waiting，而不是一直 running。
+
+    之前 `Answer(pending=True)` 被当成端口协议错误抛出，状态永远停在 running，
+    会话里也看不到失败原因，下一次回放还会被“已有活跃图”挡住。
+    """
+    package = tmp_path / "pkg"; package.mkdir()
+    (package / "graph.yaml").write_text("""version: "gt/1.0"
+node:
+  id: root
+  needs: [shell, human]
+  do: {run: "MARK > {artifact}"}
+  output: {result: {type: path}}
+  verify: [{run: "test -s {artifact}"}]
+  on_fail: ask
+""", encoding="utf-8")
+    class Shell:
+        def execute(self, command: str, cwd: Path) -> ShellResult:
+            return ShellResult(command, 1, "", "", 0)
+    class Human:
+        def ask(self, question: str, evidence: dict[str, object]) -> Answer:
+            return Answer(pending=True)
+        def capabilities(self) -> dict[str, object]: return {"interactive": True}
+    result = run(compile(package), {}, Ports(Shell(), human=Human()), tmp_path / "run")
+    assert result.status == "waiting"
+    assert result.waiting["node"] == "root"
+    assert "是否重试" in result.waiting["question"]
 
 
 def test_on_fail_ask_evidence_contains_faildecl_artifact_and_cause_logs(tmp_path: Path) -> None:

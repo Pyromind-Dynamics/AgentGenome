@@ -18,6 +18,9 @@ if (existsSync(wheelDir)) {
     if (name.endsWith(".whl") && name !== wheelName) rmSync(resolve(wheelDir, name));
   }
 }
+// setuptools reuses build/ between runs; a stale <pkg>-<old-version>.dist-info
+// left there would be packed into the next wheel alongside the new one.
+rmSync(resolve(root, "build"), { recursive: true, force: true });
 const result = spawnSync("uv", ["build", "--wheel", "--out-dir", "pi-extension/python"], {
   cwd: root, stdio: "inherit",
   env: { ...process.env, SOURCE_DATE_EPOCH: process.env.SOURCE_DATE_EPOCH || "315532800" },

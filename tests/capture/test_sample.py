@@ -69,6 +69,26 @@ def test_missing_input_is_recorded_not_raised(tmp_path):
     assert "读取失败" in entry["note"]
 
 
+def test_directory_input_is_recorded_as_a_directory(tmp_path):
+    (tmp_path / "storage/images").mkdir(parents=True)
+    entry = inspect(LocalSource(tmp_path), "storage/images")
+    assert entry["format"] == "dir"
+    assert entry["text"] is None
+    assert entry["bytes"] is None
+    assert "目录输入" in entry["note"]
+
+
+def test_sampling_a_directory_keeps_the_path_without_a_sample_file(tmp_path):
+    (tmp_path / "storage/images").mkdir(parents=True)
+    index = sample_inputs(LocalSource(tmp_path), {"images_root": "storage/images"},
+                          tmp_path / "samples")
+    entry = index["files"][0]
+    assert entry["key"] == "images_root"
+    assert entry["format"] == "dir"
+    assert entry["name"] is None
+    assert list((tmp_path / "samples").iterdir()) == [tmp_path / "samples/index.json"]
+
+
 def test_sampling_records_the_budget_it_could_not_spend(tmp_path):
     write(tmp_path, "data/raw.csv", "text,label\none,a\n")
     index = sample_inputs(LocalSource(tmp_path), {"raw": "data/raw.csv"},

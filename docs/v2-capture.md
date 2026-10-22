@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | `try` 节点 | **v2.0 不开** | 服务层闸门保持关闭（`agentgenome/service.py:148`）。多轨迹里识别出的分支步骤只记录进报告，不写进 graph |
 | capture 触发点 | **用户明说「沉淀一下」** | 不做 agent 主动提议、不做自动触发。链路打通后再迭代 |
-| 语义归纳的入口 | `genome_distill`（Stage 0） | 会话里混着内联代码、只读探测、脚本内部写出的产物时，机械固化必然失败。agent 先补全脚本、把输入产出写到命令行上，再提交规范化链路；插件校验契约后直接排队回放 |
+| 语义归纳的入口 | `genome_distill`（Stage 0） | agent 提交规范化链路后，`genome_distill` 只生成轻量结构计划；用户确认同一 `plan_id` 后，`genome_confirm_distill` 才做一次完整 preflight，通过后创建 capture 并自动排队已确认的 sample/subset 有界回放 |
 | 归纳由谁做 | **Pi 里的 agent，不是插件** | 插件只做机械工作（归一化/对齐/切片/校验/编译/回放），不调用模型 |
 | 脚本 | **只搬运，不重写** | agent 写过的 `.py` 原样进 `scripts/`，仅做槽位替换 |
 | 资产隔离 | 用户 Storage 维度 | 依赖「一个 AgentGenome root 只服务一个用户」，见 §8 |
@@ -210,12 +210,14 @@ provenance: [12, 13, 17]
 | 字段 | 作用 |
 | --- | --- |
 | `applies_when` / `not_applies_when` | 适用与明确不适用的场景，匹配的第一道闸门 |
-| `input_contract` / `output_contract` | 根输入/产出的格式与字段，例如 `{data_file: {format: "csv", required_fields: ["qid", "question_text"]}}` |
+| `input_contract` / `output_contract` | 根输入/产出的类型、格式与字段，例如 `{data_file: {type: "path", format: "csv", required_fields: ["qid", "question_text"]}, limit: {type: "number"}}`；标量参数必须显式写 `type` |
 | `determinism` | `script` / `agent-assisted` / `human-gated`，缺省按图里的节点种类推导（`human` 优先于 `llm`，`llm` 优先于 `script`）；只有确实要覆盖推导结果时才显式声明 |
 
 约束由 `agentgenome/manifest.py` 校验，导入与生成时都会跑：
 
-- contract 只认 `format / fields / required_fields / optional_fields / description`，
+- contract 只认 `type / format / fields / required_fields / optional_fields / description`。
+  旧的纯文件契约可以省略 `type` 并由 `format/fields` 等文件提示兼容识别；没有这些提示的
+  标量契约必须显式声明类型，
   未知键直接拒绝，避免写进去没人消费的自由文本。
 
 `genome_capture` / `genome_distill` 接受这些字段并写进 manifest；`genome_list` 只返回
@@ -491,14 +493,206 @@ llm 节点回放时由 agent 执行，agent 只拿到提示词，看不到「原
 `_materialize_scripts` 的 `KIND_TOOL` 分支）。于是一条「提交平台 → 人工复核 → 格式转换」
 的链路只留这三步，试跑与脚本暂存都进旁支段。
 
+### 5.15 完整轨迹导出与截断拒收（0.6.14–0.6.17）
+
+长链路沉淀的另一类失败不在蒸馏，在导出：会话轨迹先被裁剪，蒸馏再从残缺证据里
+「合法」地丢步骤。这一版把导出通道补齐，并把截断从静默降级改成硬错误。
+
+**导出为什么要裁剪**：宿主与执行面之间是一条 JSONL 帧通道（单帧 1 MiB），宿主读文件
+（`execution.read`）历史上只服务 256 KiB 的单次读取。compact 导出（`fitTrace`，
+240 KiB 上限）因此只保留最新若干步，被丢的步数记在 `dropped_steps`——这份预览够 agent
+看会话，不够沉淀用。
+
+**0.6.16 的改法**：capture / distill 导出改用 `complete: true`：不裁剪字段、不丢步骤，
+`clipped_fields` 只作为兼容字段保留；完整导出超过 4 MiB 时在写文件前直接失败，报错文案
+给出「把链路拆到更短会话」的出路，而不是悄悄降级回 compact。消费侧把截断当成硬错误：
+`capture_trace` 拒绝 `dropped_steps > 0` 和命令/工具参数里的 `clipped_fields`，
+`pipeline.py` / `distill.py` 在切片之前就报「轨迹导出不完整（dropped_steps）」——
+`review_confirmed` 也不能越过，导出里不存在的步骤，人工确认无从核对。
+
+**工具输出投影（现行）**：4 MiB 这个机制后来被判定为「目的对、手段错」。实测一条 42 步的
+真实轨迹里，结构本身只占 11%（7.1 KiB / 67.2 KiB），工具输出占 64%、工具参数占 25%——
+字节上限惩罚的是「话多」，不是「链路长」，一次 `cat` 大日志就能顶到墙；而它也不是传输
+限制（trace 走本地文件读，1 MiB 帧不参与）。根因是 `_reported_writes` 要逐行扫
+`result.text` 提产物路径：裁文本就丢证据，于是只能全量保留，再靠字节数拒收。
+
+现在改成导出时投影（`session-trace.js: projectText`）：`result.text` 与 user 文本超过
+4 KiB 时，只保留**能承载证据的行**（写产物关键词、箭头、拒绝语、路径形状）加首尾各 20 行，
+单行超 4 KiB 按首 1 KiB + 尾 3 KiB 截断，并在 `result.excerpt` / `text_excerpt` 里记
+`kept_lines` / `total_lines` / `total_chars`。短文本原样返回，普通步骤字节不变；`args`
+不投影（tool 节点要靠它重放，命令必须完整）。投影后上限提到 8 MiB，只作内存护栏；
+仍然超出说明命令/参数本身过大，报错会点名最大的三步（`bash@12（3021 KiB）`），
+而不是只说「拆会话」。`refs` 里新增 `excerpted_steps` 便于核对。
+
+投影的筛选条件是 `_reported_writes` 的**超集**：多留一行只费字节，少留一行才丢证据。
+`tests/capture/test_trace.py::test_capture_trace_reads_products_from_a_projected_result_excerpt`
+把这条契约钉在 Python 侧。
+
+**0.6.14–0.6.15 的前置**：run 步骤可以显式声明 `output`（脚本把产物写成位置参数时），
+平台回放未通过的同一版本可以重新排队（`_replay_restartable`）；「预打标 → Label Studio
+复核 → 清洗 → SFT」链路暴露的四个问题（异步工具回执拆两步、目录输入采样、引用闭包与
+keep、一次报全 + 预提交确认）在同版修掉，细节见 SDK 仓库 `docs/agentgenome-v2.md`。
+
+**0.6.17 的配套（宿主适配）**：`execution.read` 的单文件上限从 256 KiB 提到 512 KiB
+（仍在 1 MiB 帧上限内），`read_many` 改为按 base64 字节预算分批、超预算路径分页返回，
+一次响应不再可能顶穿帧上限；SDK 的验证脚本补上 `local_root`，与产品接线一致，宿主侧
+导出（trace 写在会话目录）直读、不再绕 RPC；截断/裁剪类错误文案统一中文。
+
+**验证**：`tests/capture/test_trace.py`（截断保留、裁剪拒收、投影后仍能读产物）、
+`test_pipeline.py` / `test_distill.py`（截断在切片前拒收）、
+`pi-extension/test/session-trace.test.js`（complete 导出不丢步骤、投影保留产物行、
+短结果字节不变、命令本身超限才拒写），以及 Pi runtime 的
+`workflow-execution.test.ts`（读取上限与批量预算）。
+
+### 5.16 人工闸门的唤醒与回放补队（0.6.19）
+
+「预打标 → Label Studio 复核 → 清洗 → 训练」这类链路第一次真正跑到人工闸门后，
+唤醒环节暴露了三个问题：resume 重进宿主 `prepare` 时对已存在的 artifacts 目录直接
+`mkdir` 抛 `FileExistsError`；检查点里被 park 的节点和它的所有祖先都是 `waiting`，
+唤醒取到了最浅的图根而不是真正的人工节点；run 因上述崩溃进入 `interrupted` 后，
+capture 把它当成终局，草稿再也不能唤醒发布。这一版把「暂停 → 人工交接 → 唤醒 → 发布」
+整条缝补上，并给回放失败加了一条明确的补队通道。
+
+**唤醒从最深 waiting 节点继续**：`service.parked_checkpoint` 取检查点里层级最深的
+`waiting` 节点作为 parked gate；`resume` 现在同时接受 `waiting` 与「检查点仍留有人工
+节点」的 `interrupted` run，把状态翻回 `queued`。`captures.finish` 对这类
+`interrupted` 不再落 `draft` 终局，而是记 `stage=interrupted`，唤醒后的同一条
+capture 收尾时照常走发布判定。
+
+**人工产物按图声明落位**：`genome_resume` 新增可选 `artifact`——人把导出的复核结果
+（如 Label Studio export JSON）交给 agent，agent 随唤醒一起带上；宿主在执行面把它
+落到图里声明的 artifact 路径后再放行闸门，人不接触内部路径。宿主侧已有该文件时直接
+镜像，不再依赖执行面自己找。
+
+**回放失败三分法**：新增 `genome_replay_requeue(run_id, artifact=None)`，把回放失败的
+处置收敛成三条：宿主/基础设施类失败（连接、沙箱、唤醒未落地）→ 原样补队；节点脚本
+自身报错 → 修脚本重新沉淀；`waiting/queued/running` 不是失败，等待即可。已发布的资产
+拒绝补队（走版本修订通道），未发布的同版本冻结草稿可以重新排队，人工闸门已答过的
+run 从检查点续跑、不重复问人。
+
+**人工节点提示词**：人工闸门的工作单必须给出可直接打开的入口（上游工具输出里的
+`open_url`、项目链接），artifact 路径只作为回执位置出现，不得当作让用户去打开的入口。
+
+**验证**：`tests/capture/test_distill.py`（interrupted 从 parked 检查点唤醒、
+`replay_requeue` 续跑、已答闸门的 capture 仍可发布）、`tests/capture/test_pipeline.py`
+（同版本草稿重新排队、已发布资产拒收）、`pi-extension/test/extension.test.js`
+（人工导出随唤醒回传、失败三分法指引）；SDK 侧对应
+`tests/pyromind_runtime/test_agentgenome_bridge.py` 与
+`test_conversation_runtime.py`。
+
+### 5.17 产物落点跟随输入（artifact.at）
+
+「预打标 → Label Studio 复核 → SFT」链路回放失败暴露了一类产物：**带相对引用的文件**。
+子集 manifest 里的 `images` 是相对同目录图片的路径，原会话把它写在源 manifest 旁边；
+回放时它被 stage 到 `workflow-runs/<run>/artifacts/`，平台按 manifest 所在目录解析图片，
+于是 `missing image ...`。产物内容本身是对的，坏的是落点。
+
+**落点槽位**：graph schema 的 `artifact` 增加可选 `at`：
+
+```yaml
+artifact:
+  ext: jsonl
+  at: '{input.manifest_src.dir}/prelabel_manifest_10.jsonl'
+```
+
+`at` 只允许「一个 `{input.<键>.dir}` 目录槽位 + 一个文件名」，且必须引用本节点已声明的
+输入；`{input.<键>.dir}` 解析成该输入的父目录。`ext` 与 `at` 至少给一个；只给 `ext`
+时保持原行为（产物落运行目录的 `artifacts/<节点>.ext`）。
+
+**生成规则**：`emit` 只在一种情况下写 `at`——该节点是 `run` 步骤，且它的主产物与它自己的
+某个输入**同目录**（比较的是规范化后的路径，两种 Storage 拼写算同一个文件）。此时产物
+落点写成 `{input.<该输入>.dir}/<产物文件名>`，回放就落回原位；命令、脚本、扩展名都不变。
+产物名取绑定后的真实文件名——计划里写 `{token}`（例如 `> {sft_messages}`）时，用的是该
+token 绑定的路径文件名；绑定后仍带花括号的产物名无法表达，退回运行目录 artifact。
+其他情况（产物与任何输入都不同目录、tool/llm/human 节点）仍走运行目录 artifact。
+
+只对 `run` 步骤开这个口子：它的命令自己写文件，落点就是命令里的路径；tool 节点的产物
+是引擎写下的回执，llm/human 节点的产物由 agent 或人写，都不该被钉到 Storage 的绝对路径上。
+
+**验证**：`tests/test_builder.py`（`at` 的形状与未声明输入被拒）、
+`tests/capture/test_emit.py`（同目录产物得到 `at`、`{token}` 产物按绑定文件名命名、不同目录
+仍是 `{artifact}`）、
+`tests/test_core_cli.py`（引擎按 `at` 落位并读回）。
+
+### 5.18 参数类型与平台提交路径（0.6.27）
+
+这一版修掉两类会被误判成路径的问题。
+
+**参数类型不再猜成 path**：`input_contract` 的 `type` 现为显式契约。没有 `type` 时，
+只有带 `format` / `fields` / `required_fields` / `optional_fields` 的旧文件契约仍按
+`path` 兼容；有明确标量 `default` 时按 `boolean` / `number` / `string` 推导；其余
+无类型契约在计划阶段直接报错并阻塞确认。`limit` 这类数字参数不会再被当成路径，也不会
+因为字符串路径处理丢失数值。`records` 继续映射为 graph 的 number，并由参数归一化保证
+非负整数。
+
+**DataFlow 提交参数按语义映射**：宿主的 `df_submit_pipeline` bridge 不再先对所有字符串
+做通用路径改写。`input_path` 走 Storage 映射；`script_path` 与 `support_file_path`
+分别按包内 workspace 路径映射；`model_profile` 等其他字符串保持原值。这样平台输入不会
+被二次改写，脚本和 support JSON 也不会被误当成 Storage 对象。
+
+**验证**：`tests/test_parameters.py`、`tests/capture/test_distill.py` 覆盖显式类型、
+默认值推导、旧文件契约、无类型 `limit` 阻塞和回放类型保持；SDK
+`tests/pyromind_runtime/test_agentgenome_bridge.py` 覆盖三个提交路径与普通字符串。
+
+### 5.20 计划预检误判修正（0.6.29）
+
+`genome_distill` 在真实长会话里仍会因为计划字段与 trace 语义不完全一致而把有效
+链路判成零步骤或缺少输入：
+
+- `final_artifact` 如果误写成描述文本，不再直接让候选链路变成零步，而是回到 trace
+  推断最终产物，并把差异记录进 ambiguity；描述文本会一次性列出计划里可选的产物路径；
+- `input_contract` 的显式标量类型不再参与路径解析，`limit=3` 不会变成输入路径；
+- 计划步骤会写出的中间产物不再被当成缺失根输入，`datasets/...` 与
+  `storage/datasets/...` 这类宿主和沙箱路径别名按同一路径处理；
+- 宿主本地没有文件时，SDK bridge 会继续向沙箱查询 metadata，不再把只存在于执行域
+  的脚本或输入误判为不存在；
+- `genome_*` 管理工具不进入机械候选业务图，避免把沉淀操作本身当成链路步骤。
+
+### 5.19 机械候选链路（0.6.28）
+
+`genome_distill` 第一次调用可以省略 `steps`。插件会从完整 trace 中按产物
+生产/消费关系机械生成候选链路：
+
+- `run`、`tool`、`human` 节点直接从已成功执行的步骤提取；没有可靠产物声明的
+  agent/LLM 步骤进入 ambiguity，不伪装成固定脚本；
+- 从最终产物的依赖闭包反向选择步骤，未进入闭包的探测、失败尝试、本地试跑和
+  无关读取记为 excluded branch；
+- 根输入自动生成 `{参数名}` 与 `path` 类型的 `input_contract`，不要求模型手写完整 graph；
+- 写入后立即删除的临时文件、`/tmp` 试跑文件和只读 `get/list/read/search` 工具默认排除；
+- `create/import/upload/submit/label_studio_project` 等有外部副作用的工具即使没有下游
+  消费者也保留；没有显式结果路径时生成稳定回执路径并标记 ambiguity；
+- 人工节点作为最终产物时，仍会沿其输入继续补齐上游生产步骤。
+
+计划响应里的 `planning.mode=mechanical_candidate` 表示链路由插件机械抽取。模型只
+需要展示候选步骤、根输入、排除旁支和 ambiguity，并在用户确认后调用
+`genome_confirm_distill`；只有 ambiguity 需要修正时才提交完整 `steps`。
+
 ## 6. 流水线
 
 ### Stage 0：链路蒸馏（`genome_distill`）
 
 **输入**：agent 规范化后的链路 `steps: [{run, from?} | {llm, output, input?, verify?, from?}]`，
 按执行顺序。
-**产出**：编译通过的 package + 排队中的回放 A，与 `capture` 同一套后续流程。
+**产出**：`plan_id`、计划 `digest` 和供用户复核的结构计划。计划阶段不创建 package、
+不编译 graph、不创建 capture、不启动回放。
 **实现**：`agentgenome/capture/distill.py`
+
+沉淀严格分成两阶段：
+
+1. `genome_distill` 只读取一次导出的 trace，并做结构归一化、步骤分类、来源核对、
+   范围旁支分析和最终产物可达性推导。脚本只以路径引用出现，状态固定为
+   `preflight_pending`；计划阶段不读取脚本内容、不物化脚本、不建包、不编译 graph。
+2. agent 把计划原样展示给用户。用户明确确认同一 `plan_id` 后才调用
+   `genome_confirm_distill`。确认阶段重新读取一次 trace 校验 digest，没有变化才执行
+   一次完整 preflight（脚本、依赖、链路完整性和图编译）。preflight 把问题一次聚合
+   返回；只有通过后才创建 capture。计划必须带 `validation_params` 和
+   `execution_scope.mode=sample|subset`，用户确认计划即同时批准这一次有界验证回放；
+   确认后自动排队，回放成功才发布。缺少最小回放参数时计划不可确认，`full` /
+   `unspecified` 不能代替自动验证范围。
+
+确认阶段会对比结构计划与 preflight 后的步骤类型、来源、输入输出、`keep`、最终产物、
+策略和实际入图步骤。任何语义变化都会拒绝创建 capture，并要求重新展示计划，不能把
+用户没看过的链路直接落库。
 
 Stage A 只能固化「输入产出都在命令行上」的命令，真实会话里往往不是：
 `python3 -c`、heredoc、`2>/dev/null` 的探测、以及脚本内部写出的产物，都会让机械
@@ -511,17 +705,19 @@ Stage A 只能固化「输入产出都在命令行上」的命令，真实会话
 - 真正的 agent 自由裁量步骤可以声明成 **llm 节点**（见下）；
 - `final_artifact` 必须真的被某一步声明为产出（写 `{参数名}`、`final_artifact` 用它
   绑定的字面路径，或反过来，都算同一个文件），否则报出计划里的全部产出；
-- 脚本文件必须已经存在于工作区（`host.read`），不存在时报出具体路径。
+- 脚本文件必须在确认后的 preflight 里存在于工作区（`host.read`）；不存在时一次报出
+  具体路径。
 
-**链路完整性校验（P0）**：给了 `source_traces` 时，插件把导出的会话归一化后与计划
-逐步对照（`distill._check_chain`）。计划里某一步读取的路径如果在本会话里由更早的
-**成功**步骤产出，而该步骤不在计划里，直接报「链路不完整」并指出缺的是哪一步、
-产出者是谁——这是对「agent 悄悄少交步骤」的机械防线。`{参数名}` 占位符不能再把
-固定 shell 命令产出的路径降级成输入边界：这种步骤必须补进 `steps`；只有编辑工具、
-人工或纯 agent 产生的产物才允许作为边界，并连同上游产出者一起写进报告的 boundaries
-段。**脚本例外**（0.6.13）：脚本是资产，包会搬运它，所以由被丢掉的步骤产出的脚本不算
-链路不完整——tool 步骤 args 里的脚本参数也会物化。没给 `source_traces` 时不做这项校验
-（保持旧行为，仅依赖命令自身的契约检查）。
+**链路完整性校验（P0）**：给了 `source_traces` 时，计划阶段把导出的会话与计划逐步
+做结构对照，并把可能漏步骤的范围问题写进 `review.scope_warnings` / `unresolved`；
+确认后的 preflight 再执行 `distill._check_chain` 并拒绝不完整链路。计划里某一步读取的
+路径如果在本会话里由更早的**成功**步骤产出，而该步骤不在计划里，直接报「链路不完整」
+并指出缺的是哪一步、产出者是谁——这是对「agent 悄悄少交步骤」的机械防线。
+`{参数名}` 占位符不能再把固定 shell 命令产出的路径降级成输入边界：这种步骤必须补进
+`steps`；只有编辑工具、人工或纯 agent 产生的产物才允许作为边界，并连同上游产出者
+一起写进报告的 boundaries 段。**脚本例外**（0.6.13）：脚本是资产，确认后的 preflight
+会搬运它，所以由被丢掉的步骤产出的脚本不算链路不完整——tool 步骤 args 里的脚本参数
+也会物化。没给 `source_traces` 时不做这项校验（仅依赖命令自身的契约检查）。
 
 **范围复核**：计划比会话窄时不能静默固化，但缩小本身是允许的，界线由
 `distill._scope_split` 机械判定——一个没进计划的步骤如果**和链路相连**（它读的路径是
@@ -533,9 +729,11 @@ Stage A 只能固化「输入产出都在命令行上」的命令，真实会话
 报告的「旁支步骤（未进链路，链路不依赖它）」段与 payload 的 `branches`，沉淀结果里
 因此永远看得到「会话里有这些步骤，这次没进链路」。
 
-校验通过后，distill 生成一条**确定性**轨迹（`trace_id = distilled-<sha256[:12]>`，
+确认后的 preflight 通过后，distill 生成一条**确定性**轨迹
+（`trace_id = distilled-<sha256[:12]>`，
 由 label + 命令序列派生），因此重试同一份计划会命中同一个 package 与版本，走幂等复用；
-然后直接复用 `prepare_capture`：编译、排队回放 A、写报告，返回 `capture_id` 与 `run_id`。
+然后直接复用 `prepare_capture`：编译并写报告；只有在用户明确批准 sample/subset 有界
+验证时才创建回放 A，否则返回已创建的 capture 与 `run_id: null`，等待后续单独授权。
 
 返回的 `distilled` 字段是给人看的账本：`trace_id`、`report`、`package`、`steps`
 （每步的 reads/writes）、`nodes`（入图节点与命令）、`auxiliary`（未进图的辅助步骤及原因）、
@@ -788,27 +986,36 @@ genome_capture_status
 
 genome_distill
   steps: [object]                  必填。规范化链路，按执行顺序。每步是 run / llm / tool /
-                                   human 之一；只有能编译成 graph 节点的步骤才会被接受，
-                                   固不下来的步骤直接报错
+                                   human 之一。计划阶段只做结构抽取；脚本只记录为
+                                   preflight_pending，不读取内容、不物化、不建包、不编译
   label: str                       必填。经验名，同 genome_capture
   final_artifact: str | None       可选。同 genome_capture；给了就反向切片
   source_traces: [str] | None      可选。genome_trace 给出的会话 id；给了就跑 P0 链路
-                                   完整性校验，并导出这些会话作为证据
+                                   结构完整性检查，并导出这些会话作为证据
   params: object | None            可选。根输入真实值：键与命令里的 `{参数名}` 一致，
-                                   命令里出现占位符时必填；值就是回放 A 使用的输入
+                                   值就是回放 A 使用的输入
   asset_id / version / description / owner / min_support / new_params
                                    可选。含义与 genome_capture 一致
   applies_when / not_applies_when / input_contract / output_contract /
   determinism                      可选。含义与 genome_capture 一致
-  返回: {capture_id, asset_id, version, pin, scope, run_id, reused, generalized,
-         notes, report, package, distilled: {trace_id, report, package, steps,
-         nodes, auxiliary, not_solidifiable, final_artifact}}
-  契约违规（内联代码、探测命令、没有路径、final_artifact 无人产出、脚本不在磁盘上）
-  直接报错并说明要改哪一步；通过后与 genome_capture 完全同路：编译 → 排队回放 A。
-  链路里存在无法固化的步骤时，`_require_solidified` 会列出每一步的序号与原因并拒绝发布。
+  返回: {plan_id, digest, status: "planned", requires_confirmation, review, draft,
+         validation, confirmation_question}
+  review.preflight 明确标记 reads_scripts=false / builds_package=false /
+  compiles_graph=false。计划阶段不创建 capture、不落正式资产、不启动回放。
+
+genome_confirm_distill
+  plan_id: str                     必填。genome_distill 返回的同一计划
+  digest: str | None               可选；带上时先校验计划没有变化
+  返回: {capture_id, asset_id, version, pin, scope, run_id, report, package,
+         preflight, review, distill_plan}
+  确认阶段重新读取 trace 校验证据 digest，然后只做一次完整 preflight（脚本、依赖、
+  链路完整性、图编译）。preflight 失败一次聚合返回，不创建 capture；通过后才创建
+  capture。计划必须含 validation_params + sample/subset scope；用户确认计划后自动
+  排队一次有界回放，成功才发布。
 
 genome_capture 与 genome_distill 的区别只有输入：前者吃会话轨迹（命令必须本来就干净），
-后者吃 agent 规范化后的链路。两者返回结构、报告、异步完成通知、幂等判定都相同。
+后者吃 agent 规范化后的链路。`genome_capture` 是旧的直接通道；新的正常沉淀路径是
+`genome_distill -> 用户确认 -> genome_confirm_distill`。
 ```
 
 extension 与 Python 的分工：`genome_capture` 的 `trace_ids` 先在 extension 侧经
@@ -896,7 +1103,7 @@ extension 与 Python 的分工：`genome_capture` 的 `trace_ids` 先在 extensi
 | `ctx.sessionManager` 不可用（非标准 Pi 运行时） | capture 启动前拒绝，返回明确错误，不产生半成品 |
 | 轨迹超过 bridge 单帧上限（1 MiB） | 一律落盘传递；导出侧按 240 KiB 预算丢最旧步骤并记 `dropped_steps`；读不到文件时拒绝，不静默降级 |
 | 轨迹里没有落盘脚本（全是内联代码） | capture 结果标记 `not_solidifiable`，报告中列出内联代码块，提示 agent 先落盘再 capture |
-| 命令里有内联代码 / 探测命令 / 没有路径 | `genome_distill` 在建图前拒绝，报出第几步、原命令和该改成什么，不产生半成品 |
+| 命令里有内联代码 / 探测命令 / 没有路径 | `genome_distill` 的计划结构检查或 `genome_confirm_distill` 的 preflight 拒绝，报出第几步、原命令和该改成什么，不产生半成品 |
 | 产出只在脚本内部写出（命令行上没有） | 反向切片报出骨架的全部产出 + 契约提示（把产出写到命令行上）；distill 同口径 |
 | 命令里出现 `/dev/null` 等设备文件 | 不算读写路径，避免把 `2>/dev/null` 变成产出 `null_2` |
 | 同一父节点下命令形状重复 | 节点 id 在规划阶段统一去重（`terminal`、`terminal-2`…），不再依赖「有产出的节点」才占位 |

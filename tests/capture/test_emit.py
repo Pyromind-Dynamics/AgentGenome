@@ -8,6 +8,7 @@ import yaml
 from agentgenome.capture.align import align_traces
 from agentgenome.capture.emit import (
     EmitError,
+    Package,
     artifact_ext,
     build_package,
     output_type,
@@ -126,6 +127,99 @@ def test_repeated_command_shapes_get_unique_sibling_ids(tmp_path, workspace, tra
     assert [node.id for node in package.nodes] == ["cd", "cd-2", "clean"]
 
 
+def test_a_product_written_next_to_its_input_keeps_that_directory(
+    tmp_path, workspace, trace_factory, tool_entry
+):
+    """A manifest naming sibling images only resolves where it already lives."""
+    trace = trace_factory([
+        tool_entry(
+            "a1",
+            "python3 scripts/normalize.py storage/datasets/m/images.jsonl "
+            "> storage/datasets/m/manifest_10.jsonl",
+        ),
+    ], "s1")
+    alignment = align_traces([trace])
+    package = build_package(tmp_path / "package", alignment=alignment,
+                            slice_=reverse_slice(alignment), traces=[trace],
+                            label="子集清单", workspace=workspace)
+    data = yaml.safe_load((package.directory / "graph.yaml").read_text(encoding="utf-8"))
+    node = data["node"]["children"][0]
+    assert node["artifact"] == {
+        "ext": "jsonl",
+        "at": "{input.images.dir}/manifest_10.jsonl",
+    }
+
+
+def test_a_token_named_input_is_resolved_before_artifact_pinning(
+    tmp_path, workspace, trace_factory, tool_entry
+):
+    """A manifest token has no suffix until params bind it to the real file."""
+    entry = tool_entry(
+        "a1",
+        "python3 scripts/normalize.py {source_manifest} {records} "
+        "storage/datasets/m/manifest_10.jsonl",
+    )
+    entry["declared_writes"] = ["storage/datasets/m/manifest_10.jsonl"]
+    trace = trace_factory([entry], "s1")
+    alignment = align_traces([trace])
+    bindings = {"source_manifest": "storage/datasets/m/images.jsonl"}
+    package = build_package(
+        tmp_path / "package",
+        alignment=alignment,
+        slice_=reverse_slice(alignment, bindings=bindings),
+        traces=[trace],
+        label="token 输入旁的清单",
+        workspace=workspace,
+        bindings=bindings,
+    )
+    data = yaml.safe_load((package.directory / "graph.yaml").read_text(encoding="utf-8"))
+    node = data["node"]["children"][0]
+    assert node["artifact"] == {
+        "ext": "jsonl",
+        "at": "{input.source_manifest.dir}/manifest_10.jsonl",
+    }
+
+
+def test_a_product_written_elsewhere_stays_in_the_run_directory(
+    tmp_path, workspace, trace_factory, tool_entry
+):
+    trace = trace_factory([
+        tool_entry("a1", "python3 scripts/normalize.py storage/datasets/m/images.jsonl "
+                         "> out/manifest_10.jsonl"),
+    ], "s1")
+    alignment = align_traces([trace])
+    package = build_package(tmp_path / "package", alignment=alignment,
+                            slice_=reverse_slice(alignment), traces=[trace],
+                            label="子集清单", workspace=workspace)
+    data = yaml.safe_load((package.directory / "graph.yaml").read_text(encoding="utf-8"))
+    assert data["node"]["children"][0]["artifact"] == {"ext": "jsonl"}
+
+
+def test_a_token_named_product_is_pinned_under_the_file_it_binds(
+    tmp_path, workspace, trace_factory, tool_entry
+):
+    """A plan may write `{token}`; the product keeps the name that token binds."""
+    bindings = {"sft_messages": "storage/datasets/m/clean.csv"}
+    trace = trace_factory([
+        tool_entry(
+            "a1",
+            "python3 scripts/clean.py storage/datasets/m/prelabeled.jsonl "
+            "> {sft_messages}",
+        ),
+    ], "s1")
+    alignment = align_traces([trace])
+    package = build_package(tmp_path / "package", alignment=alignment,
+                            slice_=reverse_slice(alignment, bindings=bindings),
+                            traces=[trace], label="token 产物", workspace=workspace,
+                            bindings=bindings)
+    data = yaml.safe_load((package.directory / "graph.yaml").read_text(encoding="utf-8"))
+    node = data["node"]["children"][0]
+    assert node["artifact"] == {
+        "ext": "csv",
+        "at": "{input.prelabeled.dir}/clean.csv",
+    }
+
+
 def test_graph_yaml_carries_provenance_and_slots(capture):
     package = capture()
     data = yaml.safe_load((package.directory / "graph.yaml").read_text(encoding="utf-8"))
@@ -165,6 +259,26 @@ def test_manifest_matches_the_compiled_graph(capture):
         "scripts/clean.py", "scripts/evaluate.py", "scripts/prelabel.py", "scripts/train.py"]
     assert manifest["capture"]["traces"] == ["s1", "s2"]
     assert manifest["capture"]["single_trace"] is False
+
+
+def test_package_load_preserves_typed_parameters(capture):
+    package = capture()
+    path = package.directory / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["parameters"].update(
+        {
+            "limit": {"type": "number", "source": "limit"},
+            "enabled": {"type": "boolean", "source": "enabled"},
+            "records": {"type": "records", "source": "records"},
+        }
+    )
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = Package.load(package.directory)
+
+    assert loaded.parameter_specs["limit"].type == "number"
+    assert loaded.parameter_specs["enabled"].type == "boolean"
+    assert loaded.parameter_specs["records"].type == "records"
 
 
 def test_reverse_slice_drops_auxiliary_steps_from_the_graph(capture):

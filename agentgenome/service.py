@@ -18,8 +18,11 @@ from core.ports import Ports, PortError
 from .captures import Captures
 from .manifest import validate as validate_manifest
 from .manifest import view as manifest_view
+from .parameters import PARAMETER_TYPES, ParameterError, normalize_params, parameter_spec
+from .plans import DistillPlans, RunPlans
+from .receipts import ToolReceipts
 from .stages import StageRequests
-from .revisions import Revisions, RECOVERY_INSTRUCTION, WAITING_INSTRUCTION
+from .revisions import Revisions, AWAIT_INSTRUCTION, RECOVERY_INSTRUCTION, WAITING_INSTRUCTION
 from .regressions import Regressions, RegressionFailure
 
 
@@ -36,16 +39,20 @@ class Host(Protocol):
 
         `options["resuming"]` names the human node a wakeup already answered, so a
         host that parks human nodes can approve exactly that node and park the rest.
+        `options["human_artifact"]` is the file the person produced outside the run
+        directory; a host that parks human nodes lands it on the declared artifact
+        when it approves that node.
         """
 
     def read(self, path: str) -> bytes:
         """Read a workspace file: exported traces and captured scripts."""
 
 
-# A parked run holds no worker: `waiting` is where a human gate leaves it, and
-# `resume` is what puts it back in the queue.
+# A parked run holds no worker: `waiting` is where a human gate leaves it,
+# `waiting_external` is where an asynchronous task's receipt leaves it, and
+# `resume` is what puts either back in the queue.
 _ACTIVE = ("queued", "running", "cancelling")
-_PARKED = ("waiting",)
+_PARKED = ("waiting", "waiting_external")
 _NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\Z")
 
 
@@ -58,6 +65,8 @@ class GenomeService:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self._signals: dict[str, threading.Event] = {}
+        self._tool_ports: dict[str, Any] = {}
+        self._active_tools: dict[str, set[str]] = {}
         self._lock = threading.RLock()
         self._owner = None
         with self._db() as db:
@@ -75,11 +84,17 @@ class GenomeService:
                 CREATE UNIQUE INDEX IF NOT EXISTS active_scope ON runs(scope)
                     WHERE status IN ('queued','running','cancelling');
             ''')
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
+            if "handoff" not in columns:
+                db.execute("ALTER TABLE runs ADD COLUMN handoff TEXT")
 
         self.stages = StageRequests(self)
         self.regressions = Regressions(self)
         self.revisions = Revisions(self)
         self.captures = Captures(self)
+        self.tool_receipts = ToolReceipts(self)
+        self.plans = RunPlans(self)
+        self.distill_plans = DistillPlans(self)
 
     def claim_execution_owner(self) -> None:
         if os.name != "posix":
@@ -114,6 +129,7 @@ class GenomeService:
     def recover(self) -> None:
         """Single owner startup: never replay commands whose effects are unknown."""
         self.stages.recover()
+        self.tool_receipts.recover()
         error = _json({"error": "Host restarted; execution effects may be incomplete. "
                                "No automatic replay."})
         with self._db() as db:
@@ -143,7 +159,7 @@ class GenomeService:
         inputs = manifest.get("parameters", {})
         if set(inputs) != set(graph.params):
             raise ValueError("manifest parameters must match graph parameters")
-        if any(p.get("type") not in {"path", "string", "number", "boolean"} for p in inputs.values()):
+        if any(p.get("type") not in PARAMETER_TYPES for p in inputs.values()):
             raise ValueError("unsupported parameter type")
         destination = self.root / "assets" / manifest["id"] / manifest["version"]
         pin = package_pin(source)
@@ -169,7 +185,7 @@ class GenomeService:
 
     @staticmethod
     def _supported_graph(node: Any) -> None:
-        if (node.needs - {"shell", "llm", "human", "tool"} or node.mode == "try"
+        if (node.needs - {"shell", "llm", "human", "tool", "await"} or node.mode == "try"
                 or any(rule.kind not in {"run", "metric", "human", "llm"}
                        for rule in node.verify)):
             raise ValueError("supports fixed script sequences and agent tasks only")
@@ -273,18 +289,19 @@ class GenomeService:
     @staticmethod
     def validate_params(asset, params):
         specs = asset["parameters"]
-        params = {**{k: s["default"] for k, s in specs.items() if "default" in s}, **params}
-        if set(params) != set(specs):
-            raise ValueError("parameters do not match the asset inputs")
-        for key, spec in specs.items():
-            value = params[key]
-            valid = {"path": isinstance(value, str) and bool(value),
-                     "string": isinstance(value, str),
-                     "number": isinstance(value, (int, float)) and not isinstance(value, bool),
-                     "boolean": isinstance(value, bool)}[spec["type"]]
-            if not valid:
-                raise ValueError(f"invalid parameter: {key}")
-        return params
+        typed = {
+            key: parameter_spec(
+                key,
+                type_name=spec["type"],
+                source=str(spec.get("source", key)),
+                default=spec.get("default"),
+            )
+            for key, spec in specs.items()
+        }
+        try:
+            return normalize_params(typed, params)
+        except ParameterError as exc:
+            raise ValueError(str(exc)) from exc
 
     @staticmethod
     def _run(row: sqlite3.Row) -> dict[str, Any]:
@@ -323,7 +340,70 @@ class GenomeService:
             state.update(parent_run_id=revision['parent'], revision_id=revision['id'])
             if revision['promotion']:
                 state['candidate_version'] = json.loads(revision['promotion'])['version']
+        state.update(self._execution_status(state, revision))
         return state
+
+    def _execution_status(self, state: dict[str, Any],
+                          revision: dict[str, Any] | None) -> dict[str, Any]:
+        run_id = str(state["id"])
+        run_dir = self.root / "runs" / run_id
+        package = self.root / "assets" / state["asset_id"] / state["version"]
+        if revision:
+            package = Path(revision["package"])
+        events: list[dict[str, Any]] = []
+        ledger = run_dir / "ledger.jsonl"
+        if ledger.is_file():
+            for line in ledger.read_text(encoding="utf-8").splitlines():
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    events.append(item)
+        nodes = self._checkpoint_nodes(run_dir / "checkpoint.json")
+        result = state.get("result") if isinstance(state.get("result"), dict) else {}
+        waiting = result.get("waiting")
+        current = (
+            state.get("node")
+            or (waiting.get("node") if isinstance(waiting, dict) else None)
+            or self._checkpoint_parked(run_dir)
+        )
+        sequence: list[str] = []
+        try:
+            graph = compile(package)
+            sequence = self._leaf_paths(graph.node)
+            if current is None:
+                for path in sequence:
+                    detail = nodes.get(path)
+                    if not isinstance(detail, dict) or detail.get("status") != "succeeded":
+                        current = path
+                        break
+        except Exception:
+            sequence = []
+        execution = result.get("execution")
+        execution = execution if isinstance(execution, dict) else {}
+        return {
+            "current_node": current,
+            "step_index": (
+                sequence.index(current) + 1
+                if current in sequence
+                else None
+            ),
+            "total_steps": len(sequence) or None,
+            "started_at": events[0].get("ts") if events else None,
+            "last_event": events[-1] if events else None,
+            "execution_domain": execution.get("execution_domain"),
+            "execution_path": execution.get("execution_path", str(run_dir)),
+            "artifacts_dir": execution.get(
+                "artifacts_dir", str(run_dir / "artifacts")
+            ),
+        }
+
+    @staticmethod
+    def _leaf_paths(node: Any) -> list[str]:
+        if not node.children:
+            return [node.path]
+        return [path for child in node.children for path in GenomeService._leaf_paths(child)]
 
     def cancel(self, scope: str, run_id: str) -> dict[str, Any]:
         with self._lock:
@@ -333,24 +413,154 @@ class GenomeService:
                 with self._db() as db:
                     db.execute("UPDATE runs SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'cancelling' END "
                                "WHERE id=? AND status IN ('queued','running')", (run_id,))
+                self._cancel_tools(run_id)
             elif state["status"] in _PARKED:
                 # Nothing is running: a parked run only has to be taken out of the queue
                 # the resume would put it back into.
                 with self._db() as db:
-                    db.execute("UPDATE runs SET status='cancelled' WHERE id=? AND status='waiting'",
-                               (run_id,))
+                    db.execute(
+                        "UPDATE runs SET status='cancelled' "
+                        "WHERE id=? AND status IN ('waiting','waiting_external')",
+                        (run_id,),
+                    )
         return self.status(scope, run_id)
 
-    def resume(self, scope: str, run_id: str) -> dict[str, Any]:
-        """Put a parked run back in the queue; the host's worker picks it up from here."""
+    def _cancel_tools(self, run_id: str) -> None:
+        receipts = self.tool_receipts.unresolved(run_id)
+        port = self._tool_ports.get(run_id)
+        for receipt in receipts:
+            execution_id = str(receipt["execution_id"])
+            if receipt["state"] == "unknown":
+                continue
+            self.tool_receipts.request_cancel(
+                run_id=run_id,
+                execution_id=execution_id,
+                error="cancellation requested",
+            )
+            try:
+                if port is None:
+                    raise RuntimeError("no live tool port")
+                result = port.cancel(execution_id)
+                self.tool_receipts.cancel_result(
+                    run_id=run_id,
+                    execution_id=execution_id,
+                    confirmed=result.confirmed,
+                    error=None if result.confirmed else result.detail,
+                )
+            except Exception as exc:
+                self.tool_receipts.cancel_result(
+                    run_id=run_id,
+                    execution_id=execution_id,
+                    confirmed=False,
+                    error=f"{type(exc).__name__}: {exc}"[:500],
+                )
+
+    def _cancellation_unconfirmed(self, run_id: str) -> list[dict[str, Any]]:
+        return self.tool_receipts.unresolved(run_id)
+
+    def resume(self, scope: str, run_id: str,
+               artifact: str | None = None) -> dict[str, Any]:
+        """Put a parked run back in the queue; the host's worker picks it up from here.
+
+        A crash can interrupt a run whose human gate the person already answered.
+        That checkpoint still holds the answer, so an interrupted run wakes when its
+        checkpoint left a node parked. ``artifact`` is where the person put the file
+        the gate asked for, for the host to land on the artifact the graph declared.
+        """
         with self._lock:
             state = self.status(scope, run_id)
-            if state["status"] not in _PARKED:
+            resumable = (
+                state["status"] in _PARKED
+                or (
+                    state["status"] == "interrupted"
+                    and (
+                        self.parked_checkpoint(run_id) is not None
+                        or self.awaiting_checkpoint(run_id) is not None
+                    )
+                )
+            )
+            if not resumable:
                 return state
             with self._db() as db:
-                db.execute("UPDATE runs SET status='queued' WHERE id=? AND status='waiting'",
-                           (run_id,))
+                db.execute("UPDATE runs SET handoff=? WHERE id=?",
+                           (_json({"artifact": artifact}) if artifact else None, run_id))
+                db.execute("UPDATE runs SET status='queued' "
+                           "WHERE id=? AND status IN "
+                           "('waiting','waiting_external','interrupted')", (run_id,))
         return self.status(scope, run_id)
+
+    def replay_requeue(self, scope: str, run_id: str,
+                       artifact: str | None = None) -> dict[str, Any]:
+        """Queue one more attempt after a replay died.
+
+        A run whose checkpoint still holds a parked human node continues from that
+        checkpoint, so work the person already did is not asked again; anything else
+        queues the same frozen draft from the start. Only an undecided capture may
+        requeue: a published asset belongs to the revision channel.
+        """
+        state = self.status(scope, run_id)
+        unresolved = self.tool_receipts.unresolved(run_id)
+        if unresolved:
+            raise ValueError(
+                "run has unresolved tool side effects; reconcile or cancel them "
+                "before replay"
+            )
+        asset = self.get(state["asset_id"], state["version"])
+        if asset["published"]:
+            raise ValueError("asset is already published; revise it instead of replaying")
+        if state["status"] in _ACTIVE:
+            raise ValueError("run is still live; wait for it or cancel it first")
+        if state["status"] in _PARKED:
+            raise ValueError("run is parked; use genome_resume to continue it")
+        if (self.parked_checkpoint(run_id) is not None
+                or self.awaiting_checkpoint(run_id) is not None):
+            return self.resume(scope, run_id, artifact)
+        capture = self.captures.for_run(run_id)
+        queued = self.submit(scope, uuid4().hex, state["asset_id"], state["version"],
+                             state["params"], allow_draft=True)
+        if capture:
+            self.captures.relink(capture["capture_id"], run_id=queued["id"], scope=scope)
+        return queued
+
+    def _run_dir(self, run_id: str) -> Path:
+        return self.root / "runs" / run_id
+
+    def parked_checkpoint(self, run_id: str) -> str | None:
+        """The human node a run's checkpoint left parked, if it has one."""
+        return self._checkpoint_waiting(self._run_dir(run_id), "waiting")
+
+    def awaiting_checkpoint(self, run_id: str) -> str | None:
+        """The node a run's checkpoint left waiting on an external task."""
+        return self._checkpoint_waiting(self._run_dir(run_id), "waiting_external")
+
+    @staticmethod
+    def _checkpoint_nodes(path: Path) -> dict[str, Any]:
+        try:
+            nodes = json.loads(path.read_text(encoding="utf-8"))["nodes"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        return nodes if isinstance(nodes, dict) else {}
+
+    @classmethod
+    def _checkpoint_waiting(cls, run_dir: Path, status: str) -> str | None:
+        """The parked node a checkpoint still holds: an answer a crash did not consume.
+
+        A park marks the node and every ancestor waiting, so the parked gate is the
+        deepest one; the shallowest would be the graph root.
+        """
+        waiting = [name for name, entry in
+                   cls._checkpoint_nodes(run_dir / "checkpoint.json").items()
+                   if isinstance(entry, dict) and entry.get("status") == status]
+        return max(waiting, key=lambda name: name.count(".")) if waiting else None
+
+    @classmethod
+    def _checkpoint_parked(cls, run_dir: Path) -> str | None:
+        """The deepest parked node of either kind, for progress reporting."""
+        waiting = [name for name, entry in
+                   cls._checkpoint_nodes(run_dir / "checkpoint.json").items()
+                   if isinstance(entry, dict)
+                   and entry.get("status") in {"waiting", "waiting_external"}]
+        return max(waiting, key=lambda name: name.count(".")) if waiting else None
 
     def execute(self, scope: str, run_id: str, host: Host,
                 emit: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
@@ -368,16 +578,25 @@ class GenomeService:
             resuming_node = (
                 str(parked.get("node"))
                 if isinstance(parked, dict) and parked.get("node")
+                and parked.get("kind", "human") == "human"
                 else None
             )
-            resuming = state["status"] in _PARKED or resuming_node is not None
+            # A queued run may already have consumed its park: the waiting receipt or
+            # the checkpoint is then the only evidence that this is a continuation.
+            resuming = (state["status"] in _PARKED or isinstance(parked, dict)
+                        or (self.root / "runs" / run_id / "checkpoint.json").exists())
             cancel = self._signals.setdefault(run_id, threading.Event())
             with self._db() as db:
                 changed = db.execute(
                     "UPDATE runs SET status='running' "
-                    "WHERE id=? AND status IN ('queued','waiting')", (run_id,)).rowcount
+                    "WHERE id=? AND status IN ('queued','waiting','waiting_external')",
+                    (run_id,)).rowcount
             if not changed:
                 return self.status(scope, run_id)
+            with self._db() as db:
+                row = db.execute("SELECT handoff FROM runs WHERE id=?", (run_id,)).fetchone()
+            handoff = json.loads(row["handoff"]) if row and row["handoff"] else None
+            human_artifact = handoff.get("artifact") if isinstance(handoff, dict) else None
         execution_evidence = {"log_tail": ""}
         promotion = None
         revision = None
@@ -386,6 +605,41 @@ class GenomeService:
             if cancel.is_set():
                 raise RunCancelled()
         def event(payload: dict[str, Any]) -> Any:
+            if payload.get("event") == "tool_call_started":
+                execution_id = payload.get("execution_id")
+                if isinstance(execution_id, str):
+                    self._active_tools.setdefault(run_id, set()).add(execution_id)
+                    self.tool_receipts.accepted(
+                        run_id=run_id,
+                        node=str(payload.get("node", "")),
+                        attempt=int(payload.get("attempt", 0)),
+                        execution_id=execution_id,
+                        tool_name=str(payload.get("tool", "")),
+                        arguments=(
+                            payload.get("arguments")
+                            if isinstance(payload.get("arguments"), dict)
+                            else {}
+                        ),
+                    )
+            if payload.get("event") == "tool_call_finished":
+                execution_id = payload.get("execution_id")
+                if isinstance(execution_id, str):
+                    self._active_tools.setdefault(run_id, set()).discard(execution_id)
+                    self.tool_receipts.finish(
+                        run_id=run_id,
+                        execution_id=execution_id,
+                        state=str(payload.get("state", "unknown")),
+                        receipt=(
+                            payload.get("receipt")
+                            if isinstance(payload.get("receipt"), dict)
+                            else None
+                        ),
+                        error=(
+                            str(payload["error"])
+                            if payload.get("error") is not None
+                            else None
+                        ),
+                    )
             if isinstance(payload.get("execution"), dict):
                 execution_evidence.update(payload["execution"])
             if payload.get("command"):
@@ -416,6 +670,10 @@ class GenomeService:
             if graph.pin != state["pin"]:
                 raise ValueError("frozen package has changed")
             self._supported_graph(graph.node)
+            if resuming_node is None:
+                # A crash can interrupt a wakeup before the engine re-enters the gate:
+                # the checkpoint still names the node the person answered.
+                resuming_node = self.parked_checkpoint(run_id)
             asset = json.loads((package / "manifest.json").read_text())
             paths = [key for key, spec in asset["parameters"].items() if spec["type"] == "path"]
             options = {}
@@ -426,13 +684,16 @@ class GenomeService:
                     raise ValueError("original verification package changed")
                 options['verification_package'] = original
             ports, params = host.prepare(run_id, package, state["params"], paths, cancel,
-                                         event, resuming=resuming_node, **options)
+                                         event, resuming=resuming_node,
+                                         human_artifact=human_artifact, **options)
             if package_pin(package) != state["pin"]:
                 raise ValueError("package changed while preparing execution")
             agent_task = None
             if self._requires_agent(graph.node):
                 agent_task = lambda request: self.stages.execute(scope, run_id, request, event, check_cancel)
             ports = replace(ports, check_cancel=check_cancel, on_event=event, agent_task=agent_task)
+            if ports.tool is not None:
+                self._tool_ports[run_id] = ports.tool
             diagnostics = handshake(graph, ports)
             if diagnostics:
                 reasons = "; ".join(
@@ -454,9 +715,24 @@ class GenomeService:
         except PortError as exc:
             status, details = "failed", {"error": str(exc)}
         except RunCancelled:
-            status, details = "cancelled", {}
+            unresolved = self._cancellation_unconfirmed(run_id)
+            if unresolved:
+                status, details = "interrupted", {
+                    "error": "cancellation could not be confirmed",
+                    "cancellation_unconfirmed": unresolved,
+                }
+            else:
+                status, details = "cancelled", {}
         except Exception as exc:
             status, details = "interrupted", {"error": str(exc)}
+        if cancel.is_set() and status != "interrupted":
+            unresolved = self._cancellation_unconfirmed(run_id)
+            if unresolved:
+                status = "interrupted"
+                details.update(
+                    error="cancellation could not be confirmed",
+                    cancellation_unconfirmed=unresolved,
+                )
         details["execution"] = execution_evidence
         checkpoint = evidence_dir / "checkpoint.json"
         if checkpoint.exists():
@@ -471,14 +747,24 @@ class GenomeService:
         if status == "failed":
             details["instruction"] = RECOVERY_INSTRUCTION
         elif status == "waiting":
-            details["instruction"] = WAITING_INSTRUCTION
+            waiting = details.get("waiting")
+            details["instruction"] = (
+                AWAIT_INSTRUCTION
+                if isinstance(waiting, dict) and waiting.get("kind") == "external"
+                else WAITING_INSTRUCTION
+            )
         capture = self.captures.for_run(run_id)
         if capture:
             # The run stays "running" until its capture verdict is part of the same
             # row, so no observer sees a finished capture run without its decision.
             # Replay B runs here, in the run's worker thread, never inside a tool call.
             if cancel.is_set() and status != "interrupted":
-                status = "cancelled"
+                unresolved = self._cancellation_unconfirmed(run_id)
+                if unresolved:
+                    status = "interrupted"
+                    details["cancellation_unconfirmed"] = unresolved
+                else:
+                    status = "cancelled"
             try:
                 details["capture"] = self.captures.finish(
                     capture["capture_id"], status=status, result=details, host=host,
@@ -497,4 +783,6 @@ class GenomeService:
                     details["error"] = str(exc)
             db.execute("UPDATE runs SET status=?, result=? WHERE id=?", (status, _json(details), run_id))
             self._signals.pop(run_id, None)
+            self._tool_ports.pop(run_id, None)
+            self._active_tools.pop(run_id, None)
         return self.status(scope, run_id)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentgenome"
-version = "0.6.13"
+version = "0.6.48"
 requires-python = ">=3.11"
 dependencies = ["PyYAML"]
 

@@ -54,6 +54,13 @@ def _blank(path: str, note: str) -> dict[str, Any]:
             "sha256": None, "rows": None, "schema": {}, "text": None, "note": note}
 
 
+def _directory(path: str) -> dict[str, Any]:
+    """A directory input: the path is the evidence, there is no head to keep."""
+    entry = _blank(path, "目录输入：只记录路径与格式，不采样内容")
+    entry["format"] = "dir"
+    return entry
+
+
 def _detect(path: str, text: str) -> tuple[str, str]:
     """The file's format and, for tables, the delimiter it uses."""
     suffix = PurePosixPath(path).suffix.lower()
@@ -119,6 +126,8 @@ def inspect(source: Any, path: str, limit: int = SAMPLE_BYTES) -> dict[str, Any]
     """Head, format and schema of one input file; problems are recorded, not raised."""
     try:
         data = read_head(source, path, limit)
+    except IsADirectoryError:
+        return _directory(path)
     except Exception as exc:
         return _blank(path, f"读取失败：{type(exc).__name__}: {exc}"[:300])
     truncated = len(data) > limit
@@ -208,7 +217,7 @@ def compatibility(index: Mapping[str, Any] | None, contract: Mapping[str, Any] |
         declared = (contract or {}).get(key)
         declared = declared if isinstance(declared, Mapping) else {}
         actual_format = str(actual.get("format"))
-        if actual_format in {"unavailable", "binary"}:
+        if actual_format in {"unavailable", "binary", "dir"}:
             warnings.append(f"{key}：输入无法取样（{actual.get('note')}），未做契约校验")
             continue
         expected = str(declared.get("format") or (captured.get(key) or {}).get("format") or "")

@@ -71,6 +71,61 @@ def test_artifact_extension_is_declared_per_leaf(tmp_path: Path) -> None:
     assert compile(package).node.children[0].artifact_ext == ".jsonl"
 
 
+def test_artifact_destination_can_follow_a_declared_input(tmp_path: Path) -> None:
+    body = VALID.replace(
+        LEAF_DO,
+        "      artifact: {ext: jsonl, at: '{input.source.dir}/clean.jsonl'}\n"
+        "      input: {source: {type: path, from: root.input.source}}\n"
+        + LEAF_DO,
+    ).replace(
+        "  verify:\n    - metric:",
+        "  input: {source: {type: path}}\n  verify:\n    - metric:",
+    )
+    package = write_graph(tmp_path, body)
+    assert check(package) == []
+    node = compile(package).node.children[0]
+    assert node.artifact_ext == ".jsonl"
+    assert node.artifact_at == "{input.source.dir}/clean.jsonl"
+
+
+@pytest.mark.parametrize(
+    ("declaration", "code"),
+    [
+        ("artifact: {at: 'out.jsonl'}", "E_ARTIFACT"),
+        ("artifact: {at: '{input.nope.dir}/out.jsonl'}", "E_SLOT"),
+        ("artifact: {at: '{input.source.dir}/a/b.jsonl'}", "E_ARTIFACT"),
+        ("artifact: {ext: jsonl, at: 3}", "E_ARTIFACT"),
+    ],
+)
+def test_artifact_destination_must_be_one_directory_slot(
+    tmp_path: Path, declaration: str, code: str
+) -> None:
+    body = VALID.replace(
+        LEAF_DO,
+        f"      {declaration}\n"
+        "      input: {source: {type: path, from: root.input.source}}\n" + LEAF_DO,
+    ).replace(
+        "  verify:\n    - metric:",
+        "  input: {source: {type: path}}\n  verify:\n    - metric:",
+    )
+    diagnostics = check(write_graph(tmp_path, body))
+    assert [item.code for item in diagnostics] == [code]
+
+
+def test_artifact_destination_is_rejected_outside_a_run_node(tmp_path: Path) -> None:
+    body = VALID.replace(
+        LEAF_DO,
+        "      artifact: {at: '{input.source.dir}/out.jsonl'}\n"
+        '      do: {llm: "写一份结果"}\n'
+        "      input: {source: {type: path, from: root.input.source}}\n",
+    ).replace(
+        "  verify:\n    - metric:",
+        "  input: {source: {type: path}}\n  verify:\n    - metric:",
+    )
+    diagnostics = check(write_graph(tmp_path, body))
+    assert [item.code for item in diagnostics] == ["E_ARTIFACT"]
+
+
 @pytest.mark.parametrize(
     "declaration",
     ["artifact: {ext: 'json.l'}", "artifact: {suffix: jsonl}", "artifact: jsonl"],

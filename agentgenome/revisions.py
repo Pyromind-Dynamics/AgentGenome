@@ -31,6 +31,13 @@ WAITING_INSTRUCTION = (
     'then call genome_resume with this run ID to continue from its checkpoint.'
 )
 
+AWAIT_INSTRUCTION = (
+    'This run is parked on an external task: no worker, shell or terminal is held, and '
+    'the submission node already ran. Do not poll, re-submit, or replay it. The task '
+    'callback resumes the same run from its checkpoint; if a callback was missed, call '
+    'genome_resume with this run ID and the host probes the receipt once.'
+)
+
 STOPPED = {'succeeded', 'failed', 'interrupted', 'cancelled'}
 
 

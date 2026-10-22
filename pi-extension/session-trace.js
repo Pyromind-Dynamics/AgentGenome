@@ -1,4 +1,4 @@
-// Trace export: clip Pi session history into compact JSON for AgentGenome capture.
+// Trace export: compact previews for legacy callers, complete evidence for capture.
 // Uses only ctx.sessionManager and Node built-ins, so every Pi host works the same way.
 
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
@@ -7,14 +7,34 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 export const TRACE_VERSION = 1;
 export const TRACE_DIRECTORY = "public_data/agentgenome-traces";
 export const DEFAULT_MAX_STEPS = 400;
-// Host file APIs cap a single read (256 KiB on the SDK bridge), so the export must fit.
+// Legacy compact exports fit a single RPC read; complete exports use local file reads.
 export const MAX_TRACE_BYTES = 240 * 1024;
+// A complete export keeps every step. The cap guards memory, not evidence: tool output
+// is projected first (see `projectText`), so this is measured after the payload is gone.
+export const MAX_COMPLETE_TRACE_BYTES = 8 * 1024 * 1024;
 const TEXT_LIMIT = 2000;
 const ARRAY_LIMIT = 20;
 const SESSION_LIMIT = 20;
 
-function clip(value, limit = TEXT_LIMIT) {
+// Complete exports keep tool output only where it can carry evidence. `_reported_writes`
+// reads a product path off a line that also names the write, and `_REFUSAL` reads a
+// refusal; everything else is a progress log that only costs bytes. Keeping the head and
+// tail as well preserves what a human needs to read the step.
+const EXCERPT_FULL_LIMIT = 4096;
+const EXCERPT_HEAD_LINES = 20;
+const EXCERPT_TAIL_LINES = 20;
+const EXCERPT_LINE_LIMIT = 4096;
+const EXCERPT_LINE_HEAD = 1024;
+const EXCERPT_LINE_TAIL = 3000;
+// Deliberately broader than the Python readers: an over-kept line only costs bytes,
+// a dropped one loses evidence.
+const EVIDENCE_LINE =
+  /wrote|written|saved|output|outputted|已写入|写入|输出到|产物|denied|rejected|blocked|not allowed|导出|handoff/i;
+const ARROW_LINE = /(?:->|=>)/;
+
+function clip(value, limit = TEXT_LIMIT, clippedFields, field) {
   if (typeof value !== "string" || value.length <= limit) return value;
+  if (clippedFields && !clippedFields.includes(field)) clippedFields.push(field);
   return `${value.slice(0, limit)}…[+${value.length - limit} chars]`;
 }
 
@@ -26,20 +46,67 @@ function textOf(content) {
     .join("\n");
 }
 
-function clipArguments(args) {
+function clipArguments(args, clippedFields) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
   const clipped = {};
   for (const [key, value] of Object.entries(args)) {
-    if (typeof value === "string") clipped[key] = clip(value);
-    else if (Array.isArray(value)) clipped[key] = value.slice(0, ARRAY_LIMIT).map((item) => clip(item));
-    else clipped[key] = value;
+    const field = `args.${key}`;
+    if (typeof value === "string") clipped[key] = clip(value, TEXT_LIMIT, clippedFields, field);
+    else if (Array.isArray(value)) {
+      if (value.length > ARRAY_LIMIT) clippedFields.push(field);
+      clipped[key] = value.slice(0, ARRAY_LIMIT).map((item) =>
+        clip(item, TEXT_LIMIT, clippedFields, field));
+    } else clipped[key] = value;
   }
   return clipped;
 }
 
+function excerptLine(line) {
+  if (line.length <= EXCERPT_LINE_LIMIT) return line;
+  const tail = line.slice(-EXCERPT_LINE_TAIL);
+  return `${line.slice(0, EXCERPT_LINE_HEAD)}…[+${line.length - EXCERPT_LINE_HEAD - EXCERPT_LINE_TAIL} chars]…${tail}`;
+}
+
+function namesAPath(line) {
+  return line.split(/\s+/).some((token) => {
+    const value = token.replace(/^["'`([{<]+/, "").replace(/["'`)\]}>.,;:]+$/, "");
+    return value.lastIndexOf("/") > 0 && /\.[A-Za-z0-9]{1,8}$/.test(value);
+  });
+}
+
+// Keep the lines that can carry evidence plus the head and tail, and mark what was
+// dropped. A short text is returned untouched, so ordinary steps stay byte-identical.
+export function projectText(text) {
+  if (typeof text !== "string" || text.length <= EXCERPT_FULL_LIMIT) {
+    return { text, excerpt: null };
+  }
+  const lines = text.split("\n");
+  const keep = new Set();
+  lines.forEach((line, index) => {
+    if (index < EXCERPT_HEAD_LINES || index >= lines.length - EXCERPT_TAIL_LINES
+      || EVIDENCE_LINE.test(line) || ARROW_LINE.test(line) || namesAPath(line)) {
+      keep.add(index);
+    }
+  });
+  const kept = [...keep].sort((left, right) => left - right);
+  const parts = [];
+  let previous = -1;
+  for (const index of kept) {
+    if (previous >= 0 && index > previous + 1) {
+      parts.push(`…[${index - previous - 1} 行省略]…`);
+    }
+    parts.push(excerptLine(lines[index]));
+    previous = index;
+  }
+  return {
+    text: parts.join("\n"),
+    excerpt: { kept_lines: kept.length, total_lines: lines.length, total_chars: text.length },
+  };
+}
+
 // Pair assistant tool calls with their results; user turns stay in the sequence so the
 // captured graph can tell an instruction from an action.
-export function traceSteps(entries, maxSteps = DEFAULT_MAX_STEPS) {
+export function traceSteps(entries, maxSteps = DEFAULT_MAX_STEPS, { complete = false } = {}) {
   const results = new Map();
   for (const entry of entries) {
     const message = entry?.type === "message" ? entry.message : null;
@@ -52,22 +119,38 @@ export function traceSteps(entries, maxSteps = DEFAULT_MAX_STEPS) {
     if (entry?.type !== "message") continue;
     const message = entry.message;
     if (message?.role === "user") {
+      const clippedFields = [];
+      const text = textOf(message.content);
+      const projected = complete
+        ? projectText(text)
+        : { text: clip(text, TEXT_LIMIT, clippedFields, "text"), excerpt: null };
       steps.push({ kind: "user", entry_id: entry.id, timestamp: entry.timestamp,
-        text: clip(textOf(message.content)) });
+        text: projected.text,
+        ...(projected.excerpt ? { text_excerpt: projected.excerpt } : {}),
+        ...(clippedFields.length ? { clipped_fields: clippedFields } : {}) });
       continue;
     }
     if (message?.role !== "assistant") continue;
     for (const block of message.content ?? []) {
       if (block?.type !== "toolCall") continue;
       const result = results.get(block.id);
+      const clippedFields = [];
+      const resultText = result ? textOf(result.content) : null;
+      // Arguments first: `clipped_fields` lists them in the order they were clipped.
+      const args = complete ? block.arguments : clipArguments(block.arguments, clippedFields);
+      const projected = complete && resultText !== null
+        ? projectText(resultText)
+        : { text: clip(resultText, TEXT_LIMIT, clippedFields, "result.text"), excerpt: null };
       steps.push({ kind: "tool", entry_id: entry.id, timestamp: entry.timestamp,
-        tool: block.name, call_id: block.id, args: clipArguments(block.arguments),
+        tool: block.name, call_id: block.id, args,
         result: result
-          ? { is_error: result.isError === true, text: clip(textOf(result.content)) }
-          : null });
+          ? { is_error: result.isError === true, text: projected.text,
+            ...(projected.excerpt ? { excerpt: projected.excerpt } : {}) }
+          : null,
+        ...(clippedFields.length ? { clipped_fields: clippedFields } : {}) });
     }
   }
-  const dropped = Math.max(0, steps.length - maxSteps);
+  const dropped = complete ? 0 : Math.max(0, steps.length - maxSteps);
   return { steps: steps.slice(dropped).map((step, seq) => ({ seq, ...step })), dropped };
 }
 
@@ -85,8 +168,8 @@ export function parseSessionLog(text) {
   return entries;
 }
 
-export function buildTrace(entries, { traceId, sessionId, sessionName, maxSteps } = {}) {
-  const { steps, dropped } = traceSteps(entries, maxSteps);
+export function buildTrace(entries, { traceId, sessionId, sessionName, maxSteps, complete = false } = {}) {
+  const { steps, dropped } = traceSteps(entries, maxSteps, { complete });
   return {
     trace_version: TRACE_VERSION,
     trace_id: String(traceId ?? "trace"),
@@ -105,6 +188,21 @@ export function traceFileName(traceId) {
 
 function serialized(trace) {
   return `${JSON.stringify(trace, null, 2)}\n`;
+}
+
+function excerptedSteps(trace) {
+  return trace.steps.filter((step) => step.result?.excerpt || step.text_excerpt).length;
+}
+
+// Name the steps that make an export too big. "Split the session" is not actionable on
+// its own; "step 12 carries a 3 MiB inline script" tells the author what to change.
+function largestSteps(trace, limit = 3) {
+  return trace.steps
+    .map((step) => ({ step, size: Buffer.byteLength(JSON.stringify(step), "utf8") }))
+    .sort((left, right) => right.size - left.size)
+    .slice(0, limit)
+    .map(({ step, size }) => `${step.tool ?? "user"}@${step.seq}（${(size / 1024).toFixed(0)} KiB）`)
+    .join("、");
 }
 
 // Keep the newest steps so the export stays readable through one host read.
@@ -204,9 +302,9 @@ export async function listSessions(ctx, { limit = SESSION_LIMIT } = {}) {
   return sessions;
 }
 
-// Export the requested sessions next to the workspace so the Python service can read
-// them through the host file API instead of a size-limited RPC frame.
-export async function exportTraces(ctx, traceIds, { cwd = ctx.cwd, maxSteps } = {}) {
+// Export the requested sessions next to the workspace. Capture/distill request
+// complete local files; legacy callers can still use the compact RPC-sized export.
+export async function exportTraces(ctx, traceIds, { cwd = ctx.cwd, maxSteps, complete = false } = {}) {
   const refs = [];
   for (const id of traceIds ?? []) {
     const resolved = await readEntries(ctx.sessionManager, String(id));
@@ -215,10 +313,21 @@ export async function exportTraces(ctx, traceIds, { cwd = ctx.cwd, maxSteps } = 
       sessionId: resolved.sessionId,
       sessionName: resolved.sessionName,
       maxSteps,
+      complete,
     });
-    const fitted = fitTrace(trace);
-    refs.push({ trace_id: fitted.trace_id, path: await writeTraceFile(cwd, fitted),
-      step_count: fitted.step_count, dropped_steps: fitted.dropped_steps });
+    if (complete) {
+      const size = Buffer.byteLength(serialized(trace), "utf8");
+      if (size > MAX_COMPLETE_TRACE_BYTES) {
+        throw new Error(`轨迹 ${trace.trace_id} 完整导出 ${size} 字节，超过 `
+          + `${MAX_COMPLETE_TRACE_BYTES} 字节（8 MiB）上限；工具输出已按产物行投影，`
+          + `仍然超出说明命令或参数本身过大：${largestSteps(trace)}。`
+          + "请把这些大内容改成文件路径传递，或把这条链路拆到更短的会话里再沉淀。");
+      }
+    }
+    const exported = complete ? trace : fitTrace(trace);
+    refs.push({ trace_id: exported.trace_id, path: await writeTraceFile(cwd, exported),
+      step_count: exported.step_count, dropped_steps: exported.dropped_steps,
+      excerpted_steps: complete ? excerptedSteps(exported) : 0 });
   }
   return refs;
 }

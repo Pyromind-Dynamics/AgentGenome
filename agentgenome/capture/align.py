@@ -35,6 +35,7 @@ class Slot:
     variants: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]
     evidence: tuple[tuple[str, int], ...]
     inline_code: bool
+    keep: bool = False
 
     @property
     def kind(self) -> str:
@@ -155,6 +156,7 @@ def _slot(step: Step, trace_id: str, role: str) -> Slot:
         variants=((trace_id, step.read_paths, step.write_paths),) if successful else (),
         evidence=((trace_id, step.seq),) if successful else (),
         inline_code=step.inline_code,
+        keep=step.keep,
     )
 
 
@@ -168,6 +170,7 @@ def _extend(slot: Slot, step: Step, trace_id: str) -> Slot:
         attempts=slot.attempts + 1,
         variants=slot.variants + ((trace_id, step.read_paths, step.write_paths),),
         evidence=slot.evidence + ((trace_id, step.seq),),
+        keep=slot.keep or step.keep,
     )
 
 
@@ -207,7 +210,11 @@ def classify(slots: Sequence[Slot], required: int) -> tuple[Slot, ...]:
 def align_traces(traces: Sequence[Trace], threshold: float = DEFAULT_THRESHOLD) -> Alignment:
     if not traces:
         raise ValueError("capture needs at least one trace")
-    sequences = [(trace.trace_id, alignable(trace)) for trace in traces]
+    # The first trace seeds the columns and every later one is aligned against the
+    # current slots, so the order traces arrive in changes the skeleton. Sorting by
+    # id makes the result a property of the trace set, not of the caller's list.
+    ordered = sorted(traces, key=lambda trace: trace.trace_id)
+    sequences = [(trace.trace_id, alignable(trace)) for trace in ordered]
     contributing = [(trace_id, steps) for trace_id, steps in sequences if steps]
     if not contributing:
         raise ValueError("no tool steps to align")
@@ -217,7 +224,7 @@ def align_traces(traces: Sequence[Trace], threshold: float = DEFAULT_THRESHOLD) 
             _slot(step, trace_id, ROLE_BRANCH) for step in steps]
     required = required_support(len(contributing), threshold)
     return Alignment(
-        traces=tuple(trace.trace_id for trace in traces),
+        traces=tuple(trace.trace_id for trace in ordered),
         skipped=tuple(trace_id for trace_id, steps in sequences if not steps),
         threshold=threshold,
         required_support=required,
@@ -243,6 +250,7 @@ def alignment_payload(alignment: Alignment) -> dict[str, Any]:
             "write_paths": list(slot.write_paths),
             "inline_code": slot.inline_code,
             "varies": slot.varies,
+            "keep": slot.keep,
         })
     return {
         "traces": list(alignment.traces),

@@ -12,6 +12,7 @@ finalize step of A (see ``run_probe``), so neither blocks a tool call.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from core.api import run
 
+from ..parameters import normalize_params, parameter_spec, path_keys
 from .emit import Package
 
 if TYPE_CHECKING:
@@ -34,7 +36,7 @@ class ReplayCase:
     name: str
     status: str
     run_id: str | None
-    params: tuple[tuple[str, str], ...]
+    params: tuple[tuple[str, Any], ...]
     failure: dict[str, Any] | None = None
     outputs: dict[str, Any] | None = None
     evidence: tuple[str, ...] = ()
@@ -60,7 +62,16 @@ def values(package: Package, params: Mapping[str, Any]) -> dict[str, Any]:
     if set(params) != expected:
         raise ReplayError(
             f"参数不匹配：需要 {sorted(expected)}，收到 {sorted(params)}")
-    return {key: str(value) for key, value in params.items()}
+    specs = dict(package.parameter_specs)
+    for key, type_name in package.param_types.items():
+        specs.setdefault(
+            key,
+            parameter_spec(key, type_name=type_name, source=key),
+        )
+    try:
+        return normalize_params(specs, params)
+    except ValueError as exc:
+        raise ReplayError(str(exc)) from exc
 
 
 def probe_replay(host: Host, package: Package, params: Mapping[str, Any], *,
@@ -72,8 +83,9 @@ def probe_replay(host: Host, package: Package, params: Mapping[str, Any], *,
     directory = Path(run_dir)
     directory.mkdir(parents=True, exist_ok=True)
     events: list[dict[str, Any]] = []
+    paths = path_keys(package.parameter_specs, values_)
     ports, resolved = host.prepare(run_id, package.directory, values_,
-                                   list(values_), cancel or threading.Event(),
+                                   paths, cancel or threading.Event(),
                                    emit or events.append)
     if ports.artifacts is None:
         raise ReplayError("宿主没有提供 artifact 端口，无法回放验证")
@@ -117,7 +129,7 @@ def run_probe(host: Host, package_dir: str | Path, params: Mapping[str, Any], *,
               cancel: threading.Event | None = None,
               emit: Callable[[dict[str, Any]], None] | None = None) -> ReplayCase:
     """Replay B after the capture call returned; a broken replay is a verdict."""
-    requested = tuple(sorted((key, str(value)) for key, value in params.items()))
+    requested = tuple(sorted(params.items()))
     try:
         package = Package.load(package_dir)
         return probe_replay(host, package, params, run_id=run_id, run_dir=run_dir,
@@ -143,12 +155,17 @@ def read_case(service: GenomeService, scope: str, case: ReplayCase) -> ReplayCas
 
 
 def render_plan(probe: Mapping[str, Any] | None, run_id: str | None,
-                notes: Sequence[str] = ()) -> str:
+                notes: Sequence[str] = (), *, planned: bool = False) -> str:
     """What the capture queued; the verdict is appended once both replays ran."""
+    same = (
+        "已生成执行计划，等待用户确认"
+        if planned
+        else (f"已排队，run `{run_id}`" if run_id
+              else "未排队（与已有版本字节一致）")
+    )
     lines = [
         "### 回放计划", "",
-        "- 回放 A（原参数）：" + (f"已排队，run `{run_id}`" if run_id
-                                 else "未排队（与已有版本字节一致）"),
+        "- 回放 A（原参数）：" + same,
         "- 回放 B（换参数）：" + ("已排定，待回放 A 成功后执行" if probe
                                  else "未提供换参数回放数据"),
     ]

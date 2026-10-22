@@ -6,6 +6,7 @@ import pytest
 
 from adapters import LocalShell
 from agentgenome.cli import LocalHost
+from agentgenome.local_host import LocalExecutionHost
 from agentgenome.service import GenomeService, RunCancelled
 from core.artifacts import LocalArtifacts
 from core.ports import Ports
@@ -48,6 +49,31 @@ def test_asset_validation_publication_and_two_batches(catalog, tmp_path):
         submit(catalog, second)
     with pytest.raises(ValueError, match="conversation"):
         catalog.status("someone-else", state["id"])
+
+
+def test_status_reports_current_step_and_execution_evidence(catalog, tmp_path):
+    data = tmp_path / "first.csv"
+    data.write_text("name,age\nAda,36\n")
+    state = submit(catalog, data)
+
+    queued = catalog.status("validation", state["id"])
+    assert queued["current_node"] == "clean-sop.clean"
+    assert queued["step_index"] == 1
+    assert queued["total_steps"] == 2
+
+    result = catalog.execute(
+        "validation",
+        state["id"],
+        LocalExecutionHost(catalog.root, tmp_path),
+        lambda _: None,
+    )
+    assert result["status"] == "succeeded"
+    status = catalog.status("validation", state["id"])
+    assert status["started_at"]
+    assert status["last_event"]
+    assert status["execution_domain"] == "local"
+    assert Path(status["execution_path"]).is_dir()
+    assert Path(status["artifacts_dir"]).is_dir()
 
 
 def test_parameters_busy_cancel_recovery_and_freeze(catalog, tmp_path):

@@ -1,5 +1,7 @@
 """Artifact access belongs to the execution host, not the engine filesystem."""
 
+import os
+import shutil
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -11,6 +13,7 @@ class ArtifactPort(Protocol):
     def describe(self, name: str) -> dict[str, Any]: ...
     def read_text(self, name: str) -> str: ...
     def write_text(self, name: str, text: str) -> None: ...
+    def link(self, name: str, source: str) -> None: ...
 
 
 class LocalArtifacts:
@@ -32,3 +35,18 @@ class LocalArtifacts:
         path = self.root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+
+    def link(self, name: str, source: str) -> None:
+        """Put an external product on an artifact path without copying when possible.
+
+        A hardlink keeps a multi-gigabyte product out of the run directory while
+        still behaving like a regular file for ``describe``; a different filesystem
+        falls back to a copy.
+        """
+        target = self.root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copyfile(source, target)

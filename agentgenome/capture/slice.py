@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from .. import paths
 from .align import ROLE_SKELETON, Alignment, Slot
 from .trace import canonical_path
 
@@ -38,6 +39,7 @@ class Slice:
     auxiliary: tuple[int, ...]
     final_artifact: str | None
     producers: tuple[tuple[str, int], ...]
+    kept: tuple[int, ...] = ()
 
     @property
     def full(self) -> bool:
@@ -57,7 +59,7 @@ def producer_map(slots: Sequence[Slot],
         if slot.role != ROLE_SKELETON:
             continue
         for path in slot.write_paths:
-            result[canonical_path(path, given)] = order
+            result[paths.display(canonical_path(path, given))] = order
     return result
 
 
@@ -69,21 +71,25 @@ def reverse_slice(alignment: Alignment, final_artifact: str | None = None,
     skeleton = tuple(order for order, slot in enumerate(slots) if slot.role == ROLE_SKELETON)
     if not skeleton:
         raise SliceError("没有骨架步骤，无法生成图")
+    kept = tuple(order for order in skeleton if slots[order].keep)
     if final_artifact is None:
-        return Slice(skeleton, (), None, tuple(sorted(producers.items())))
-    root = producers.get(canonical_path(final_artifact, given))
+        return Slice(skeleton, (), None, tuple(sorted(producers.items())), kept)
+    root = producers.get(paths.display(canonical_path(final_artifact, given)))
     if root is None:
         detail = (f"骨架步骤的产出：{_produced(producers)}" if producers
                   else "骨架步骤没有产出任何文件")
         raise SliceError(
             f"最终产物 {final_artifact!r} 不在任何骨架步骤的产物里；{detail}。"
             f"{OUTPUT_CONTRACT_HINT}")
-    keep = {root}
-    stack = [root]
+    # A step whose effect matters without feeding the final artifact (creating a
+    # Label Studio project, submitting a platform job) is kept on purpose; its own
+    # inputs then pull their producers in like any other node.
+    keep = {root, *kept}
+    stack = list(keep)
     while stack:
         order = stack.pop()
         for path in slots[order].read_paths:
-            source = producers.get(canonical_path(path, given))
+            source = producers.get(paths.display(canonical_path(path, given)))
             if source is not None and source < order and source not in keep:
                 keep.add(source)
                 stack.append(source)
@@ -93,6 +99,7 @@ def reverse_slice(alignment: Alignment, final_artifact: str | None = None,
         auxiliary=tuple(order for order in skeleton if order not in keep),
         final_artifact=final_artifact,
         producers=tuple(sorted(producers.items())),
+        kept=kept,
     )
 
 
@@ -100,6 +107,7 @@ def slice_payload(slice_: Slice, slots: Sequence[Slot]) -> dict[str, object]:
     return {
         "final_artifact": slice_.final_artifact,
         "full": slice_.full,
+        "kept": list(slice_.kept),
         "nodes": [
             {"order": order, "shape": slots[order].command_shape,
              "writes": list(slots[order].write_paths)}
@@ -120,6 +128,9 @@ def render_slice(slice_: Slice, slots: Sequence[Slot]) -> str:
     else:
         lines.append(f"- 最终产物：`{slice_.final_artifact}`")
     lines.append(f"- 入图 {len(slice_.nodes)} 步 / 辅助 {len(slice_.auxiliary)} 步")
+    if slice_.kept:
+        lines.append("- 强制保留（副作用步骤，产出不参与依赖闭包）："
+                     + "、".join(f"#{order}" for order in slice_.kept))
     if slice_.auxiliary:
         lines.extend(["", "| # | 辅助步骤 | 产出 |", "| --- | --- | --- |"])
         for order in slice_.auxiliary:

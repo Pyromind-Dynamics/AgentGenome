@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
@@ -18,14 +19,23 @@ import yaml
 
 from builder import Graph, compile as compile_graph
 
+from .. import paths
 from ..manifest import MATCH_KEYS, ManifestError, declared
 from ..manifest import validate as validate_manifest
+from ..parameters import (
+    ParameterSpec,
+    contracts_to_specs,
+    parameter_spec,
+)
 from .align import Alignment, Slot
 from .slice import Slice
 from .trace import (KIND_HUMAN, KIND_LLM, KIND_SHELL, KIND_TOOL, KIND_WRITE, ROLE_SCRIPT,
-                    Step, Trace, canonical_path, parse_command, role)
+                    Step, Trace, canonical_path, parse_command, placeholder_key, role)
 
 DEFAULT_VERSION = "0.1.0"
+# Tools whose call is an external side effect: replaying one submits work to a
+# platform queue, so the node asks for approval first.
+SIDE_EFFECT_TOOLS = frozenset({"df_submit_pipeline"})
 _TEXT_SUFFIXES = {".csv", ".jsonl", ".txt", ".tsv", ".md", ".log", ".yaml", ".yml"}
 _KEY = re.compile(r"[^a-z0-9]+")
 _ASSET_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -84,6 +94,19 @@ class LocalSource:
         with self._target(path).open("rb") as stream:
             return stream.read(limit)
 
+    def metadata(self, path: str) -> dict[str, Any]:
+        target = self._target(path)
+        try:
+            stat = target.stat()
+        except OSError:
+            return {"exists": False}
+        return {
+            "exists": True,
+            "is_file": target.is_file(),
+            "is_dir": target.is_dir(),
+            "size": stat.st_size,
+        }
+
 
 def source_for(workspace: Source | str | Path) -> Source:
     if isinstance(workspace, (str, Path)):
@@ -128,6 +151,14 @@ def _names_something(source: Source, token: str) -> bool:
     return True
 
 
+ASYNC_TOOLS = frozenset({"df_submit_pipeline"})
+
+
+def is_async_tool(name: str) -> bool:
+    """A tool that returns a task handle instead of the product it started."""
+    return name in ASYNC_TOOLS or name.endswith("_submit_pipeline")
+
+
 @dataclass(frozen=True)
 class EmittedNode:
     order: int
@@ -141,6 +172,7 @@ class EmittedNode:
     kind: str = "run"
     verify_command: str | None = None
     artifact_ext: str | None = None
+    artifact_at: str | None = None
     tool_name: str | None = None
     arguments: Mapping[str, Any] | None = None
 
@@ -156,6 +188,8 @@ class EmittedNode:
         if self.kind == "tool":
             return json.dumps({"tool": self.tool_name, "args": self.arguments},
                               ensure_ascii=False)
+        if self.kind == "await":
+            return json.dumps({"await": self.command}, ensure_ascii=False)
         return self.command
 
 
@@ -168,6 +202,8 @@ class Package:
     owner: str
     root_id: str
     params: tuple[tuple[str, str], ...]
+    param_types: Mapping[str, str]
+    parameter_specs: Mapping[str, ParameterSpec]
     nodes: tuple[EmittedNode, ...]
     scripts: tuple[tuple[str, str], ...]
     absorbed: tuple[tuple[int, str], ...]
@@ -196,6 +232,19 @@ class Package:
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         graph = compile_graph(root)
         capture = manifest.get("capture") or {}
+        contracts = manifest.get("input_contract") or {}
+        parameters = manifest.get("parameters") or {}
+        specs = contracts_to_specs(contracts)
+        for key, value in parameters.items():
+            if isinstance(value, Mapping) and "type" in value:
+                specs[str(key)] = parameter_spec(
+                    str(key),
+                    type_name=str(value["type"]),
+                    source=str(value.get("source", key)),
+                    default=value.get("default"),
+                )
+        for key in graph.params:
+            specs.setdefault(key, parameter_spec(key, type_name="path", source=key))
         return cls(
             directory=root,
             asset_id=manifest["id"],
@@ -203,7 +252,9 @@ class Package:
             label=manifest["name"],
             owner=manifest.get("owner", "local"),
             root_id=graph.node.id,
-            params=tuple((key, "") for key in sorted(graph.params)),
+            params=tuple((key, specs[key].source) for key in sorted(graph.params)),
+            param_types={key: spec.type for key, spec in specs.items()},
+            parameter_specs=specs,
             nodes=(),
             scripts=(),
             absorbed=(),
@@ -250,6 +301,19 @@ def output_type(path: str) -> str:
     if suffix in _TEXT_SUFFIXES:
         return "text"
     return "path"
+
+
+def _contract_types(contract: Mapping[str, Any]) -> Mapping[str, str]:
+    """Parameter types a manifest declares, as service expects them."""
+    return {key: spec.type for key, spec in contracts_to_specs(contract).items()}
+
+
+def _graph_types(contract: Mapping[str, Any]) -> Mapping[str, str]:
+    """Service-level parameter names use graph-level runtime types."""
+    return {
+        key: {"string": "text", "boolean": "bool"}.get(type_name, type_name)
+        for key, type_name in _contract_types(contract).items()
+    }
 
 
 def artifact_ext(path: str) -> str | None:
@@ -299,7 +363,11 @@ class _Plan:
     def __init__(self, alignment: Alignment, slice_: Slice, traces: Sequence[Trace],
                  label: str, owner: str, source: Source, version: str,
                  description: str | None, asset_id: str | None,
-                 bindings: Mapping[str, str] | None = None) -> None:
+                 bindings: Mapping[str, str] | None = None,
+                 output_contract: Mapping[str, Any] | None = None,
+                 input_contract: Mapping[str, Any] | None = None) -> None:
+        self.input_contract = dict(input_contract or {})
+        self.contract_specs = contracts_to_specs(self.input_contract)
         self.slots = alignment.slots
         self.slice = slice_
         self.traces = traces
@@ -310,6 +378,7 @@ class _Plan:
         self.source = source
         self.version = version
         self.description = description
+        self.output_contract = dict(output_contract or {})
         self.keys = _Keys()
         self.bindings = {str(key): str(value) for key, value in (bindings or {}).items()}
         self.root_id = _slug(label, "capture", allow_digit=False)
@@ -320,6 +389,7 @@ class _Plan:
         self.outputs: dict[int, tuple[str, str, str]] = {}
         self.linkable: dict[str, tuple[int, str, str, str]] = {}
         self.params: dict[str, str] = {}
+        self.parameter_specs: dict[str, ParameterSpec] = {}
         self.scripts: dict[str, str] = {}
         self.absorbed: dict[int, str] = {}
         self.not_solidifiable: dict[int, str] = {}
@@ -333,8 +403,13 @@ class _Plan:
         return step
 
     def file_of(self, path: str) -> str:
-        """The file a path token names, so both spellings of it pair up."""
-        return canonical_path(path, self.bindings)
+        """The file a path token names, so both spellings of it pair up.
+
+        `storage/datasets/x` (the sandbox alias) and `datasets/x` (the object path)
+        are one file; comparing raw strings made them two, which produced a duplicate
+        `_2` parameter and hid the producer from the reverse slice.
+        """
+        return paths.display(canonical_path(path, self.bindings))
 
     @property
     def output_paths(self) -> dict[str, str]:
@@ -497,7 +572,11 @@ class _Plan:
         for order in sorted(self.node_ids, reverse=True):
             step = self.step(order)
             primary = next((path for path in step.write_paths
-                            if self.file_of(path) in consumed), None)
+                            if self.slice.final_artifact is not None
+                            and self.file_of(path) == self.file_of(self.slice.final_artifact)), None)
+            if primary is None:
+                primary = next((path for path in step.write_paths
+                                if self.file_of(path) in consumed), None)
             if primary is None and step.write_paths:
                 primary = step.write_paths[-1]
             if primary is not None:
@@ -517,7 +596,15 @@ class _Plan:
         if key is None:
             key = self.keys.claim(_key_base(path))
             self.params[path] = key
-        return key, "path", f"{self.root_id}.input.{key}"
+        declared = self.contract_specs.get(key)
+        type_name = declared.type if declared is not None else "path"
+        self.parameter_specs[key] = parameter_spec(
+            key,
+            type_name=type_name,
+            source=path,
+        )
+        result_type = self.parameter_specs[key].graph_type
+        return key, result_type, f"{self.root_id}.input.{key}"
 
     def _build_nodes(self) -> None:
         for order in sorted(self.node_ids):
@@ -540,16 +627,19 @@ class _Plan:
             output = self.outputs.get(order)
             extra: tuple[str, ...] = ()
             ext: str | None = None
+            at: str | None = None
             if output is not None:
                 _, primary, _ = output
                 # A node writes into its own artifact; {output.*} only resolves for
                 # ancestors and siblings, which is what verify and compose use.
                 mapping[primary] = "{artifact}"
                 extra = tuple(path for path in step.write_paths if path != primary)
-                ext = artifact_ext(primary)
+                ext = artifact_ext(self.file_of(primary))
+                at = self._artifact_at(step, order, primary)
             kind = {"llm": "llm", "human": "human"}.get(step.kind, "run")
             arguments: Mapping[str, Any] | None = None
             command = ""
+            receipt = self._await_receipt(order, step)
             if step.kind == KIND_TOOL:
                 kind = "tool"
                 # Only declared reads are slots in the args: the output path names the
@@ -558,6 +648,13 @@ class _Plan:
                     dict(step.arguments or {}),
                     {path: mapping[path] for path in step.read_paths if path in mapping},
                 )
+            elif receipt is not None:
+                # A submit tool hands back a handle, not the product. Waiting is an
+                # engine state, not a command: the node parks without a worker and the
+                # task's callback resumes it, so the captured polling script is dropped.
+                kind = "await"
+                command = mapping[receipt]
+                at = None
             else:
                 command = _replace_tokens(step.command, mapping)
             self.nodes.append(EmittedNode(
@@ -573,9 +670,78 @@ class _Plan:
                 kind=kind,
                 verify_command=step.verify or None,
                 artifact_ext=ext,
+                artifact_at=at,
                 tool_name=step.tool_name if step.kind == KIND_TOOL else None,
                 arguments=arguments,
             ))
+
+    def _await_receipt(self, order: int, step: Step) -> str | None:
+        """The receipt path this step consumes, when an earlier async tool wrote it.
+
+        Matching on the data relationship (the step reads what the tool wrote) rather
+        than on the script name is what lets a captured `poll_task.py` become an
+        engine await node instead of a long-running shell command.
+        """
+        if step.kind != KIND_SHELL or not step.read_paths:
+            return None
+        reads = {self.file_of(path) for path in step.read_paths}
+        for earlier in sorted(self.node_ids):
+            if earlier >= order:
+                break
+            candidate = self.step(earlier)
+            if candidate.kind != KIND_TOOL or not is_async_tool(candidate.tool_name or ""):
+                continue
+            receipts = {self.file_of(path) for path in candidate.write_paths}
+            if receipts & reads:
+                return next(path for path in step.read_paths
+                            if self.file_of(path) in receipts)
+        return None
+
+    def _artifact_at(self, step: Step, order: int, primary: str) -> str | None:
+        """Pin a run step's product next to the input it is derived from.
+
+        A product can carry references to its neighbours -- a manifest naming sibling
+        images -- and those references only resolve where the file already lives. Only
+        a run step qualifies: its command writes the file itself, so the pinned
+        destination is exactly the path the captured command used. Products with no
+        input in their own directory keep the run-directory artifact.
+
+        A product declared as `{token}` has no literal file name, so the token itself
+        names the file and the step's first resolvable input supplies the directory
+        and suffix. Refusing to pin those (the previous behaviour) moved a manifest
+        away from the images it names, and the failure only surfaced on the platform.
+        """
+        if step.kind != KIND_SHELL:
+            return None
+        product = PurePosixPath(self.file_of(primary))
+        if "{" in product.name or "}" in product.name:
+            return self._pin_token_artifact(step, order, primary)
+        directory = product.parent
+        for path in step.read_paths:
+            if path in self.scripts:
+                continue
+            resolved = PurePosixPath(self.file_of(path))
+            # A path token such as `{source_manifest}` has no suffix until its
+            # binding is resolved. Checking the raw token skipped exactly the
+            # manifest case this pin exists to protect.
+            if not resolved.suffix or resolved.parent != directory:
+                continue
+            key = self._input_for(path, order)[0]
+            return f"{{input.{key}.dir}}/{product.name}"
+        return None
+
+    def _pin_token_artifact(self, step: Step, order: int, primary: str) -> str | None:
+        """The destination of a `{token}` product: its first resolvable input's dir."""
+        name = placeholder_key(primary) or "artifact"
+        for path in step.read_paths:
+            if path in self.scripts:
+                continue
+            resolved = PurePosixPath(self.file_of(path))
+            if "{" in str(resolved) or str(resolved.parent) in (".", ""):
+                continue
+            key = self._input_for(path, order)[0]
+            return f"{{input.{key}.dir}}/{name}{resolved.suffix}"
+        return None
 
 
 def _node_yaml(node: EmittedNode) -> dict[str, Any]:
@@ -587,22 +753,81 @@ def _node_yaml(node: EmittedNode) -> dict[str, Any]:
         "do": (
             {"tool": {"name": node.tool_name, "args": dict(node.arguments or {})}}
             if node.kind == "tool"
+            else {"await": {"receipt": node.command}}
+            if node.kind == "await"
             else {node.kind: node.command}
         ),
     }
+    # A platform submission spends real compute on someone else's queue. The graph
+    # declares it dangerous so a replay stops for approval instead of submitting on
+    # its own just because the chain was captured once.
+    if node.kind == "tool" and node.tool_name in SIDE_EFFECT_TOOLS:
+        data["danger"] = True
     if node.output is not None:
         key, type_name = node.output
         data["output"] = {key: {"type": type_name}}
-    if node.artifact_ext is not None:
-        data["artifact"] = {"ext": node.artifact_ext.lstrip(".")}
+    if node.artifact_ext is not None or node.artifact_at is not None:
+        artifact: dict[str, Any] = {}
+        if node.artifact_ext is not None:
+            artifact["ext"] = node.artifact_ext.lstrip(".")
+        if node.artifact_at is not None:
+            artifact["at"] = node.artifact_at
+        data["artifact"] = artifact
     data["verify"] = [{"run": node.verify}]
     return data
 
 
 def _composed(plan: _Plan) -> tuple[str, str, str] | None:
+    if plan.slice.final_artifact is not None:
+        for node in reversed(plan.nodes):
+            output = plan.outputs.get(node.order)
+            if output and plan.file_of(output[1]) == plan.file_of(plan.slice.final_artifact):
+                return node.id, output[0], output[2]
+        raise EmitError(f"最终产物 {plan.slice.final_artifact!r} 没有对应的图节点输出")
     composed = [(node.id, node.output[0], node.output[1])
                 for node in plan.nodes if node.output is not None]
     return composed[-1] if composed else None
+
+
+def _root_verify(plan: _Plan, composed: tuple[str, str, str]) -> str:
+    """Check the declared final file's format and required fields, when known."""
+    node_id, key, _ = composed
+    contract = plan.output_contract.get(key)
+    if contract is None:
+        if plan.output_contract:
+            raise EmitError(
+                f"output_contract must include the final graph output `{key}`"
+            )
+        return f"test -s {{output.{key}}}"
+    fmt = contract.get("format")
+    fields = contract.get("required_fields", contract.get("fields", []))
+    if fmt not in {"jsonl", "json", "text"}:
+        raise EmitError(
+            f"output_contract.{key}.format `{fmt}` has no automatic verifier; "
+            "use jsonl, json, or text"
+        )
+    if not isinstance(fields, list) or any(not isinstance(field, str) for field in fields):
+        raise EmitError(f"output_contract.{key} fields must be a list of strings")
+    if fmt == "text" and fields:
+        raise EmitError(f"output_contract.{key} text format does not support fields")
+    if not fields and fmt == "text":
+        return f"test -s {{output.{key}}}"
+    code = (
+        "import json,sys; p=sys.argv[1]; required="
+        + repr(fields)
+        + "; f=open(p,encoding='utf-8'); rows=[json.loads(line) for line in f if line.strip()]"
+        if fmt == "jsonl"
+        else "import json,sys; p=sys.argv[1]; required="
+        + repr(fields)
+        + "; data=json.load(open(p,encoding='utf-8')); rows=data if isinstance(data,list) else [data]"
+    )
+    code += (
+        "; assert rows, 'output is empty'; assert all(isinstance(row,dict) for row in rows), "
+        "'output rows must be JSON objects'; missing=sorted({field for row in rows "
+        "for field in required if field not in row}); "
+        "assert not missing, 'missing required fields: '+','.join(missing)"
+    )
+    return f"python3 -c {shlex.quote(code)} {{output.{key}}}"
 
 
 def _root_yaml(plan: _Plan) -> dict[str, Any]:
@@ -610,15 +835,22 @@ def _root_yaml(plan: _Plan) -> dict[str, Any]:
         "id": plan.root_id,
         "mode": "sequence",
         "provenance": sorted({seq for node in plan.nodes for seq in node.provenance}),
-        "input": {key: {"type": "path", "from": f"params.{key}"}
-                  for _, key in sorted(plan.params.items(), key=lambda item: item[1])},
+        "input": {
+            key: {
+                "type": plan.parameter_specs[key].graph_type,
+                "from": f"params.{key}",
+            }
+            for _, key in sorted(
+                plan.params.items(), key=lambda item: item[1]
+            )
+        },
         "children": [_node_yaml(node) for node in plan.nodes],
     }
     composed = _composed(plan)
     if composed:
         node_id, key, type_name = composed
         root["output"] = {key: {"type": type_name, "compose": [f"{node_id}.output.{key}"]}}
-        root["verify"] = [{"run": f"test -s {{output.{key}}}"}]
+        root["verify"] = [{"run": _root_verify(plan, composed)}]
     else:
         root["verify"] = [{"run": "true"}]
     return root
@@ -645,8 +877,16 @@ def _manifest(plan: _Plan, alignment: Alignment, slice_: Slice,
         "description": plan.description or (
             f"由 {len(trace_ids)} 条 Pi 轨迹沉淀：{plan.label}"),
         "owner": plan.owner,
-        "parameters": {key: {"type": "path", "description": f"根输入：{path}"}
-                       for path, key in sorted(plan.params.items(), key=lambda item: item[1])},
+        "parameters": {
+            key: {
+                "type": plan.parameter_specs[key].type,
+                "source": path,
+                "description": f"根输入：{path}",
+            }
+            for path, key in sorted(
+                plan.params.items(), key=lambda item: item[1]
+            )
+        },
         "requires": [],
         "expected_outputs": {} if composed is None else {
             composed[1]: f"由节点 {composed[0]} 产出，原轨迹路径 {plan.output_paths[composed[1]]}"},
@@ -689,6 +929,29 @@ def _verify_provenance(nodes: Sequence[EmittedNode], expected: Sequence[int],
             f"provenance 校验失败：uncovered_steps={uncovered} invented_steps={invented}")
 
 
+def _verify_outputs(plan: _Plan, graph: Graph) -> None:
+    """A declared product is not valid unless its compiled node exposes it."""
+    children = {node.id: node for node in graph.node.children}
+    for emitted in plan.nodes:
+        step = plan.step(emitted.order)
+        child = children.get(emitted.id)
+        if step.write_paths and (child is None or emitted.output is None or
+                                 emitted.output[0] not in child.output):
+            raise EmitError(
+                f"步骤 {emitted.order} 声明了产出 {step.write_paths}，"
+                "但编译后的图节点没有对应的 output")
+    if plan.slice.final_artifact is not None:
+        composed = _composed(plan)
+        if composed is None:
+            raise EmitError(
+                f"最终产物 {plan.slice.final_artifact!r} 没有对应的图节点输出")
+        node_id, key, _ = composed
+        spec = graph.node.output.get(key)
+        if spec is None or not any(ref.node_path == children[node_id].path and ref.key == key
+                                   for ref in spec.compose):
+            raise EmitError(f"最终产物 {plan.slice.final_artifact!r} 未作为图的根 output")
+
+
 def build_package(directory: str | Path, *, alignment: Alignment, slice_: Slice,
                   traces: Sequence[Trace], label: str, workspace: Source | str | Path,
                   owner: str = "local", version: str = DEFAULT_VERSION,
@@ -700,7 +963,9 @@ def build_package(directory: str | Path, *, alignment: Alignment, slice_: Slice,
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     plan = _Plan(alignment, slice_, traces, label, owner, source_for(workspace),
-                 version, description, asset_id, bindings)
+                 version, description, asset_id, bindings,
+                 (declarations or {}).get("output_contract"),
+                 (declarations or {}).get("input_contract"))
     plan.plan()
     expected = [order for order in slice_.nodes
                 if order in plan.node_ids]
@@ -733,6 +998,7 @@ def build_package(directory: str | Path, *, alignment: Alignment, slice_: Slice,
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8")
     graph = compile_graph(root)
+    _verify_outputs(plan, graph)
     return Package(
         directory=root,
         asset_id=plan.asset_id,
@@ -742,6 +1008,8 @@ def build_package(directory: str | Path, *, alignment: Alignment, slice_: Slice,
         root_id=plan.root_id,
         params=tuple((key, path) for path, key in sorted(plan.params.items(),
                                                          key=lambda item: item[1])),
+        param_types={key: spec.type for key, spec in plan.parameter_specs.items()},
+        parameter_specs=dict(plan.parameter_specs),
         nodes=tuple(plan.nodes),
         scripts=tuple(scripts),
         absorbed=tuple(sorted(plan.absorbed.items())),
@@ -760,7 +1028,14 @@ def package_payload(package: Package) -> dict[str, Any]:
         "owner": package.owner,
         "pin": package.graph.pin,
         "solidifiable": package.solidifiable,
-        "params": [{"key": key, "source": path} for key, path in package.params],
+        "params": [
+            {
+                "key": key,
+                "source": path,
+                "type": package.parameter_specs[key].type,
+            }
+            for key, path in package.params
+        ],
         "scripts": [{"source": source, "package": target} for source, target in package.scripts],
         "nodes": [
             {

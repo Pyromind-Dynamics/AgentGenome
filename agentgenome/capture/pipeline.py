@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
-from builder import CompileError
+from builder import CompileError, compile
 
 from ..service import GenomeService
+from ..parameters import ParameterError, normalize_value, parameter_spec, path_keys
 from .align import DEFAULT_THRESHOLD, Alignment, align_traces, render_alignment
 from .emit import (DEFAULT_VERSION, EmitError, Package, build_package, render_emit,
                    source_for, unresolved_literals)
@@ -28,6 +29,7 @@ from .slice import OUTPUT_CONTRACT_HINT, Slice, SliceError, render_slice, revers
 from .trace import KIND_SHELL, Trace
 
 _SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)\Z")
+_LIVE_RUNS = ("queued", "running", "cancelling", "waiting")
 
 
 class CaptureError(ValueError):
@@ -48,6 +50,9 @@ class CapturePlan:
     notes: tuple[str, ...]
     report_path: Path
     samples: dict[str, Any] | None = None
+    plan_id: str | None = None
+    plan_digest: str | None = None
+    requires_confirmation: bool = False
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -63,6 +68,9 @@ class CapturePlan:
             "report": str(self.report_path),
             "package": str(self.package_dir),
             "samples": (self.samples or {}).get("index"),
+            "plan_id": self.plan_id,
+            "plan_digest": self.plan_digest,
+            "requires_confirmation": self.requires_confirmation,
         }
 
 
@@ -122,10 +130,16 @@ def render_samples(samples: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _samples(workspace: Any, bound: Mapping[str, Any], directory: Path) -> dict[str, Any]:
+def _samples(workspace: Any, bound: Mapping[str, Any], directory: Path,
+             path_names: Sequence[str] | None = None) -> dict[str, Any]:
     """Sampling is evidence: a broken input is reported, never raised."""
+    selected = (
+        {key: value for key, value in bound.items() if key in path_names}
+        if path_names is not None
+        else bound
+    )
     try:
-        return sample_inputs(source_for(workspace), bound, directory)
+        return sample_inputs(source_for(workspace), selected, directory)
     except Exception as exc:
         return {"index": None, "files": [], "error": f"{type(exc).__name__}: {exc}"[:300]}
 
@@ -152,13 +166,22 @@ def _failure_report(capture_id: str, label: str, traces: Sequence[Trace],
 
 
 def _probe_plan(package: Package, new_params: Mapping[str, Any] | None,
-                bound: Mapping[str, Any]) -> tuple[dict[str, str] | None, str]:
+                bound: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
     """Replay B's parameters, or None plus the note explaining why there is none."""
     allowed = {key for key, _ in package.params}
-    requested = {key: str(value) for key, value in (new_params or {}).items()
-                 if key in allowed}
+    specs = getattr(package, "parameter_specs", {})
+    requested: dict[str, Any] = {}
+    for key, value in (new_params or {}).items():
+        if key not in allowed:
+            continue
+        spec = specs.get(key)
+        if spec is None:
+            spec = parameter_spec(key, type_name="path", source=key)
+        requested[key] = normalize_value(spec.type, value, key=key)
     if not requested:
         return None, "未提供换参数回放数据，本条经验未经泛化验证"
+    if "human" in package.graph.node.needs:
+        return None, "链路含人工门禁，回放 B 无法自动恢复，跳过换参数回放并按窄口径发布"
     dropped = sorted({key for key in (new_params or {})} - allowed)
     note = "换参数回放将在回放 A 成功后由服务执行"
     if dropped:
@@ -204,6 +227,19 @@ def _forbid_replay_literals(traces: Sequence[Trace], workspace: Any) -> None:
                     "并在 params 里给出它在会话里的真实值。")
 
 
+def _replay_restartable(service: GenomeService, previous: Mapping[str, Any]) -> bool:
+    """A capture whose replay died may queue again; a live one must not be duplicated."""
+    if previous.get("published"):
+        return False
+    run_id, scope = previous.get("run_id"), previous.get("scope")
+    if isinstance(run_id, str) and isinstance(scope, str):
+        try:
+            return service.status(scope, run_id).get("status") not in _LIVE_RUNS
+        except ValueError:
+            return True
+    return previous.get("run_status") not in _LIVE_RUNS
+
+
 def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: str,
                     workspace: Any, scope: str, final_artifact: str | None = None,
                     threshold: float = DEFAULT_THRESHOLD, new_params: Mapping[str, Any] | None = None,
@@ -212,15 +248,26 @@ def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: s
                     asset_id: str | None = None,
                     declarations: Mapping[str, Any] | None = None,
                     replay_params: Mapping[str, Any] | None = None,
-                    bindings: Mapping[str, Any] | None = None) -> CapturePlan:
+                    bindings: Mapping[str, Any] | None = None,
+                    enqueue: bool = True,
+                    allow_side_effects: bool = False,
+                    request_id: str | None = None,
+                    execution_scope: Mapping[str, Any] | None = None) -> CapturePlan:
     traces = list(traces)
     if not traces:
         raise CaptureError("至少需要一条轨迹")
+    truncated = [f"{trace.trace_id} ({trace.export_dropped_steps})" for trace in traces
+                 if trace.export_dropped_steps]
+    if truncated:
+        raise CaptureError("轨迹导出不完整（dropped_steps）："
+                           + ", ".join(truncated)
+                           + "；请重新导出完整会话后再沉淀整条链路")
     capture_id = capture_id or uuid4().hex
     directory = service.root / "captures" / capture_id
     alignment = align_traces(traces, threshold)
     package_dir = directory / "package"
     slice_: Slice | None = None
+    queue_allowed = enqueue
 
     def build(candidate: str) -> Package:
         assert slice_ is not None
@@ -234,7 +281,12 @@ def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: s
         package = build(version or DEFAULT_VERSION)
         _forbid_replay_literals(traces, workspace)
         _require_solidified(package)
-    except (SliceError, EmitError, CompileError) as exc:
+        if (
+            service._requires_tool(compile(package.directory).node)
+            and not allow_side_effects
+        ):
+            queue_allowed = False
+    except (SliceError, EmitError, CompileError, ParameterError) as exc:
         report = _failure_report(capture_id, label, traces, alignment, slice_,
                                  package_dir, str(exc))
         service.captures.failed(
@@ -247,9 +299,85 @@ def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: s
         ) from exc
     versions = {item["version"]: item for item in service.versions(package.asset_id)}
     existing = {name: item["pin"] for name, item in versions.items()}
+
+    def planned(candidate: Package, bound: Mapping[str, Any],
+                samples: Mapping[str, Any], notes: tuple[str, ...],
+                probe: dict[str, str] | None, reused: bool) -> CapturePlan:
+        service.import_asset(candidate.directory)
+        report = _report(capture_id, label, candidate, traces, alignment, slice_,
+                         render_plan(probe, None, notes, planned=True), samples)
+        state = service.captures.create(
+            capture_id, asset_id=candidate.asset_id, version=candidate.version,
+            pin=candidate.pin, scope=scope, run_id=None, package=candidate.directory,
+            report=report, traces=[trace.trace_id for trace in traces],
+            generalized=False if probe is None else None, probe=probe, notes=notes,
+            reused=reused, samples=dict(samples), planned=True,
+        )
+        asset = service.get(candidate.asset_id, candidate.version)
+        plan = service.plans.prepare(
+            scope=scope,
+            request_id=request_id or capture_id,
+            kind="capture",
+            asset_id=candidate.asset_id,
+            version=candidate.version,
+            params=dict(bound),
+            source=workspace,
+            requested_scope=dict(execution_scope) if execution_scope else None,
+            capture_id=capture_id,
+        )
+        state = service.captures.attach_plan(
+            capture_id,
+            plan_id=plan["plan_id"],
+            digest=plan["digest"],
+        )
+        return CapturePlan(
+            capture_id, candidate.asset_id, candidate.version, candidate.pin,
+            candidate.directory, scope, None, reused, state["generalized"],
+            notes, Path(state["report"]), state.get("samples"), plan["plan_id"],
+            plan["digest"], True,
+        )
+
     if existing.get(package.version) == package.pin:
-        notes = ("与已有版本字节一致，未产生新版本",)
         previous = service.captures.for_asset(package.asset_id, package.version) or {}
+        if (not versions[package.version]["published"]
+                and _replay_restartable(service, previous)):
+            bound = dict(replay_params) if replay_params is not None else dict(package.params)
+            samples = _samples(
+                workspace,
+                bound,
+                directory / "samples",
+                path_keys(package.parameter_specs, bound),
+            )
+            probe, probe_note = _probe_plan(package, new_params, bound)
+            if queue_allowed:
+                # The bytes are already frozen but never passed validation, so the same
+                # plan may run again instead of returning a reused capture with no run.
+                notes = ("与已有版本字节一致，未产生新版本；上一次回放未通过，按原参数重新排队",
+                         probe_note)
+                try:
+                    case = queue_replay(service, package, bound, scope=scope,
+                                        request_id=capture_id, name="same")
+                except ValueError as exc:
+                    raise CaptureError(f"草稿导入失败：{exc}") from exc
+                report = _report(capture_id, label, package, traces, alignment, slice_,
+                                 render_plan(probe, case.run_id, notes), samples)
+                state = service.captures.create(
+                    capture_id, asset_id=package.asset_id, version=package.version,
+                    pin=package.pin, scope=scope, run_id=case.run_id,
+                    package=package.directory, report=report,
+                    traces=[trace.trace_id for trace in traces],
+                    generalized=False if probe is None else None, probe=probe,
+                    notes=notes, samples=dict(samples))
+                return CapturePlan(capture_id, package.asset_id, package.version,
+                                   package.pin, package.directory, scope, case.run_id,
+                                   True, state["generalized"], notes,
+                                   Path(state["report"]), state.get("samples"))
+            notes = (
+                "与已有版本字节一致，未产生新版本；执行计划已生成，等待用户确认",
+                probe_note,
+            )
+            return planned(package, bound, samples, notes, probe, True)
+        notes = ("与已有版本字节一致，未产生新版本",)
         report = _report(capture_id, label, package, traces, alignment, slice_,
                          render_plan(None, None, notes))
         state = service.captures.create(
@@ -267,9 +395,23 @@ def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: s
         package = build(next_version(list(existing)))
 
     bound = dict(replay_params) if replay_params is not None else dict(package.params)
-    samples = _samples(workspace, bound, directory / "samples")
+    samples = _samples(
+        workspace,
+        bound,
+        directory / "samples",
+        path_keys(package.parameter_specs, bound),
+    )
     probe, note = _probe_plan(package, new_params, bound)
     notes = (note,)
+    if not queue_allowed:
+        if "tool" in compile(package.directory).node.needs:
+            notes = (
+                "链路包含宿主工具副作用，已只生成执行计划，未自动回放",
+                *notes,
+            )
+        else:
+            notes = ("执行计划已生成，等待用户确认后回放", *notes)
+        return planned(package, bound, samples, notes, probe, False)
     try:
         case = queue_replay(service, package, bound, scope=scope,
                             request_id=capture_id, name="same")

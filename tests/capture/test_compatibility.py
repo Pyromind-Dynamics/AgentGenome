@@ -63,7 +63,14 @@ def reuse(service, host, plan, request_id, **params):
     return invoke(service, "conv-1", "run",
                   {"asset_id": plan["asset_id"], "version": plan["version"],
                    "params": {"raw": "data/raw.csv", "review": "out/review.jsonl",
-                              "rules": "rules.json", **params}},
+                              "rules": "rules.json", **params},
+                   "execution_scope": {"mode": "full", "description": "整份测试输入"}},
+                  request_id, host=host)
+
+
+def confirm_reuse(service, host, plan, request_id):
+    return invoke(service, "conv-1", "confirm_run",
+                  {"plan_id": plan["plan_id"], "digest": plan["digest"]},
                   request_id, host=host)
 
 
@@ -72,9 +79,17 @@ def test_reuse_gate_accepts_an_input_that_keeps_the_contract(
     pipeline_workspace.write("data/other.csv", "text,label\nnine,i\n")
     plan = publish(service, host, trace_refs, **CONTRACT)
 
-    state = reuse(service, host, plan, "run-1", raw="data/other.csv")
-    assert state["status"] == "queued"
-    assert "compatibility" not in state
+    prepared = reuse(service, host, plan, "run-1", raw="data/other.csv")
+    assert prepared["status"] == "planned"
+    assert prepared["analysis"]["compatibility"]["checked"] == [
+        "raw",
+        "review",
+        "rules",
+    ]
+    assert prepared["analysis"]["compatibility"]["problems"] == []
+    assert prepared["analysis"]["compatibility"]["forced"] is False
+    confirmed = confirm_reuse(service, host, prepared, "confirm-1")
+    assert confirmed["run"]["status"] == "queued"
 
 
 def test_reuse_gate_stops_a_broken_input_and_reports_it(
@@ -88,11 +103,16 @@ def test_reuse_gate_stops_a_broken_input_and_reports_it(
     with pytest.raises(ValueError, match="缺少必需字段"):
         reuse(service, host, plan, "run-2", raw="data/other.csv")
 
-    state = invoke(service, "conv-1", "run",
-                   {"asset_id": plan["asset_id"], "version": plan["version"],
-                    "params": {"raw": "data/other.csv", "review": "out/review.jsonl",
-                               "rules": "rules.json"},
-                    "allow_mismatch": True}, "run-3", host=host)
-    assert state["status"] == "queued"
-    assert state["compatibility"]["forced"] is True
-    assert state["compatibility"]["problems"] == ["raw：缺少必需字段 ['text']"]
+    prepared = invoke(service, "conv-1", "run",
+                      {"asset_id": plan["asset_id"], "version": plan["version"],
+                       "params": {"raw": "data/other.csv", "review": "out/review.jsonl",
+                                  "rules": "rules.json"},
+                       "execution_scope": {"mode": "full", "description": "整份测试输入"},
+                       "allow_mismatch": True}, "run-3", host=host)
+    assert prepared["status"] == "planned"
+    assert prepared["analysis"]["compatibility"]["forced"] is True
+    assert prepared["analysis"]["compatibility"]["problems"] == [
+        "raw：缺少必需字段 ['text']"
+    ]
+    confirmed = confirm_reuse(service, host, prepared, "confirm-3")
+    assert confirmed["run"]["status"] == "queued"

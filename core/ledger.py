@@ -13,8 +13,14 @@ from typing import Any, Callable
 
 def file_ref(run_dir: Path, path: Path) -> dict[str, Any]:
     data = path.read_bytes()
+    try:
+        name = path.relative_to(run_dir).as_posix()
+    except ValueError:
+        # A node can pin its artifact outside the run directory, next to a Storage
+        # input; the name then stays the absolute path the host resolves.
+        name = path.as_posix()
     return {
-        "path": path.relative_to(run_dir).as_posix(),
+        "path": name,
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
     }

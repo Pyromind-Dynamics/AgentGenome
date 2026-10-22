@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from .models import (
+    AwaitCall,
     CompileError,
     Diagnostic,
     Graph,
@@ -29,11 +30,12 @@ _ID = re.compile(r"^[a-z][a-z0-9_-]*$")
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SLOT = re.compile(r"\{(artifact|(?:input|output)\.[^{}]+)\}")
 _TRIED_SLOT = re.compile(r"\{tried\.([a-z][a-z0-9_-]*)\.(stage|reason|attempt)\}")
+_ARTIFACT_AT = re.compile(r"^\{input\.([a-z][a-z0-9_-]*)\.dir\}/([^/{}]+)$")
 _TYPES = {"text", "json", "path", "number", "bool"}
-_NEEDS = {"shell", "llm", "human", "tool"}
+_NEEDS = {"shell", "llm", "human", "tool", "await"}
 _ARTIFACT_EXT = re.compile(r"[A-Za-z0-9]{1,12}")
 _DO_SHAPE = ("do 必须是 {run: <shell 字符串>}、{llm: <prompt 模板>}、"
-             "{tool: {name, args}} 或 {human: <问题模板>}")
+             "{tool: {name, args}}、{await: {receipt, timeout?}} 或 {human: <问题模板>}")
 
 
 class _Compiler:
@@ -167,10 +169,12 @@ class _Compiler:
                 self.error("E_TRY_CANDIDATE", path, "try 的候选 output 声明必须同构")
         input_specs = self.inputs(inputs_raw, path, ancestors, prior_siblings)
         verifies = self.verifies(raw.get("verify"), path, output_specs)
-        command, do_kind, tool = (
-            self.command(raw.get("do"), path) if has_do else (None, None, None)
+        command, do_kind, tool, await_call = (
+            self.command(raw.get("do"), path) if has_do else (None, None, None, None)
         )
-        artifact_ext = self.artifact(raw.get("artifact"), path, is_leaf)
+        artifact_ext, artifact_at = self.artifact(
+            raw.get("artifact"), path, is_leaf, set(input_specs), do_kind
+        )
         retry, on_fail = self.on_fail(raw.get("on_fail"), path)
         needs = self.needs(raw, path)
 
@@ -196,6 +200,9 @@ class _Compiler:
             self.slots(command, path, set(input_specs), set(output_specs), allow_artifact=True)
         if tool is not None:
             self.slots_value(dict(tool.args), path, set(input_specs), set(output_specs))
+        if await_call is not None:
+            self.slots(await_call.receipt, path, set(input_specs), set(output_specs),
+                       allow_artifact=False)
         for rule in verifies:
             if rule.kind in {"run", "llm", "human"}:
                 self.slots(rule.value, path, set(input_specs), set(output_specs), allow_artifact=True)
@@ -216,7 +223,9 @@ class _Compiler:
             route,
             route_hint,
             artifact_ext,
+            artifact_at,
             tool,
+            await_call,
         )
 
     def tried_slots(self, children: list[Any], path: str, route: Any) -> None:
@@ -237,7 +246,7 @@ class _Compiler:
             if not isinstance(declared_raw, list) or any(
                 not isinstance(item, str) or item not in _NEEDS for item in declared_raw
             ):
-                self.error("E_NEEDS", path, "needs 必须是 shell/llm/human/tool 的子集列表")
+                self.error("E_NEEDS", path, "needs 必须是 shell/llm/human/tool/await 的子集列表")
             else:
                 declared = set(declared_raw)
 
@@ -250,6 +259,8 @@ class _Compiler:
                 inferred.add("llm")
             elif "tool" in do:
                 inferred.add("tool")
+            elif "await" in do:
+                inferred.add("await")
             elif "human" in do:
                 inferred.add("human")
         verify = raw.get("verify")
@@ -271,21 +282,54 @@ class _Compiler:
             self.error("E_NEEDS", path, f"needs 声明缺少结构推导需求：{', '.join(sorted(missing))}")
         return frozenset(declared | inferred)
 
-    def artifact(self, raw: Any, path: str, is_leaf: bool) -> str | None:
-        """`{artifact}` 的后缀；读取方按扩展名选解析器，缺省 .out 保持兼容。"""
+    def artifact(
+        self, raw: Any, path: str, is_leaf: bool, inputs: set[str], do_kind: str | None
+    ) -> tuple[str | None, str | None]:
+        """`{artifact}` 的后缀与落点；读取方按扩展名选解析器，缺省 .out 保持兼容。
+
+        `at` 把产物钉在一个输入旁边（`{input.<键>.dir}/<文件名>`）。带相对引用的产物
+        ——比如用相对路径指向同目录图片的 manifest——只有留在原位才仍然有效，落到
+        运行目录的 artifacts/ 里就会指向不存在的位置。
+
+        只有 run 节点能用 `at`：它的命令自己写文件，落点就是命令里的路径；tool 节点
+        的产物是引擎写下的回执，llm/human 节点的产物由 agent 或人写，都不该被钉到
+        Storage 的绝对路径上。
+        """
         if raw is None:
-            return None
+            return None, None
         if not is_leaf:
             self.error("E_ARTIFACT", path, "artifact 仅可声明在叶子 do 节点")
-            return None
-        if not isinstance(raw, dict) or set(raw) != {"ext"}:
-            self.error("E_ARTIFACT", path, "artifact 必须是 {ext: <后缀>}")
-            return None
-        ext = str(raw["ext"]).lstrip(".")
-        if not _ARTIFACT_EXT.fullmatch(ext):
-            self.error("E_ARTIFACT", path, "artifact.ext 必须是不带点的短后缀，例如 jsonl")
-            return None
-        return f".{ext.lower()}"
+            return None, None
+        if not isinstance(raw, dict) or not raw or not set(raw) <= {"ext", "at"}:
+            self.error("E_ARTIFACT", path, "artifact 必须是 {ext: <后缀>} 或 {ext: <后缀>, at: <落点模板>}")
+            return None, None
+        ext: str | None = None
+        if "ext" in raw:
+            suffix = str(raw["ext"]).lstrip(".")
+            if not _ARTIFACT_EXT.fullmatch(suffix):
+                self.error("E_ARTIFACT", path, "artifact.ext 必须是不带点的短后缀，例如 jsonl")
+                return None, None
+            ext = f".{suffix.lower()}"
+        at = raw.get("at")
+        if at is None:
+            return ext, None
+        if not isinstance(at, str):
+            self.error("E_ARTIFACT", path, "artifact.at 必须是字符串模板")
+            return ext, None
+        if do_kind != "run":
+            self.error("E_ARTIFACT", path, "artifact.at 仅可用于 run 叶子节点")
+            return ext, None
+        match = _ARTIFACT_AT.fullmatch(at)
+        if match is None:
+            self.error(
+                "E_ARTIFACT", path,
+                "artifact.at 必须形如 {input.<键>.dir}/<文件名>，只允许一个目录槽位加一个文件名",
+            )
+            return ext, None
+        if match.group(1) not in inputs:
+            self.error("E_SLOT", path, f"槽位 {{input.{match.group(1)}.dir}} 未引用已声明输入")
+            return ext, None
+        return ext, at
 
     def outputs(
         self, raw: dict[str, Any], path: str, is_group: bool, child_outputs: dict[str, Any]
@@ -390,17 +434,35 @@ class _Compiler:
         self.error("E_INPUT_FROM", path, f"无效输入来源 {value!r}")
         return None
 
-    def command(self, raw: Any, path: str) -> tuple[str | None, str | None, ToolCall | None]:
+    def command(self, raw: Any, path: str) -> tuple[str | None, str | None, ToolCall | None,
+                                                    AwaitCall | None]:
         if not isinstance(raw, dict) or len(raw) != 1:
             self.error("E_NODE_KIND", path, _DO_SHAPE)
-            return None, None, None
+            return None, None, None, None
         kind, value = next(iter(raw.items()))
         if kind == "tool":
-            return None, "tool", self.tool_call(value, path)
+            return None, "tool", self.tool_call(value, path), None
+        if kind == "await":
+            return None, "await", None, self.await_call(value, path)
         if kind not in {"run", "llm", "human"} or not isinstance(value, str):
             self.error("E_NODE_KIND", path, _DO_SHAPE)
-            return None, None, None
-        return value, kind, None
+            return None, None, None, None
+        return value, kind, None, None
+
+    def await_call(self, raw: Any, path: str) -> AwaitCall | None:
+        """An await leaf names the receipt, never the platform behind it."""
+        if (not isinstance(raw, dict) or set(raw) - {"receipt", "timeout"}
+                or not isinstance(raw.get("receipt"), str) or not raw["receipt"].strip()):
+            self.error("E_AWAIT_CALL", path,
+                       "await 必须是 {receipt: <受理单路径模板>, timeout?: <秒>}")
+            return None
+        timeout = raw.get("timeout")
+        if timeout is not None:
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+                self.error("E_AWAIT_CALL", path, "await.timeout 必须是正数秒")
+                return None
+            timeout = float(timeout)
+        return AwaitCall(raw["receipt"].strip(), timeout)
 
     def tool_call(self, raw: Any, path: str) -> ToolCall | None:
         """A host tool call: the leaf runs it directly, with no model in the loop."""

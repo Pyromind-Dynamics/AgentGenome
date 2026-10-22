@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "agentgenome"
-version = "0.6.5"
+version = "0.6.43"
 source = { editable = "." }
 dependencies = [
     { name = "pyyaml" },

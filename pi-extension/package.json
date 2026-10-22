@@ -1,6 +1,6 @@
 {
   "name": "@agentgenome/pi-extension",
-  "version": "0.6.13",
+  "version": "0.6.48",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",

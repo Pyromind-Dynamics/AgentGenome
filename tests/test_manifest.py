@@ -27,6 +27,11 @@ def test_validate_rejects_unknown_contract_fields():
         validate(manifest(input_contract={"data_file": {"format": "csv", "columns": ["qid"]}}))
 
 
+def test_validate_rejects_unknown_parameter_types():
+    with pytest.raises(ManifestError, match="type must be one of"):
+        validate(manifest(input_contract={"limit": {"type": "symbol"}}))
+
+
 def test_validate_rejects_unknown_determinism():
     with pytest.raises(ManifestError, match="determinism must be one of"):
         validate(manifest(determinism="half-scripted"))

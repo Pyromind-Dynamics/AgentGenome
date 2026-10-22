@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from typing import Protocol
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 from .artifacts import LocalArtifacts
 from .checkpoint import Checkpoint
 from .ledger import Ledger
-from .ports import (Answer, Candidate, FailDecl, JudgeResult, PortError, Ports,
+from .ports import (Answer, AwaitResult, Candidate, FailDecl, JudgeResult, PortError, Ports,
                     ShellResult, ToolResult)
 
 _SLOT = re.compile(r"\{(artifact|tried\.[^{}]+|(?:input|output)\.[^{}]+)\}")
@@ -63,6 +64,21 @@ class NodeWaiting(Exception):
         super().__init__(question)
 
 
+class NodeAwaiting(Exception):
+    """An await node parked on an external task: no worker and no shell stay busy."""
+
+    def __init__(self, node: str, receipt: str, awaited_at: float,
+                 deadline: float | None, task_id: str | None = None,
+                 output_dir: str | None = None) -> None:
+        self.node = node
+        self.receipt = receipt
+        self.awaited_at = awaited_at
+        self.deadline = deadline
+        self.task_id = task_id
+        self.output_dir = output_dir
+        super().__init__(f"{node} is waiting for the task behind {receipt}")
+
+
 class Engine:
     def __init__(self, graph: Graph, ports: Ports, run_dir: Path, checkpoint: Checkpoint, ledger: Ledger) -> None:
         self.graph = graph
@@ -94,7 +110,7 @@ class Engine:
             return refs
         if entry and entry.get("status") == "failed":
             raise NodeFailed(Failure(node.path, "do", 0, "该节点已在断点中失败"))
-        if entry and entry.get("status") in {"abandoned", "waiting"}:
+        if entry and entry.get("status") in {"abandoned", "waiting", "waiting_external"}:
             self.checkpoint.reenter(node.path)
             entry = self.checkpoint.entry(node.path)
 
@@ -109,6 +125,22 @@ class Engine:
                 self.ledger.append(
                     "node_waiting", node=node.path, attempt=attempt,
                     question=self.ledger.log_ref("question", waiting.question),
+                )
+                raise
+            except NodeAwaiting as awaiting:
+                self.checkpoint.mark_waiting_external(
+                    node.path, retries,
+                    receipt=awaiting.receipt,
+                    product=None,
+                    awaited_at=awaiting.awaited_at,
+                    deadline=awaiting.deadline,
+                    task_id=awaiting.task_id,
+                    output_dir=awaiting.output_dir,
+                )
+                self.ledger.append(
+                    "node_awaiting", node=node.path, attempt=attempt,
+                    receipt=awaiting.receipt, deadline=awaiting.deadline,
+                    task_id=awaiting.task_id,
                 )
                 raise
             except NodeAbandoned as abandoned:
@@ -159,20 +191,27 @@ class Engine:
             f"节点 {node.path} 在 {failure.stage} 阶段第 {declaration.attempt} 次尝试失败："
             f"{failure.summary}。是否重试？"
         )
-        evidence = {"failure": detail}
+        evidence = {"node": node.path, "failure": detail}
         started = time.monotonic()
         try:
             answer = human.ask(question, evidence)
-            if not isinstance(answer, Answer) or (not answer.approve and not answer.feedback):
+            if (not isinstance(answer, Answer) or not isinstance(answer.approve, bool)
+                    or (not answer.approve and not answer.feedback and not answer.pending)):
                 raise PortError("HumanPort.ask 返回不符合协议", kind="bad_output")
         except PortError as exc:
             self._verify_port_error("human", node, attempt, str(exc), exc.kind)
         self.ledger.append(
             "call_human", node=node.path, attempt=attempt,
             question=self.ledger.log_ref("question", question), evidence=evidence,
-            approve=answer.approve, feedback=answer.feedback,
+            approve=answer.approve, feedback=answer.feedback, pending=answer.pending,
             duration_ms=round((time.monotonic() - started) * 1000),
         )
+        if answer.pending:
+            # A failure decision is a question like any other: park the run so the
+            # status shows the failed node instead of blocking a background replay
+            # on an answer that no conversation is going to deliver.
+            artifact = self._artifact_path(node)
+            raise NodeWaiting(node.path, question, str(artifact) if artifact else "")
         if not answer.approve:
             raise NodeAbandoned(answer.feedback or "人否决失败处置")
         return True
@@ -200,10 +239,12 @@ class Engine:
     def _attempt(self, node: Node, attempt: int) -> dict[str, dict[str, Any]]:
         if node.danger:
             self._danger_gate(node, attempt)
-        if node.do is not None or node.tool is not None:
+        if node.do is not None or node.tool is not None or node.await_call is not None:
             artifact = self._artifact_path(node)
             if node.tool is not None:
                 seq = self._call_tool(node, artifact, attempt)
+            elif node.await_call is not None:
+                seq = self._await_product(node, artifact, attempt)
             elif node.do_kind == "human":
                 seq = self._human_work(node, artifact, attempt)
             elif node.do_kind == "llm":
@@ -222,7 +263,8 @@ class Engine:
             refs = self._try_children(node) if node.mode == "try" else self._sequence_children(node)
 
         for index, rule in enumerate(node.verify):
-            leaf = node.do is not None or node.tool is not None
+            leaf = (node.do is not None or node.tool is not None
+                or node.await_call is not None)
             failure = self._verify(rule, index, node, attempt, refs, artifact if leaf else None)
             if failure:
                 raise NodeFailed(failure)
@@ -293,7 +335,8 @@ class Engine:
         if human is None:
             self._verify_port_error("human", node, attempt, "未注入 human 端口")
         assert human is not None
-        leaf = node.do is not None or node.tool is not None
+        leaf = (node.do is not None or node.tool is not None
+                or node.await_call is not None)
         artifact = self._artifact_path(node) if leaf else None
         execution = self._declaration(node, artifact) if leaf else None
         evidence = {
@@ -306,7 +349,7 @@ class Engine:
         try:
             answer = human.ask(question, evidence)
             if (not isinstance(answer, Answer) or not isinstance(answer.approve, bool)
-                    or (not answer.approve and not answer.feedback)):
+                    or (not answer.approve and not answer.feedback and not answer.pending)):
                 raise PortError("HumanPort.ask 返回不符合协议", kind="bad_output")
         except PortError as exc:
             self._verify_port_error("human", node, attempt, str(exc), exc.kind)
@@ -314,10 +357,13 @@ class Engine:
             self.ledger.append(
                 "call_human", node=node.path, attempt=attempt,
                 question=self.ledger.log_ref("question", question), evidence=evidence,
-                approve=answer.approve, feedback=answer.feedback,
+                approve=answer.approve, feedback=answer.feedback, pending=answer.pending,
                 **({"batch_approval": True} if answer.batch_approval else {}),
                 duration_ms=round((time.monotonic() - started) * 1000),
             )
+        if answer.pending:
+            # The approval is a question too: park instead of blocking the replay.
+            raise NodeWaiting(node.path, question, str(artifact) if artifact else "")
         if not answer.approve:
             raise NodeAbandoned(answer.feedback or "人拒绝 danger gate")
 
@@ -489,6 +535,8 @@ class Engine:
         return result, seq
 
     def _artifact_path(self, node: Node) -> Path:
+        if node.artifact_at:
+            return Path(self._fill(node.artifact_at, node, None, quote=False))
         return Path("artifacts") / (
             f"{node.path.replace('.', '--')}{node.artifact_ext or '.out'}"
         )
@@ -500,21 +548,71 @@ class Engine:
             self._verify_port_error("tool", node, attempt, "未注入 tool 端口")
         assert port is not None and node.tool is not None
         arguments = self._fill_json(dict(node.tool.args), node, artifact)
+        execution_id = f"{node.path}:{attempt}:{uuid4().hex}"
         started = time.monotonic()
+        if self.ports.on_event:
+            self.ports.on_event({
+                "event": "tool_call_started",
+                "node": node.path,
+                "attempt": attempt,
+                "execution_id": execution_id,
+                "tool": node.tool.name,
+                "arguments": arguments,
+            })
         try:
             if self.ports.check_cancel:
                 self.ports.check_cancel()
-            result = port.call(node.tool.name, arguments)
+            result = port.call(
+                node.tool.name,
+                arguments,
+                execution_id=execution_id,
+            )
             if not isinstance(result, ToolResult):
                 raise PortError("ToolPort.call 返回不符合协议", kind="bad_output")
             if self.ports.check_cancel:
                 self.ports.check_cancel()
         except PortError as exc:
+            if self.ports.on_event:
+                self.ports.on_event({
+                    "event": "tool_call_finished",
+                    "node": node.path,
+                    "attempt": attempt,
+                    "execution_id": execution_id,
+                    "tool": node.tool.name,
+                    "state": "unknown",
+                    "error": str(exc),
+                })
             self.ledger.append(
                 "port_error", node=node.path, attempt=attempt,
                 port="tool", kind=exc.kind, message=str(exc),
             )
             raise
+        except Exception as exc:
+            if self.ports.on_event:
+                self.ports.on_event({
+                    "event": "tool_call_finished",
+                    "node": node.path,
+                    "attempt": attempt,
+                    "execution_id": execution_id,
+                    "tool": node.tool.name,
+                    "state": "unknown",
+                    "error": f"{type(exc).__name__}: {exc}"[:1000],
+                })
+            raise
+        if self.ports.on_event:
+            self.ports.on_event({
+                "event": "tool_call_finished",
+                "node": node.path,
+                "attempt": attempt,
+                "execution_id": execution_id,
+                "tool": node.tool.name,
+                "state": "failed" if result.is_error else "completed",
+                "receipt": {
+                    "is_error": result.is_error,
+                    "result": dict(result.result),
+                    "text": result.text,
+                },
+            })
         payload = dict(result.result) or {"text": result.text}
         self.artifacts.write_text(
             str(artifact), json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
@@ -531,6 +629,73 @@ class Engine:
                         result.text or f"工具 {node.tool.name} 返回错误")
             )
         return seq
+
+    def _await_product(self, node: Node, artifact: Path, attempt: int) -> int:
+        """Resolve a receipt to the product; park the node while the task runs.
+
+        One probe, never a wait: a pending answer parks the run and the host wakes
+        it from the task's own callback. The product lands on the declared artifact,
+        so every later node keeps reading one path exactly as with a run leaf.
+        """
+        port = self.ports.await_port
+        if port is None:
+            self._verify_port_error("await", node, attempt, "未注入 await 端口")
+        assert port is not None and node.await_call is not None
+        receipt = self._fill(node.await_call.receipt, node, artifact, quote=False)
+        record = self.checkpoint.awaiting(node.path) or {}
+        awaited_at = record.get("awaited_at")
+        if not isinstance(awaited_at, (int, float)):
+            awaited_at = time.time()
+        timeout = node.await_call.timeout
+        deadline = float(awaited_at) + timeout if timeout else None
+        if deadline is not None and time.time() >= deadline:
+            raise NodeFailed(
+                Failure(node.path, "do", 0, f"等待外部任务超过 {timeout:.0f}s")
+            )
+        started = time.monotonic()
+        try:
+            if self.ports.check_cancel:
+                self.ports.check_cancel()
+            result = port.probe(receipt)
+            if not isinstance(result, AwaitResult):
+                raise PortError("AwaitPort.probe 返回不符合协议", kind="bad_output")
+        except PortError as exc:
+            self.ledger.append(
+                "port_error", node=node.path, attempt=attempt,
+                port="await", kind=exc.kind, message=str(exc),
+            )
+            raise
+        if result.status == "pending":
+            detail = result.detail if isinstance(result.detail, Mapping) else {}
+            task_id = detail.get("task_id")
+            output_dir = detail.get("output_dir")
+            raise NodeAwaiting(
+                node.path, receipt, float(awaited_at), deadline,
+                task_id=task_id if isinstance(task_id, str) and task_id else None,
+                output_dir=(output_dir if isinstance(output_dir, str) else None),
+            )
+        if result.status == "failed":
+            seq = self.ledger.append(
+                "call_await", node=node.path, attempt=attempt, status="failed",
+                receipt=receipt, error=result.error,
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            raise NodeFailed(
+                Failure(node.path, "do", seq, result.error or "外部任务失败")
+            )
+        if result.product:
+            self.artifacts.link(str(artifact), result.product)
+        else:
+            self.artifacts.write_text(
+                str(artifact),
+                json.dumps(dict(result.detail), ensure_ascii=False, indent=2) + "\n",
+            )
+        return self.ledger.append(
+            "call_await", node=node.path, attempt=attempt, status="completed",
+            receipt=receipt, product=result.product,
+            artifact=self.artifacts.describe(str(artifact)),
+            duration_ms=round((time.monotonic() - started) * 1000),
+        )
 
     def _human_work(self, node: Node, artifact: Path, attempt: int) -> int:
         """A human step: the question is the work order, the artifact is their output.
@@ -582,7 +747,13 @@ class Engine:
             candidate, field = key.split(".", 1)
             return getattr(self.tried[candidate], field)
         if scope == "input":
-            return self._input_slot(node, key)
+            key, _, sub = key.partition(".")
+            value = self._input_slot(node, key)
+            if not sub:
+                return value
+            if sub == "dir":
+                return str(Path(str(value)).parent)
+            raise RuntimeError(f"无效槽位 {token}")
         if scope == "output":
             return self.artifacts.path(refs[key]["path"])
         raise RuntimeError(f"无效槽位 {token}")

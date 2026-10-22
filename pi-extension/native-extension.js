@@ -204,6 +204,11 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     if (result?.run_id) remember(state, { id: result.run_id, status: "queued" });
   }
 
+  function rememberRun(state, result) {
+    const run = result?.run?.id ? result.run : (result?.id ? result : null);
+    if (run) remember(state, run);
+  }
+
   pi.on("session_start", (_event, ctx) => { begin(ctx); });
   pi.on("session_shutdown", () => { stop(); });
   pi.on("message_start", async (event) => {
@@ -290,8 +295,11 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
         args = { ...args, execution_id: stage.execution_id };
       }
       const result = await state.client.request(action, args, callId);
-      if (action === "run" || action === "resume") remember(state, result);
-      else if (action === "capture" || action === "distill") rememberCapture(state, result);
+      if (action === "prepare_run") return result;
+      if (action === "confirm_run" || action === "run" || action === "resume") {
+        rememberRun(state, result);
+      }
+      else if (action === "capture" || action === "confirm_distill") rememberCapture(state, result);
       else if (action === "cancel") {
         if (state.stage?.active && state.stage.request.run_id === args.run_id) state.ctx.abort?.();
         watch(state);

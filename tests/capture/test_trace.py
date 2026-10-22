@@ -90,6 +90,26 @@ def test_parse_command_keeps_subcommands_and_module_names():
     assert parse_command("python3 -m pytest tests -q").shape == "python3 -m pytest tests -q"
 
 
+def test_parse_command_ignores_paths_inside_command_substitutions():
+    command = parse_command(
+        "python3 scripts/ls_to_sft.py out/review.jsonl out/sft.jsonl "
+        "--sft-root $(dirname out/sft.jsonl)"
+    )
+    assert command.read_paths == (
+        "scripts/ls_to_sft.py", "out/review.jsonl", "out/sft.jsonl")
+    assert "out/sft.jsonl)" not in command.read_paths
+    assert command.literals == (("--sft-root", "<command-substitution>"),)
+
+
+def test_parse_command_ignores_nested_quoted_command_substitutions():
+    command = parse_command(
+        'python3 scripts/run.py input.json --root "$(python3 -c '
+        '\'print("out/nested")\')"'
+    )
+    assert command.read_paths == ("scripts/run.py", "input.json")
+    assert command.literals == (("--root", "<command-substitution>"),)
+
+
 def test_parse_command_handles_script_heads_and_file_moves():
     direct = parse_command("./scripts/run.sh data/raw.csv")
     assert direct.shape == "<script:run> <path>"
@@ -219,6 +239,113 @@ def test_capture_trace_rejects_unknown_shapes():
         capture_trace(json.dumps({"trace_version": 1}))
     with pytest.raises(ValueError, match="JSON object"):
         capture_trace("[]")
+
+
+def test_capture_trace_rejects_clipped_tool_arguments():
+    entry = tool("a1", "bash", {"command": "python3 scripts/clean.py data.csv > out.csv"})
+    entry["clipped_fields"] = ["args.command"]
+    with pytest.raises(ValueError, match="命令/工具参数被裁剪（clipped_fields）"):
+        capture_trace(document([entry]))
+    entry["clipped_fields"] = ["result.text"]
+    assert len(capture_trace(document([entry])).steps) == 1
+
+
+def test_capture_trace_keeps_products_reported_by_successful_tools():
+    trace = capture_trace(document([
+        tool(
+            "a1",
+            "bash",
+            {"command": "python3 scripts/ls_to_sft.py"},
+            text=(
+                "wrote 3 rows -> storage/datasets/review/sft.jsonl\n"
+                "saved to storage/datasets/review/manifest.json"
+            ),
+        ),
+    ]))
+
+    step = trace.steps[0]
+    assert step.write_paths == ()
+    assert step.reported_writes == (
+        "storage/datasets/review/sft.jsonl",
+        "storage/datasets/review/manifest.json",
+    )
+
+
+def test_capture_trace_reads_products_from_a_projected_result_excerpt():
+    """The exporter drops progress lines to keep a long session readable.
+
+    It keeps every line that can name a write, so the product survives projection;
+    this is the contract between `session-trace.js: projectText` and `_reported_writes`.
+    """
+    text = "\n".join(
+        [f"progress {n} {'x' * 60}" for n in range(20)]
+        + ["…[39960 行省略]…"]
+        + [f"progress {n} {'x' * 60}" for n in range(39980, 40000)]
+        + ["wrote 1200 rows -> public_data/out/cleaned.jsonl", ""]
+    )
+    entry = tool("a1", "bash", {"command": "python3 scripts/clean.py"}, text=text)
+    entry["result"]["excerpt"] = {
+        "kept_lines": 40, "total_lines": 40002, "total_chars": 3_000_000,
+    }
+
+    trace = capture_trace(document([entry]))
+
+    assert trace.steps[0].write_paths == ()
+    assert trace.steps[0].reported_writes == ("public_data/out/cleaned.jsonl",)
+
+
+def test_capture_trace_keeps_a_product_after_long_success_output():
+    trace = capture_trace(document([
+        tool(
+            "a1",
+            "bash",
+            {"command": "python3 scripts/ls_to_sft.py"},
+            text=(
+                "wrote ["
+                + ("{'id': 'sample', 'text': 'value'}, " * 600)
+                + "] rows -> storage/datasets/review/sft.jsonl\r\n"
+            ),
+        ),
+    ]))
+
+    assert trace.steps[0].write_paths == ()
+    assert trace.steps[0].reported_writes == ("storage/datasets/review/sft.jsonl",)
+
+
+def test_capture_trace_ignores_reported_products_from_failed_or_probe_tools():
+    trace = capture_trace(document([
+        tool(
+            "a1",
+            "bash",
+            {"command": "python3 scripts/ls_to_sft.py"},
+            text="output: storage/datasets/review/sft.jsonl",
+            is_error=True,
+        ),
+        tool(
+            "a2",
+            "bash",
+            {"command": "echo done"},
+            text="wrote 3 rows -> storage/datasets/review/fake.jsonl",
+        ),
+    ]))
+
+    assert trace.steps[0].reported_writes == ()
+    assert len(trace.steps) == 1
+    assert trace.dropped[0].reason == "probe"
+
+
+def test_export_truncation_is_preserved_separately_from_filtered_probes():
+    exported = json.loads(document([tool("a1", "bash", {"command": "ls data/"})]))
+    exported["dropped_steps"] = 30
+    trace = capture_trace(json.dumps(exported))
+    assert trace.export_dropped_steps == 30
+    assert len(trace.dropped) == 1
+    assert steps_payload(trace)["export_dropped_steps"] == 30
+    assert "导出截断 30 条" in render_report(trace)
+    for invalid in (-1, True, "30"):
+        exported["dropped_steps"] = invalid
+        with pytest.raises(ValueError, match="dropped_steps"):
+            capture_trace(json.dumps(exported))
 
 
 def test_payload_and_report_describe_the_capture(tmp_path):

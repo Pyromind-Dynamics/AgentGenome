@@ -6,12 +6,14 @@ import { join } from "node:path";
 import {
   DEFAULT_MAX_STEPS,
   MAX_TRACE_BYTES,
+  MAX_COMPLETE_TRACE_BYTES,
   TRACE_DIRECTORY,
   buildTrace,
   exportTraces,
   fitTrace,
   listSessions,
   parseSessionLog,
+  projectText,
   traceFileName,
   traceSteps,
 } from "../session-trace.js";
@@ -86,12 +88,17 @@ test("traceSteps clips oversized text and arguments", () => {
   const long = "x".repeat(2500);
   const { steps } = traceSteps([
     user("u1", long),
-    assistant("a1", [call("c1", "write", { path: "out.txt", content: long, rows: Array.from({ length: 30 }, (_, n) => `row-${n}`) })]),
+    assistant("a1", [call("c1", "write", { path: "out.txt", command: long,
+      content: long, rows: Array.from({ length: 30 }, (_, n) => `row-${n}`) })]),
+    result("r1", "c1", long),
   ]);
   assert.equal(steps[0].text, `${"x".repeat(2000)}…[+500 chars]`);
+  assert.deepEqual(steps[0].clipped_fields, ["text"]);
   assert.equal(steps[1].args.content, `${"x".repeat(2000)}…[+500 chars]`);
   assert.equal(steps[1].args.rows.length, 20);
   assert.equal(steps[1].args.rows[0], "row-0");
+  assert.deepEqual(steps[1].clipped_fields,
+    ["args.command", "args.content", "args.rows", "result.text"]);
 });
 
 test("traceSteps keeps the newest steps when the history exceeds the cap", () => {
@@ -194,6 +201,99 @@ test("listSessions still returns the live session when the session directory is 
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].current, true);
   assert.equal(sessions[0].step_count, 1);
+});
+
+test("complete export retains every step and full command without fitting or clipping", async () => {
+  const dir = await workspace();
+  const command = `python3 scripts/convert.py --input data/raw.csv --note ${"x".repeat(2500)}`;
+  const entries = Array.from({ length: 430 }, (_, n) => user(`u${n}`, `step ${n}`));
+  entries.push(assistant("a1", [call("c1", "bash", { command })]));
+  const ctx = { cwd: dir, sessionManager: {
+    getSessionId: () => "current", getSessionFile: () => join(dir, "current.jsonl"),
+    getSessionDir: () => dir, getSessionName: () => "full",
+    getEntries: () => entries,
+  } };
+  assert.equal((await listSessions(ctx))[0].step_count, DEFAULT_MAX_STEPS);
+  const [ref] = await exportTraces(ctx, ["current"], { complete: true });
+  const trace = JSON.parse(await readFile(join(dir, ref.path), "utf8"));
+  assert.equal(ref.step_count, 431);
+  assert.equal(ref.dropped_steps, 0);
+  assert.equal(trace.steps[0].text, "step 0");
+  assert.equal(trace.steps.at(-1).args.command, command);
+  assert.equal(trace.steps.at(-1).clipped_fields, undefined);
+  assert.equal(trace.steps.at(-1).seq, 430);
+});
+
+test("complete export projects tool output to the lines that carry evidence", async () => {
+  const dir = await workspace();
+  const noise = Array.from({ length: 40000 }, (_, n) => `progress ${n} ${"x".repeat(60)}`);
+  const text = `${noise.join("\n")}\nwrote 1200 rows -> public_data/out/cleaned.jsonl\n`;
+  const ctx = { cwd: dir, sessionManager: {
+    getSessionId: () => "noisy", getSessionFile: () => join(dir, "noisy.jsonl"),
+    getSessionDir: () => dir, getSessionName: () => "noisy",
+    getEntries: () => [
+      assistant("a1", [call("c1", "bash", { command: "python clean.py" })]),
+      result("r1", "c1", text),
+    ],
+  } };
+  const [ref] = await exportTraces(ctx, ["noisy"], { complete: true });
+  assert.equal(ref.step_count, 1);
+  assert.equal(ref.dropped_steps, 0);
+  assert.equal(ref.excerpted_steps, 1);
+  const trace = JSON.parse(await readFile(join(dir, ref.path), "utf8"));
+  const step = trace.steps[0];
+  // The product line is what `_reported_writes` reads; dropping it would lose the node.
+  assert.match(step.result.text, /-> public_data\/out\/cleaned\.jsonl/);
+  assert.deepEqual(step.result.excerpt.kept_lines, 40);
+  assert.equal(step.result.excerpt.total_chars, text.length);
+  assert.ok(Buffer.byteLength(step.result.text) < 16 * 1024);
+  assert.ok((await stat(join(dir, ref.path))).size < text.length / 50);
+});
+
+test("complete export leaves a short result byte-identical", async () => {
+  const dir = await workspace();
+  const ctx = { cwd: dir, sessionManager: {
+    getSessionId: () => "small", getSessionFile: () => join(dir, "small.jsonl"),
+    getSessionDir: () => dir, getSessionName: () => "small",
+    getEntries: () => [
+      assistant("a1", [call("c1", "bash", { command: "python clean.py" })]),
+      result("r1", "c1", "wrote 12 rows -> out.jsonl"),
+    ],
+  } };
+  const [ref] = await exportTraces(ctx, ["small"], { complete: true });
+  assert.equal(ref.excerpted_steps, 0);
+  const trace = JSON.parse(await readFile(join(dir, ref.path), "utf8"));
+  assert.deepEqual(trace.steps[0].result, { is_error: false, text: "wrote 12 rows -> out.jsonl" });
+});
+
+test("projectText keeps a product arrow at the end of one very long line", () => {
+  const text = `wrote [${"{'id': 'sample', 'text': 'value'}, ".repeat(600)}] rows -> storage/datasets/review/sft.jsonl`;
+  const { text: projected, excerpt } = projectText(text);
+  // The arrow sits after the dropped middle; `_reported_writes` reads it from the tail.
+  assert.match(projected, /-> storage\/datasets\/review\/sft\.jsonl$/);
+  assert.ok(projected.length < 5000);
+  assert.equal(excerpt.total_lines, 1);
+  assert.equal(excerpt.total_chars, text.length);
+});
+
+test("projectText leaves a short text untouched", () => {
+  assert.deepEqual(projectText("wrote 3 rows -> out.jsonl"),
+    { text: "wrote 3 rows -> out.jsonl", excerpt: null });
+});
+
+test("complete export rejects a trace whose command alone exceeds the cap", async () => {
+  const dir = await workspace();
+  const ctx = { cwd: dir, sessionManager: {
+    getSessionId: () => "big", getSessionFile: () => join(dir, "big.jsonl"),
+    getSessionDir: () => dir, getSessionName: () => "big",
+    getEntries: () => [
+      assistant("a1", [call("c1", "bash", { command: "x".repeat(MAX_COMPLETE_TRACE_BYTES + 1024) })]),
+    ],
+  } };
+  assert.equal(MAX_COMPLETE_TRACE_BYTES, 8 * 1024 * 1024);
+  await assert.rejects(() => exportTraces(ctx, ["big"], { complete: true }),
+    /轨迹 big 完整导出 \d+ 字节，超过 8388608 字节（8 MiB）上限；工具输出已按产物行投影，仍然超出说明命令或参数本身过大：bash@0/);
+  await assert.rejects(() => stat(join(dir, TRACE_DIRECTORY, "big.json")), { code: "ENOENT" });
 });
 
 test("exportTraces writes each trace under the workspace and returns file references", async () => {

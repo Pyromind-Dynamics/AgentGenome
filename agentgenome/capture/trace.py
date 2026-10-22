@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -93,9 +93,25 @@ _REFUSAL = re.compile(
     re.IGNORECASE,
 )
 
+_REPORTED_WRITE = re.compile(
+    r"(?i)\b(?:wrote|written|saved|output|outputted)\b|"
+    r"(?:已写入|写入|输出到|产物(?:为|在|保存在|写到)?)"
+)
+_REPORTED_ARROW = re.compile(
+    r"(?:->|=>)[ \t]*(?P<path>[^\s\"'`<>，。；、]+)"
+)
+_REPORTED_DIRECT = re.compile(
+    r"(?i)(?:"
+    r"\b(?:written|saved|output|outputted)\b[ \t]*(?:to|into|:)"
+    r"|(?:已写入|写入|输出到|产物(?:为|在|保存在|写到)?)"
+    r")[ \t:：]*(?P<path>[^\s\"'`<>，。；、]+)"
+)
+
 # A `{name}` token is how the agent declares a chain parameter instead of a literal
 # path, so the same command can be replayed with another input.
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
+_COMMAND_SUBSTITUTION = "__agentgenome_command_substitution__"
+_COMMAND_SUBSTITUTION_SHAPE = "<command-substitution>"
 
 
 @dataclass(frozen=True)
@@ -120,6 +136,18 @@ class Step:
     # holds the call's JSON result. Session steps record no args, so they cannot be
     # emitted as tool nodes.
     arguments: Mapping[str, Any] | None = None
+    # A step whose effect matters even though no later step consumes its artifact
+    # (creating a Label Studio project, submitting a platform job) says so when it is
+    # distilled: the reverse slice keeps it instead of dropping it as auxiliary.
+    keep: bool = False
+    # Successful tools sometimes report a product they created internally. This is
+    # separate from write_paths because the command line cannot be replayed with a
+    # different output until that output becomes an explicit argument.
+    reported_writes: tuple[str, ...] = ()
+    # Positional paths whose direction the command line does not settle. They are
+    # reads by default; the report names them so a chain that loses a product says
+    # why instead of failing silently.
+    unresolved: tuple[str, ...] = ()
 
     @property
     def signature(self) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
@@ -145,6 +173,9 @@ class Step:
             "inline_code": self.inline_code,
             "verify": self.verify,
             "raw_ref": self.raw_ref,
+            "keep": self.keep,
+            "reported_writes": list(self.reported_writes),
+            "unresolved": list(self.unresolved),
             "signature": [self.kind, self.command_shape, list(self.reads), list(self.writes)],
         }
         if self.arguments is not None:
@@ -173,6 +204,7 @@ class Trace:
     source: str
     steps: tuple[Step, ...]
     dropped: tuple[Dropped, ...]
+    export_dropped_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -187,6 +219,11 @@ class Command:
     # word, but nothing in the command says whether `storage` is a path. The pair is
     # (flag, value) so a later stage can ask the workspace which one it is.
     literals: tuple[tuple[str, str], ...] = ()
+    # Positional paths of an interpreter call (`python3 script.py in.csv out.csv`).
+    # The command line says nothing about which of them the script writes, so these
+    # are read by default and reported here; a stage that freezes the command asks
+    # the caller to declare its output instead of guessing.
+    unresolved: tuple[str, ...] = ()
 
 
 def _basename(token: str) -> str:
@@ -277,6 +314,87 @@ def _tokenize(command: str) -> list[str]:
     return list(lexer)
 
 
+def _command_substitution_end(text: str, start: int) -> int | None:
+    """The index after a `$(...)` that starts at `start`, or None when unclosed."""
+    depth = 1
+    quote = ""
+    index = start + 2
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        if char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
+
+
+def _shield_command_substitutions(text: str) -> str:
+    """Replace `$()` bodies before path tokenization.
+
+    A command substitution may contain an arbitrary shell program. Its arguments
+    are not inputs to the outer command, and the closing `)` is not part of a path:
+    tokenizing `$(dirname out/sft.jsonl)` used to invent `out/sft.jsonl)`.
+    """
+    out: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\" and quote == '"' and index + 1 < len(text):
+                out.append(text[index:index + 2])
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+                out.append(char)
+                index += 1
+                continue
+            if quote == '"' and char == "$" and text[index + 1:index + 2] == "(":
+                end = _command_substitution_end(text, index)
+                if end is not None:
+                    out.append(_COMMAND_SUBSTITUTION)
+                    index = end
+                    continue
+            out.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(text):
+            out.append(text[index:index + 2])
+            index += 2
+            continue
+        if char in "'\"":
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char == "$" and text[index + 1:index + 2] == "(":
+            end = _command_substitution_end(text, index)
+            if end is not None:
+                out.append(_COMMAND_SUBSTITUTION)
+                index = end
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _unfold_newlines(text: str) -> str:
     """Turn an unquoted newline into `;` so every line is its own command.
 
@@ -330,6 +448,7 @@ def _simple_command(tokens: list[str]) -> Command:
     write_paths: list[str] = []
     moved: list[str] = []
     literals: list[tuple[str, str]] = []
+    unresolved: list[str] = []
     direction: str | None = None
     pending = False
     pending_flag: str | None = None
@@ -338,6 +457,13 @@ def _simple_command(tokens: list[str]) -> Command:
     while index < len(tokens):
         token = tokens[index]
         index += 1
+        if token == _COMMAND_SUBSTITUTION:
+            shape.append(_COMMAND_SUBSTITUTION_SHAPE)
+            literals.append((pending_flag or "", _COMMAND_SUBSTITUTION_SHAPE))
+            direction = None
+            pending = False
+            pending_flag = None
+            continue
         if token in _WRITE_OPERATORS or token in _READ_OPERATORS:
             shape.append(token)
             direction = "write" if token in _WRITE_OPERATORS else "read"
@@ -384,6 +510,12 @@ def _simple_command(tokens: list[str]) -> Command:
                 moved.append(token)
             else:
                 written = direction == "write" or (direction is None and name in _WRITE_COMMANDS)
+                if direction is None and not written and name in _INTERPRETERS:
+                    # The interpreter decides what its positional paths are, and the
+                    # command line does not. Keep the common reading (an input) but
+                    # report the ambiguity, so a stage that freezes the command can
+                    # ask for the output instead of guessing wrong.
+                    unresolved.append(token)
                 (write_paths if written else read_paths).append(token)
             direction = None
             pending = False
@@ -407,7 +539,7 @@ def _simple_command(tokens: list[str]) -> Command:
     write_paths = [path for path in write_paths if path not in _DEVICE_PATHS]
     return Command(" ".join(shape), _roles(read_paths, writing=False),
                    _roles(write_paths, writing=True), tuple(read_paths),
-                   tuple(write_paths), name, tuple(literals))
+                   tuple(write_paths), name, tuple(literals), tuple(unresolved))
 
 
 def _last_wins(paths: list[str]) -> list[str]:
@@ -421,7 +553,7 @@ def _last_wins(paths: list[str]) -> list[str]:
 
 def parse_command(command: str) -> Command:
     text, inline = _split_inline(command)
-    tokens = _tokenize(_unfold_newlines(text))
+    tokens = _tokenize(_unfold_newlines(_shield_command_substitutions(text)))
     if not tokens:
         return Command(INLINE_MARK if inline else "", (), (), (), (), "")
     segments: list[list[str]] = [[]]
@@ -446,7 +578,8 @@ def parse_command(command: str) -> Command:
     return Command(" ".join(shape), _roles(read_paths, writing=False),
                    _roles(write_paths, writing=True), tuple(read_paths),
                    tuple(write_paths), parsed[0].name,
-                   tuple(item for part in parsed for item in part.literals))
+                   tuple(item for part in parsed for item in part.literals),
+                   tuple(_last_wins([item for part in parsed for item in part.unresolved])))
 
 
 def probe_command(command: Command) -> bool:
@@ -465,6 +598,61 @@ def _shell_noise(step: Step, command: Command) -> str | None:
     return None
 
 
+def _declared_writes(entry: dict[str, Any]) -> tuple[str, ...]:
+    """Products a distilled plan declared for a command the parser reads as inputs.
+
+    A script that takes its product positionally (`script.py in out`) looks like a
+    read to the parser, and one that writes its products itself names nothing at all.
+    The plan's declaration is what keeps such a product on the step that made it.
+    """
+    value = entry.get("declared_writes")
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
+
+
+def _declared_paths(write_paths: tuple[str, ...], declared: tuple[str, ...],
+                    command: str) -> tuple[str, ...]:
+    """A step's products: what the command names, plus the declarations it carries."""
+    written = [*write_paths]
+    for path in declared:
+        if path in command and path not in written:
+            written.append(path)
+    return tuple(written)
+
+
+def _reported_writes(text: str, *, success: bool) -> tuple[str, ...]:
+    """Products a successful tool reports in its result text.
+
+    Tool output is evidence, not a replayable interface. Keep only path-shaped,
+    non-device values so plan extraction can see the producer without mistaking
+    progress prose or URL output for a file. A successful script can print a large
+    JSON payload before its final arrow, so parse each line instead of imposing a
+    fixed text-window limit between the verb and the destination.
+    """
+    if not success:
+        return ()
+    found: list[str] = []
+    for line in text.splitlines():
+        keyword = _REPORTED_WRITE.search(line)
+        if keyword is None:
+            continue
+        tail = line[keyword.start():]
+        # Arrows are unambiguous, including after long `wrote [...] rows` output.
+        matches = list(_REPORTED_ARROW.finditer(tail)) or list(
+            _REPORTED_DIRECT.finditer(tail)
+        )
+        for match in matches:
+            path = match.group("path").rstrip(").,;:")
+            if not path or path in _DEVICE_PATHS or not _is_path(path):
+                continue
+            if path.endswith("/"):
+                continue
+            if path not in found:
+                found.append(path)
+    return tuple(found)
+
+
 def _tool_step(entry: dict[str, Any], trace_id: str, seq: int) -> tuple[Step, str | None] | None:
     tool = str(entry.get("tool") or "")
     args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
@@ -473,23 +661,49 @@ def _tool_step(entry: dict[str, Any], trace_id: str, seq: int) -> tuple[Step, st
     success = result is not None and result.get("is_error") is not True
     rejected = bool(result) and result.get("is_error") is True and bool(_REFUSAL.search(text))
     raw_ref = str(entry.get("entry_id") or "")
+    declared = _declared_writes(entry)
+    reported = _reported_writes(text, success=success)
 
     def build(kind: str, shape: str, reads: tuple[str, ...] = (), writes: tuple[str, ...] = (),
-              read_paths: tuple[str, ...] = (), write_paths: tuple[str, ...] = ()) -> Step:
+              read_paths: tuple[str, ...] = (), write_paths: tuple[str, ...] = (),
+              reported_writes: tuple[str, ...] = (),
+              unresolved: tuple[str, ...] = ()) -> Step:
+        # Session tool calls need their arguments to become replayable tool nodes.
+        arguments = dict(args) if kind == KIND_TOOL else None
         return Step(seq, trace_id, kind, tool, str(args.get("command") or ""), shape, reads,
-                    writes, read_paths, write_paths, success, rejected, raw_ref)
+                    writes, read_paths, write_paths, success, rejected, raw_ref,
+                    arguments=arguments, reported_writes=reported_writes,
+                    unresolved=unresolved)
 
     if tool in _SHELL_TOOLS:
-        command = parse_command(str(args.get("command") or ""))
-        step = build(KIND_SHELL, command.shape, command.reads, command.writes,
-                     command.read_paths, command.write_paths)
+        text_command = str(args.get("command") or "")
+        command = parse_command(text_command)
+        if probe_command(command):
+            reported = ()
+        written = _declared_paths(command.write_paths, declared, text_command)
+        reported = tuple(path for path in reported if path not in written)
+        # Only the products the parser missed get reclassified; a path the command
+        # already reads and writes stays on both sides so emit can reject it.
+        reclassified = tuple(
+            path
+            for path in (*written, *reported)
+            if path not in command.write_paths
+        )
+        read_paths = tuple(path for path in command.read_paths if path not in reclassified)
+        # A path that ended up declared as a product is settled, so it is not reported
+        # as ambiguous; what remains is genuinely undecided by the command line.
+        unresolved = tuple(token for token in command.unresolved
+                           if token not in reclassified)
+        step = build(KIND_SHELL, command.shape, _roles(read_paths, writing=False),
+                     _roles((*written, *reported), writing=True), read_paths,
+                     written, reported_writes=reported, unresolved=unresolved)
         return step, _shell_noise(step, command)
     if tool in _WRITE_TOOLS:
         target = str(args.get("path") or args.get("file_path") or "")
         if not target:
             return build(KIND_OTHER, f"<tool:{tool}>"), None
         return build(KIND_WRITE, f"{tool} <path>", (), _roles([target], writing=True),
-                     (), (target,)), None
+                     (), (target,), reported_writes=()), None
     if tool in _PROBE_TOOLS:
         target = str(args.get("path") or args.get("file_path") or "")
         paths = (target,) if target else ()
@@ -604,11 +818,23 @@ def capture_trace(text: str, *, source: str = "") -> Trace:
     if not isinstance(entries, list):
         raise ValueError("trace has no steps")
     trace_id = str(document.get("trace_id") or "trace")
+    export_dropped = document.get("dropped_steps", 0)
+    if (not isinstance(export_dropped, int) or isinstance(export_dropped, bool)
+            or export_dropped < 0):
+        raise ValueError("trace dropped_steps must be a non-negative integer")
     steps: list[Step] = []
     dropped: list[Dropped] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        clipped_fields = entry.get("clipped_fields", [])
+        if not isinstance(clipped_fields, list) or any(
+                not isinstance(field, str) for field in clipped_fields):
+            raise ValueError(f"trace {trace_id} has invalid clipped_fields")
+        if any(field == "args" or field.startswith("args.") for field in clipped_fields):
+            raise ValueError(
+                f"轨迹 {trace_id} 第 {entry.get('seq', '?')} 步的命令/工具参数被裁剪"
+                "（clipped_fields）；请重新导出完整会话")
         # An export numbers its own steps; keeping that number is what makes the
         # `<trace_id>:<seq>` an agent reads in the file the same one this module
         # reports back, even after the stages below drop probes from the list.
@@ -618,6 +844,8 @@ def capture_trace(text: str, *, source: str = "") -> Trace:
         if candidate is None:
             continue
         step, reason = candidate
+        if entry.get("keep") is True:
+            step = replace(step, keep=True)
         if reason is not None:
             dropped.append(Dropped(step.seq, step.kind, step.tool_name, reason, step.raw_ref))
             continue
@@ -626,7 +854,7 @@ def capture_trace(text: str, *, source: str = "") -> Trace:
     session_name = document.get("session_name")
     return Trace(trace_id, None if session_id is None else str(session_id),
                  None if session_name is None else str(session_name), source,
-                 tuple(steps), tuple(dropped))
+                 tuple(steps), tuple(dropped), export_dropped)
 
 
 def steps_payload(trace: Trace) -> dict[str, Any]:
@@ -637,6 +865,7 @@ def steps_payload(trace: Trace) -> dict[str, Any]:
         "source": trace.source,
         "step_count": len(trace.steps),
         "dropped_count": len(trace.dropped),
+        "export_dropped_steps": trace.export_dropped_steps,
         "steps": [step.payload() for step in trace.steps],
         "dropped": [item.payload() for item in trace.dropped],
     }
@@ -655,7 +884,8 @@ def render_report(trace: Trace) -> str:
         lines.extend([f"- 来源：`{trace.source}`", ""])
     if trace.session_name:
         lines.extend([f"- 会话：{trace.session_name}", ""])
-    lines.extend([f"- 步骤：{len(trace.steps)} 条（丢弃 {len(trace.dropped)} 条）", "",
+    lines.extend([f"- 步骤：{len(trace.steps)} 条（规范化过滤 {len(trace.dropped)} 条，"
+                  f"导出截断 {trace.export_dropped_steps} 条）", "",
                   "| seq | kind | tool | 形状 | 读 | 写 | 结果 |",
                   "| --- | --- | --- | --- | --- | --- | --- |"])
     for step in trace.steps:
@@ -667,4 +897,11 @@ def render_report(trace: Trace) -> str:
         lines.extend(["", "丢弃：" + "；".join(
             f"`{item.raw_ref or item.seq}` {item.tool_name or item.kind} ({item.reason})"
             for item in trace.dropped)])
+    ambiguous = [step for step in trace.steps if step.unresolved]
+    if ambiguous:
+        # The parser cannot tell an input from a product here; naming them keeps a
+        # chain that loses a product diagnosable instead of silently short.
+        lines.extend(["", "方向不明（按输入处理，产出要用 output 显式声明）：" + "；".join(
+            f"`{step.seq}` " + "、".join(f"`{token}`" for token in step.unresolved)
+            for step in ambiguous)])
     return "\n".join(lines) + "\n"

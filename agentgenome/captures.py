@@ -25,7 +25,9 @@ if TYPE_CHECKING:
     from .service import GenomeService
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-_TERMINAL = {"published", "draft", "reused"}
+# `draft` is not terminal: the run that owns the capture can still wake from its
+# checkpoint and decide it, and a requeue moves the capture to a fresh attempt.
+_TERMINAL = {"published", "reused"}
 _REPORT_TEXT_LIMIT = 16 * 1024
 _PREVIEW_TEXT = 2 * 1024
 _PREVIEW_TOTAL = 12 * 1024
@@ -60,7 +62,8 @@ class Captures:
                generalized: bool | None, probe: dict[str, str] | None,
                notes: tuple[str, ...] = (), reused: bool = False,
                published: bool = False,
-               samples: dict[str, Any] | None = None) -> dict[str, Any]:
+               samples: dict[str, Any] | None = None,
+               planned: bool = False) -> dict[str, Any]:
         directory = self.directory(capture_id)
         report_path = directory / "report.md"
         state = {
@@ -80,7 +83,7 @@ class Captures:
             "replay": {"same_params": None, "new_params": None,
                        "generalized": generalized, "notes": list(notes)},
             "reused": reused,
-            "stage": "reused" if reused else "replaying",
+            "stage": "reused" if reused else ("planned" if planned else "replaying"),
             "published": published,
             "run_status": None,
             "created_at": _now(),
@@ -93,6 +96,40 @@ class Captures:
             self._write(self.root / "by-run" / f"{run_id}.json", {"capture_id": capture_id})
         self._write(self.root / "assets" / asset_id / f"{version}.json", {"capture_id": capture_id})
         return state
+
+    def attach_plan(
+        self,
+        capture_id: str,
+        *,
+        plan_id: str,
+        digest: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            state = self.state(capture_id)
+            state.update(
+                plan_id=plan_id,
+                plan_digest=digest,
+                stage="planned",
+                run_id=None,
+                scope=state.get("scope"),
+                updated_at=_now(),
+            )
+            self._write(self.directory(capture_id) / "state.json", state)
+            report = Path(state["report"])
+            text = report.read_text(encoding="utf-8")
+            marker = "### 待确认执行计划"
+            if marker not in text:
+                report.write_text(
+                    text.rstrip()
+                    + "\n\n"
+                    + marker
+                    + "\n\n"
+                    + f"- plan：`{plan_id}`\n"
+                    + f"- digest：`{digest}`\n"
+                    + "- 尚未提交执行；先用实际输入向用户展示范围，确认后再提交。\n",
+                    encoding="utf-8",
+                )
+            return state
 
     def failed(self, capture_id: str, *, asset_id: str, label: str, report: str,
                error: str, traces: list[str], package: Path) -> dict[str, Any]:
@@ -148,6 +185,23 @@ class Captures:
 
     def for_run(self, run_id: str) -> dict[str, Any] | None:
         return self._pointed(self.root / "by-run" / f"{run_id}.json")
+
+    def relink(self, capture_id: str, *, run_id: str, scope: str) -> dict[str, Any]:
+        """Point a capture at the attempt that now owns its verdict.
+
+        A requeued replay is a new run; without moving the pointer a successful
+        retry would finish without publishing anything.
+        """
+        with self._lock:
+            state = self.state(capture_id)
+            if state["stage"] in {"published", "reused"}:
+                raise ValueError("capture is already decided")
+            self._write(self.root / "by-run" / f"{run_id}.json",
+                        {"capture_id": capture_id})
+            state.update(run_id=run_id, scope=scope, stage="replaying", run_status=None,
+                         updated_at=_now())
+            self._write(self.directory(capture_id) / "state.json", state)
+            return state
 
     def for_asset(self, asset_id: str, version: str) -> dict[str, Any] | None:
         return self._pointed(self.root / "assets" / asset_id / f"{version}.json")
@@ -251,6 +305,13 @@ class Captures:
                 self._write(self.directory(capture_id) / "state.json", state)
                 self._append_report(capture_id, self._verdict(state, result))
                 return self._with_report(state)
+            if status == "interrupted" and self._resumable(state):
+                # The attempt died with its checkpoint, not with a verdict: the human
+                # gate it parked on is still answered, so this capture is not decided.
+                state.update(stage="interrupted", run_status=status, updated_at=_now())
+                self._write(self.directory(capture_id) / "state.json", state)
+                self._append_report(capture_id, self._verdict(state, result))
+                return self._with_report(state)
             if status == "succeeded" and state.get("probe"):
                 state = self._probe(capture_id, state, host, emit, cancel)
             if status == "succeeded":
@@ -270,6 +331,11 @@ class Captures:
             self._write(self.directory(capture_id) / "state.json", state)
             self._append_report(capture_id, self._verdict(state, result))
             return self._with_report(state)
+
+    def _resumable(self, state: dict[str, Any]) -> bool:
+        """Whether the capture's own run can still wake from a parked checkpoint."""
+        run_id = state.get("run_id")
+        return isinstance(run_id, str) and self.service.parked_checkpoint(run_id) is not None
 
     def _baseline(self, capture_id: str, state: dict[str, Any],
                   result: dict[str, Any]) -> dict[str, Any]:

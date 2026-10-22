@@ -25,7 +25,15 @@ function harness(t, { records = [], stages = [], history = [], delivered = true,
     sessionManager: { getSessionFile: () => "/tmp/pi-session", getSessionId: () => "session", getEntries: () => history } };
   const client = { close() {}, async request(action, args) {
     calls.push({ action, args });
-    if (action === "run") return { id: "r1", status: "queued" };
+    if (action === "prepare_run" || action === "run") {
+      return { plan_id: "plan-1", status: "planned", requires_confirmation: true };
+    }
+    if (action === "confirm_run") {
+      return {
+        plan: { plan_id: args.plan_id, status: "confirmed", run_id: "r1" },
+        run: { id: "r1", status: "queued" },
+      };
+    }
     if (action === "resume") return { id: args.run_id, status: "queued" };
     if (action === "capture") return capture ?? { capture_id: "c1", run_id: "r2", reused: false };
     if (action === "snapshot") return snapshot ? snapshot() : { runs: [...records], stages };
@@ -44,17 +52,26 @@ function harness(t, { records = [], stages = [], history = [], delivered = true,
   return { hooks, calls, messages, widgets, aborts, host, ctx, history, records };
 }
 
+async function confirmed(h) {
+  const planned = await h.host.invoke(
+    "prepare_run", {}, "prepare", undefined, h.ctx);
+  assert.equal(planned.run_id, undefined);
+  assert.equal(h.history.some((entry) => entry.customType === "agentgenome.run"), false);
+  return h.host.invoke(
+    "confirm_run", { plan_id: planned.plan_id }, "confirm", undefined, h.ctx);
+}
+
 test("default entry loads standalone; SDK factory registers no native lifecycle", () => {
   const hooks = [], tools = [], commands = [];
   const pi = { events: { emit() {} }, on: (name) => hooks.push(name), registerTool: (tool) => tools.push(tool.name), registerCommand: (name) => commands.push(name) };
   agentGenome(pi);
-  assert.equal(tools.length, 13);
+  assert.equal(tools.length, 17);
   assert.deepEqual(commands, ["genome"]);
   assert.ok(hooks.includes("session_start"));
   assert.equal(hooks.includes("context"), false);
   hooks.length = tools.length = commands.length = 0;
   createGenomeExtension(createBridgeHost(async () => {}))(pi);
-  assert.equal(tools.length, 13);
+  assert.equal(tools.length, 17);
   assert.deepEqual(hooks, ["before_agent_start"]);
   assert.equal(commands.length, 0);
 });
@@ -126,7 +143,7 @@ test("SDK bridge owns wire conversion and propagates failures without local fall
 
 test("submission returns before start; agent_end starts once and success resumes with a custom message", async (t) => {
   const h = harness(t);
-  assert.equal((await h.host.invoke("run", {}, "call", undefined, h.ctx)).id, "r1");
+  assert.equal((await confirmed(h)).run.id, "r1");
   assert.equal(h.calls.some((call) => call.action === "start"), false);
   await h.hooks.get("agent_end")();
   await h.hooks.get("agent_end")();
@@ -140,7 +157,7 @@ test("submission returns before start; agent_end starts once and success resumes
 
 test("busy agent notification is acknowledged only after custom_message is persisted", async (t) => {
   const h = harness(t, { delivered: false });
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   h.records.push({ id: "r1", status: "failed" });
   await until(() => h.messages.length === 1);
   await until(() => h.calls.some((call) => call.action === "renew"));
@@ -203,7 +220,7 @@ test("cancelling an active stage does not block a later explicit handoff", async
 
 test("a parked run reports the human gate once and resumes the same run", async (t) => {
   const h = harness(t);
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   const parked = { id: "r1", status: "waiting", asset_id: "prelabel-clean", version: "0.1.0",
     result: { waiting: { node: "review", question: "请到 Label Studio 复核 prelabeled.csv",
       artifact: "/runs/r1/artifacts/review.out" } } };
@@ -287,7 +304,7 @@ test("restart recognizes real Pi receipts and cancellation never wakes the model
 test("session shutdown prevents a late response from notifying another session", async (t) => {
   let finish;
   const h = harness(t, { snapshot: () => new Promise((done) => { finish = done; }) });
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   await until(() => finish);
   h.hooks.get("session_shutdown")();
   finish({ runs: [{ id: "r1", status: "succeeded" }] });

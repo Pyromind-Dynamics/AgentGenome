@@ -48,13 +48,16 @@ class Checkpoint:
                 raise CheckpointError("断点损坏：节点 retries 无效")
             status = entry.get("status")
             if status is not None and status not in {"succeeded", "failed", "abandoned",
-                                                     "waiting"}:
+                                                     "waiting", "waiting_external"}:
                 raise CheckpointError(
-                    "断点损坏：节点状态必须是 succeeded/failed/abandoned/waiting")
+                    "断点损坏：节点状态必须是 succeeded/failed/abandoned/"
+                    "waiting/waiting_external")
             if status == "succeeded" and not isinstance(entry.get("outputs"), dict):
                 raise CheckpointError("断点损坏：成功节点缺少 outputs")
-            if status in {"failed", "abandoned", "waiting"} and "outputs" in entry:
+            if status in {"failed", "abandoned", "waiting", "waiting_external"} and "outputs" in entry:
                 raise CheckpointError("断点损坏：未成功节点不可带 outputs")
+            if status == "waiting_external" and not isinstance(entry.get("await"), dict):
+                raise CheckpointError("断点损坏：外部等待节点缺少 await 记录")
         return cls(run_dir, raw)
 
     @property
@@ -91,6 +94,35 @@ class Checkpoint:
         """Park a node: not a verdict, so a resume re-enters it and asks again."""
         self.nodes[node_path] = {"status": "waiting", "retries": retries}
         self.write()
+
+    def mark_waiting_external(self, node_path: str, retries: int, *,
+                              receipt: str, product: str | None,
+                              awaited_at: float, deadline: float | None,
+                              task_id: str | None = None,
+                              output_dir: str | None = None) -> None:
+        """Park a node on an external task: the worker is released, not blocked.
+
+        The receipt and the deadline live in the checkpoint so a resume after a
+        crash still knows what it was waiting for and when to give up.
+        """
+        self.nodes[node_path] = {
+            "status": "waiting_external",
+            "retries": retries,
+            "await": {
+                "receipt": receipt,
+                "product": product,
+                "awaited_at": awaited_at,
+                "deadline": deadline,
+                "task_id": task_id,
+                "output_dir": output_dir,
+            },
+        }
+        self.write()
+
+    def awaiting(self, node_path: str) -> dict[str, Any] | None:
+        entry = self.nodes.get(node_path) or {}
+        record = entry.get("await")
+        return record if isinstance(record, dict) else None
 
     def reenter(self, node_path: str) -> None:
         entry = self.nodes[node_path]

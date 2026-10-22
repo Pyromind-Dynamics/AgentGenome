@@ -69,6 +69,14 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class AwaitCall:
+    """A leaf that waits for an asynchronous task's product, without holding a worker."""
+
+    receipt: str
+    timeout: float | None = None
+
+
+@dataclass(frozen=True)
 class Node:
     id: str
     path: str
@@ -86,7 +94,9 @@ class Node:
     route: str | None
     route_hint: str
     artifact_ext: str | None = None
+    artifact_at: str | None = None
     tool: ToolCall | None = None
+    await_call: AwaitCall | None = None
 
 
 @dataclass(frozen=True)
