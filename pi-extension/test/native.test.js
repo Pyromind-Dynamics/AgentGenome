@@ -51,6 +51,7 @@ test("default entry loads standalone; SDK factory registers no native lifecycle"
   assert.equal(tools.length, 13);
   assert.deepEqual(commands, ["genome"]);
   assert.ok(hooks.includes("session_start"));
+  assert.equal(hooks.includes("context"), false);
   hooks.length = tools.length = commands.length = 0;
   createGenomeExtension(createBridgeHost(async () => {}))(pi);
   assert.equal(tools.length, 13);
@@ -114,30 +115,6 @@ test("a stage message whose round was cancelled is intercepted before the model 
   assert.equal(h.calls.some((c) => c.action === "stage_begin"), false);
   await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "aborted" }] });
   assert.equal(h.calls.some((c) => c.action === "stage_finish"), false);
-  const ordinary = { role: "user", content: "继续" };
-  const context = [{ role: "custom", ...message }, ordinary];
-  assert.deepEqual(h.hooks.get("context")({ messages: context }).messages, [ordinary]);
-  assert.equal(context.length, 2); // Filtering must not delete the audit history.
-});
-
-test("model context includes only the live stage, never finished or restored instructions", async (t) => {
-  const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
-  const h = harness(t, { stages: [{ request, claimed: false }] });
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
-  await until(() => h.messages.some((m) => m.message.customType === "agentgenome.stage"));
-  const live = { role: "custom", ...h.messages[0].message };
-  const old = { ...live, details: { ...live.details, execution_id: "old-round" } };
-  const other = { role: "custom", customType: "other-plugin", content: "Keep me" };
-  const messages = [old, live, other];
-  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [other]);
-  await h.hooks.get("message_start")({ message: live });
-  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [live, other]);
-  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] });
-  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [other]);
-  h.hooks.get("session_shutdown")();
-  h.hooks.get("session_start")({}, h.ctx);
-  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [other]);
-  assert.equal(messages.length, 3);
 });
 
 test("SDK bridge owns wire conversion and propagates failures without local fallback", async () => {
@@ -172,6 +149,56 @@ test("busy agent notification is acknowledged only after custom_message is persi
   h.history.push({ type: "custom_message", ...h.messages[0].message });
   await until(() => h.calls.some((call) => call.action === "ack"));
   assert.match(h.messages[0].message.content, /不要自动重复/);
+});
+
+test("interrupted stage waits for abort to settle before delivering its completion", async (t) => {
+  const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
+  const records = [{ id: "r1", status: "running" }];
+  const h = harness(t, { records, stages: [{ request, claimed: false }] });
+  let idle = true;
+  h.ctx.isIdle = () => idle;
+  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await until(() => h.messages.some(m => m.message.customType === "agentgenome.stage"));
+  await h.hooks.get("message_start")({ message: { role: "custom", ...h.messages[0].message } });
+  idle = false;
+  // The service recovers an interrupted run while the model still has a tool running.
+  records[0].status = "interrupted";
+  await until(() => h.aborts.length === 1);
+  await delay(1100);
+  assert.equal(h.messages.filter(m => m.message.customType === "agentgenome.completed").length, 0);
+  assert.equal(h.calls.some(c => c.action === "claim" || c.action === "renew"), false);
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "aborted" }] });
+  idle = true;
+  await until(() => h.calls.some(c => c.action === "ack"));
+  const completions = h.messages.filter(m => m.message.customType === "agentgenome.completed");
+  assert.equal(completions.length, 1);
+  assert.match(completions[0].message.content, /interrupted/);
+  assert.equal(h.calls.filter(c => c.action === "claim").length, 1);
+  assert.equal(h.calls.some(c => c.action === "stage_finish"), false);
+});
+
+test("cancelling an active stage does not block a later explicit handoff", async (t) => {
+  const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
+  const stages = [{ request, claimed: false }];
+  const records = [{ id: "r1", status: "running" }];
+  const h = harness(t, { records, stages });
+  let idle = true;
+  h.ctx.isIdle = () => idle;
+  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await until(() => h.messages.length === 1);
+  await h.hooks.get("message_start")({ message: { role: "custom", ...h.messages[0].message } });
+  idle = false;
+  records[0].status = "cancelled";
+  await until(() => h.aborts.length === 1);
+  assert.equal(h.messages.length, 1);
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "aborted" }] });
+  stages.push({ request: { ...request, request_id: "s2", run_id: "r2" }, claimed: false });
+  await delay(1100);
+  assert.equal(h.messages.length, 1);
+  idle = true;
+  await until(() => h.messages.length === 2);
+  assert.equal(h.messages[1].message.details.request_id, "s2");
+  assert.equal(h.calls.some(c => c.action === "claim"), false);
 });
 
 test("a parked run reports the human gate once and resumes the same run", async (t) => {

@@ -28,5 +28,5 @@ test("standard Pi loader discovers the installed plugin without extensionFactori
   assert.ok(extension.commands.has("genome"));
   assert.ok(extension.handlers.has("session_start"));
   assert.ok(extension.handlers.has("session_shutdown"));
-  assert.ok(extension.handlers.has("context"));
+  assert.equal(extension.handlers.has("context"), false);
 });

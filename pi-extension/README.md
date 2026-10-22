@@ -141,9 +141,10 @@ session. A handoff is only created or kept while the connection that started the
 execution remains connected and stage-capable. Reopening the same session file
 does not revive that connection's old execution. A delivered stage message whose round is
 already dead is intercepted and its turn aborted before the model acts on it.
-Only the active stage's instructions enter model context; old stage instructions
-remain in audit history but are filtered out of subsequent model requests.
-Later runs need an explicit new submission.
+The extension does not filter or rewrite Pi conversation history for model requests.
+Later runs need an explicit new submission. If a terminal run aborts its active
+stage round, completion delivery waits for Pi to become idle before claiming a
+notification; acknowledgement still requires the message to appear in session history.
 
 Use `templates/native-agent-task-check` to test script → Agent → script. This does
 not enable native `model_judge`, revision or read-only verification protection;

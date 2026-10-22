@@ -82,7 +82,8 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     const { runs, stages = [] } = await state.client.request("snapshot");
     if (!alive(state)) return false;
     const delivered = deliveredRunIds(entries(state));
-    if (!state.stage && (state.ctx.isIdle?.() ?? true)) {
+    if (state.ctx.isIdle?.() ?? true) state.aborting = false;
+    if (!state.stage && !state.aborting && (state.ctx.isIdle?.() ?? true)) {
       const pending = stages.find((stage) => !stage.claimed);
       if (pending) {
         const claim = await state.client.request("stage_claim", { request_id: pending.request.request_id });
@@ -107,7 +108,12 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     for (const run of runs) {
       if (!alive(state)) return false;
       if (state.stage?.request.run_id === run.id && !ACTIVE.has(run.status)) {
-        if (state.stage.active) state.ctx.abort?.();
+        if (state.stage.active) {
+          // Pi abort settles asynchronously. A follow-up queued during that
+          // teardown may never enter session history, leaving its lease renewing forever.
+          state.aborting = true;
+          state.ctx.abort?.();
+        }
         state.stage = undefined;
       }
       show(state, progressLines(run));
@@ -132,6 +138,7 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
         state.sent.delete(run.id);
         continue;
       }
+      if (state.aborting) continue;
       if (state.sent.has(run.id)) {
         await state.client.request("renew", { run_id: run.id, token: state.sent.get(run.id) });
         continue;
@@ -199,16 +206,6 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
 
   pi.on("session_start", (_event, ctx) => { begin(ctx); });
   pi.on("session_shutdown", () => { stop(); });
-  pi.on("context", (event) => {
-    const state = current, stage = state?.stage;
-    // Keep the audit history intact, but never send old stage instructions to
-    // a later model round (abort alone leaves the custom message in history).
-    return { messages: event.messages.filter((message) =>
-      message.role !== "custom" || message.customType !== STAGE
-      || (stage?.active && message.details?.request_id === stage.request.request_id
-        && message.details?.execution_id === stage.execution_id
-        && message.details?.scope === state.scope)) };
-  });
   pi.on("message_start", async (event) => {
     const state = current, stage = state?.stage, message = event.message;
     if (message?.role !== "custom" || message.customType !== STAGE) return;
