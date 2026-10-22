@@ -146,9 +146,12 @@ Later runs need an explicit new submission. If a terminal run aborts its active
 stage round, completion delivery waits for Pi to become idle before claiming a
 notification; acknowledgement still requires the message to appear in session history.
 
-Use `templates/native-agent-task-check` to test script → Agent → script. This does
-not enable native `model_judge`, revision or read-only verification protection;
-`data-cleaning-v2` still requires additional host capabilities. Capture's separate
+Use `templates/native-agent-task-check` to test script → Agent → script, and
+`templates/data-cleaning-revision` to test the native revision loop (draft
+preparation in the registry, prompt-level protection, regression and
+publication). Native `model_judge` and read-only verification protection remain
+undeclared; `data-cleaning-v2` still requires additional host capabilities.
+Capture's separate
 new-parameter probe is not covered by this stage handoff; do not infer generalized
 reuse from a successful main run alone.
 

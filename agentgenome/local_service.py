@@ -10,6 +10,7 @@ import hashlib
 import json
 import importlib
 import os
+import shutil
 import stat
 import time
 from pathlib import Path
@@ -72,6 +73,21 @@ class LocalService:
                 WHERE r.scope=? AND n.acknowledged=0 ORDER BY r.rowid''', (scope,)).fetchall()
         return [{**self.service._run(row), "progress": json.loads(row["progress"])} for row in rows]
 
+    def reclaim_draft(self, revision_id: str) -> None:
+        shutil.rmtree(self.root / "revision-drafts" / revision_id, ignore_errors=True)
+
+    def reclaim_submitted_drafts(self) -> None:
+        """Drop editable copies whose revision was submitted or never registered."""
+        directory = self.root / "revision-drafts"
+        if not directory.is_dir():
+            return
+        with self.service._db() as db:
+            submitted = {row[0] for row in db.execute("SELECT id FROM revisions WHERE child IS NOT NULL")}
+            known = {row[0] for row in db.execute("SELECT id FROM revisions")}
+        for path in directory.iterdir():
+            if path.name not in known or path.name in submitted:
+                shutil.rmtree(path, ignore_errors=True)
+
     def progress(self, run_id: str, event: dict) -> None:
         with self.service._db() as db:
             row = db.execute("SELECT progress FROM native_runs WHERE run_id=?", (run_id,)).fetchone()
@@ -120,9 +136,12 @@ class LocalService:
 
     async def dispatch(self, scope: str, cwd: str, message: dict, connection_id: str | None = None) -> dict:
         action, args = message["action"], message.get("arguments", {})
-        capabilities = {"agent_task"} if connection_id in self.stage_clients else set()
+        # The local host can always stage and collect revision files on this machine.
+        capabilities = {"revision"}
+        if connection_id in self.stage_clients:
+            capabilities.add("agent_task")
         request_id = message.get("request_id", message["id"])
-        if action in {"run", "validate", "capture", "distill"}:
+        if action in {"run", "validate", "capture", "distill", "prepare_revision"}:
             host = LocalExecutionHost(self.root, Path(cwd))
             if action == "validate":
                 self.service.check_capabilities(args["asset_id"], args["version"], capabilities)
@@ -131,9 +150,12 @@ class LocalService:
             else:
                 result = invoke(self.service, scope, action, args, request_id,
                                 host=host, capabilities=capabilities)
+                if action == "run" and "revision_id" in args:
+                    # Submission collected the allowlisted files; reclaim the copy.
+                    self.reclaim_draft(args["revision_id"])
             # A capture or distill reuses an existing version without queueing a run.
             run_id = (result.get("run_id") if action in {"capture", "distill"}
-                      else result["id"])
+                      else result.get("id"))
             if run_id:
                 with self.service._db() as db:
                     db.execute("INSERT OR IGNORE INTO native_runs(run_id,cwd) VALUES(?,?)",
@@ -249,6 +271,7 @@ class LocalService:
         try:
             path.unlink(missing_ok=True)
             self.service.recover()
+            self.reclaim_submitted_drafts()
             server = await asyncio.start_unix_server(self.client, path=path, limit=1024 * 1024)
             path.chmod(0o600)
             async with server:

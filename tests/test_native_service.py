@@ -82,6 +82,136 @@ def validate(client, data="input.csv", request="first"):
                                "params": {"data_file": data}}, request)
 
 
+REVISED_CLEAN = '''import csv
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) != 3 or not sys.argv[2]:
+        print("clean: delimiter must be a non-empty string", file=sys.stderr)
+        return 1
+    delimiter = sys.argv[2]
+    with open(sys.argv[1], newline="") as f:
+        text = f.read()
+    if len(delimiter) == 1:
+        rows = list(csv.reader(text.splitlines(), delimiter=delimiter))
+    else:
+        rows = [line.split(delimiter) for line in text.splitlines() if line.strip()]
+    if not rows:
+        print("clean: empty input", file=sys.stderr)
+        return 1
+    header, data = rows[0], rows[1:]
+    kept = []
+    seen = set()
+    for row in data:
+        if any(cell.strip() == "" for cell in row):
+            continue
+        key = tuple(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(row)
+    out = csv.writer(sys.stdout)
+    out.writerow(header)
+    out.writerows(kept)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def delimiter_case(case_id, delimiter):
+    header = delimiter.join(["name", "age"])
+    rows = [delimiter.join(["Ada", "36"]), delimiter.join(["Ada", "36"]),
+            delimiter.join(["Bob", ""]), delimiter.join(["Cy", "12"])]
+    return {"id": case_id,
+            "files": {"input.csv": "\n".join([header, *rows]) + "\n"},
+            "params": {"data_file": "fixture:input.csv", "delimiter": delimiter},
+            "assertions": [
+                {"node": "clean-sop", "output": "report", "kind": "json",
+                 "expected": {"rows": 2, "columns": ["name", "age"]}},
+                {"node": "clean-sop.clean", "output": "cleaned", "kind": "csv",
+                 "expected": [["name", "age"], ["Ada", "36"], ["Cy", "12"]]}]}
+
+
+def failed_revision_run(client, tmp_path):
+    client("import", {"source": str(ROOT / "templates/data-cleaning-revision")})
+    data = tmp_path / "input.csv"
+    data.write_text("name;;age\nAda;;36\nAda;;36\nBob;;\nCy;;12\n")
+    run = client("validate", {"asset_id": "data-cleaning", "version": "1.1.0",
+                              "params": {"data_file": str(data), "delimiter": ";;"}})
+    client("start", {"run_id": run["id"]})
+    assert wait_run(client, run["id"])["status"] == "failed"
+    return run, data
+
+
+def submit_arguments(draft, data):
+    return {"revision_id": draft["revision_id"],
+            "params": {"data_file": str(data), "delimiter": ";;"},
+            "change_summary": "support multi-character delimiters",
+            "baseline_cases": [delimiter_case("comma", ",")],
+            "regression_cases": [delimiter_case("double-semicolon", ";;")]}
+
+
+def test_native_revision_loop_publishes_and_keeps_verification_frozen(server, tmp_path):
+    home, _, _, connect = server
+    client = connect()
+    run, data = failed_revision_run(client, tmp_path)
+
+    recovery = client("status", {"run_id": run["id"]})["recovery"]
+    assert recovery["revision"]["available"] is True
+    assert recovery["revision"]["reasons"] == []
+
+    draft = client("prepare_revision", {"run_id": run["id"]}, "draft")
+    directory = Path(draft["editable_dir"])
+    assert directory == home / "revision-drafts" / draft["revision_id"]
+    assert draft["verification_protection"] == "prompt"
+    assert draft["allowed_scripts"] == ["scripts/clean.py", "scripts/summarize.py"]
+    # Prompt-level protection: the copy carries the whole package as context.
+    assert (directory / "scripts/verify_report.py").is_file()
+    (directory / "scripts/clean.py").write_text(REVISED_CLEAN)
+    (directory / "scripts/verify_report.py").write_text("raise SystemExit(1)\n")
+
+    child = client("run", submit_arguments(draft, data), "submit")
+    assert child["status"] == "queued"
+    assert child["candidate_version"] == "1.1.1"
+    assert not directory.exists()
+    assert client("run", submit_arguments(draft, data), "submit")["id"] == child["id"]
+
+    client("start", {"run_id": child["id"]})
+    done = wait_run(client, child["id"])
+    assert done["status"] == "succeeded", done
+    assert done["result"]["publication"] == {"status": "published", "version": "1.1.1"}
+    assert [a["version"] for a in client("list")["assets"] if a["id"] == "data-cleaning"] == ["1.1.1"]
+    original = (ROOT / "templates/data-cleaning-revision/scripts/verify_report.py").read_bytes()
+    assert (home / "assets/data-cleaning/1.1.1/scripts/verify_report.py").read_bytes() == original
+    report = json.loads(Path(done["result"]["outputs"]["report"]["execution_path"]).read_text())
+    assert report == {"rows": 2, "columns": ["name", "age"]}
+
+
+def test_native_revision_draft_survives_restart_while_orphans_are_reclaimed(server, tmp_path):
+    home, process, launch, connect = server
+    client = connect()
+    run, data = failed_revision_run(client, tmp_path)
+    draft = client("prepare_revision", {"run_id": run["id"]}, "draft")
+    directory = Path(draft["editable_dir"])
+    (home / "revision-drafts/never-registered").mkdir(parents=True)
+
+    process.terminate()
+    process.wait(timeout=5)
+    launch()
+    client = connect()
+    assert not (home / "revision-drafts/never-registered").exists()
+    assert directory.is_dir()
+
+    (directory / "scripts/clean.py").write_text(REVISED_CLEAN)
+    child = client("run", submit_arguments(draft, data), "submit")
+    assert child["status"] == "queued"
+    assert not directory.exists()
+
+
 def human_package(tmp_path):
     source = tmp_path / "human"
     source.mkdir()

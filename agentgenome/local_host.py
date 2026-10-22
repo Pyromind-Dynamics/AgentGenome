@@ -127,7 +127,7 @@ class LocalExecutionHost:
             return stream.read(limit)
 
     def prepare(self, run_id, package, params, path_parameters, cancel, emit,
-                **options):
+                verification_package=None, **options):
         # A local run asks its terminal human again on resume; `resuming` only tells
         # a headless host which parked node the wakeup answers.
         directory = self.root / "runs" / run_id / "work"
@@ -147,4 +147,34 @@ class LocalExecutionHost:
                  if isinstance(self.human, NativeHuman) else self.human)
         return Ports(shell=StreamingShell(cancel, emit), cwd=scripts,
                      artifacts=NativeArtifacts(directory), tool=LocalTool(),
-                     human=human), values
+                     human=human,
+                     # Verify rules must run the frozen originals, not the run copy.
+                     verification_cwd=verification_package), values
+
+    def prepare_revision(self, revision_id, package, allowed):
+        """Copy the frozen package for the agent to edit in place.
+
+        There is no OS-level protection: the full copy is context, the prompt
+        carries the constraint, and submission still collects only the
+        allowlisted business scripts.
+        """
+        directory = self.root / "revision-drafts" / revision_id
+        if directory.exists():
+            raise ValueError("revision draft already exists")
+        shutil.copytree(package, directory)
+        for name in allowed:
+            file = directory / name
+            if not file.is_file() or file.is_symlink():
+                raise ValueError("editable script is not a regular package file")
+        return {"editable_dir": str(directory), "verification_dir": str(directory),
+                "verification_protection": "prompt"}
+
+    def collect_revision(self, draft, allowed):
+        directory = Path(draft["editable_dir"])
+        files = {}
+        for name in allowed:
+            file = directory / name
+            if not file.is_file() or file.is_symlink():
+                raise ValueError("editable script is not a regular package file")
+            files[name] = file.read_bytes()
+        return files
