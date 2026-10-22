@@ -170,7 +170,7 @@ def test_native_llm_stage_waits_for_round_and_verifies_outputs(server, tmp_path,
         assert json.loads(report.read_text()) == {"passed": True, "rows": 2, "names": ["Ada", "Cy"]}
 
 
-@pytest.mark.parametrize("mode", ["cancel", "disconnect", "disconnect_unclaimed", "restart"])
+@pytest.mark.parametrize("mode", ["cancel", "cancel_disconnect", "disconnect", "disconnect_unclaimed", "restart"])
 def test_native_stage_interruption_never_redelivers_old_work(server, tmp_path, mode):
     home, process, launch, connect = server
     client = connect()
@@ -180,8 +180,10 @@ def test_native_stage_interruption_never_redelivers_old_work(server, tmp_path, m
         claim = client("stage_claim", {"request_id": request["request_id"]})
         args = {"request_id": request["request_id"], "execution_id": claim["execution_id"]}
         client("stage_begin", args)
-    if mode == "cancel":
+    if mode in {"cancel", "cancel_disconnect"}:
         observer("cancel", {"run_id": run["id"]})
+        if mode == "cancel_disconnect":
+            client.close()
         expected = "cancelled"
     elif mode == "disconnect":
         client.close()
@@ -246,7 +248,8 @@ node:
     return source
 
 
-def test_native_stage_interrupted_when_session_exits_before_handoff(server, tmp_path):
+@pytest.mark.parametrize("reopen_before_handoff", [False, True])
+def test_native_stage_interrupted_when_session_exits_before_handoff(server, tmp_path, reopen_before_handoff):
     home, _, _, connect = server
     source = gated_stage_package(tmp_path)
     client = connect()
@@ -255,6 +258,12 @@ def test_native_stage_interrupted_when_session_exits_before_handoff(server, tmp_
     run = client("validate", {"asset_id": "native-gated-stage-check", "version": "1.0.0", "params": {}})
     client("start", {"run_id": run["id"]})
     client.close()
+    reopened = None
+    if reopen_before_handoff:
+        # Reopening the same session must not revive its old connection's run,
+        # even when another client keeps the registry service alive.
+        time.sleep(.15)
+        reopened = connect()
     # Release the pre-stage script only after the owning session has no client left;
     # the still-connected stranger must not keep the handoff alive for 30 minutes.
     (tmp_path / "release").write_text("go")
@@ -265,13 +274,27 @@ def test_native_stage_interrupted_when_session_exits_before_handoff(server, tmp_
         time.sleep(.02)
     else:
         raise AssertionError("pre-stage script did not finish")
-    # The handoff decision follows the artifact within milliseconds; only reconnect
-    # once it has certainly happened, or the reopened session would be deliverable.
-    time.sleep(.5)
-    reopened = connect()
+    if reopened is None:
+        reopened = connect()
     finished = wait_run(reopened, run["id"])
     assert finished["status"] == "failed", finished
     assert reopened("snapshot")["stages"] == []
+
+
+def test_native_stage_loses_start_connection_even_when_peer_claimed_it(server):
+    _, _, _, connect = server
+    client = connect()
+    run, request = native_stage(client)
+    peer = connect()
+    claim = peer("stage_claim", {"request_id": request["request_id"]})
+    assert claim["claimed"]
+    args = {"request_id": request["request_id"], "execution_id": claim["execution_id"]}
+    peer("stage_begin", args)
+    client.close()
+    assert wait_run(peer, run["id"])["status"] == "failed"
+    assert peer("snapshot")["stages"] == []
+    with pytest.raises(ValueError, match="not active"):
+        peer("step_result", {**args, "outcome": "completed"})
 
 
 def test_native_stage_timeout_releases_pending_handoff(tmp_path):
@@ -284,6 +307,36 @@ def test_native_stage_timeout_releases_pending_handoff(tmp_path):
         result = await stages.wait("one", {"request_id": "expired", "run_id": "run"})
         assert result["status"] == "failed"
         assert stages.snapshot("one") == []
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("already_waiting", [False, True])
+def test_native_stage_cancellation_takes_precedence_over_disconnection(tmp_path, already_waiting):
+    import asyncio
+    from threading import Event
+    from agentgenome.native_stages import NativeStages
+    from agentgenome.service import GenomeService
+
+    async def check():
+        service = GenomeService(tmp_path / "catalog")
+        signal = service._signals["run"] = Event()
+        connected = True
+        stages = NativeStages(service)
+        if already_waiting:
+            task = asyncio.create_task(stages.wait("one", {"request_id": "stage", "run_id": "run"},
+                                                   deliverable=lambda: connected))
+            await asyncio.sleep(0)
+            assert "stage" in stages.pending
+        signal.set()
+        connected = False
+        if already_waiting:
+            stages.disconnect("owner", abandoned_scope="one")
+            result = await task
+        else:
+            result = await stages.wait("one", {"request_id": "stage", "run_id": "run"},
+                                       deliverable=lambda: connected)
+        assert result["status"] == "cancelled"
+        assert stages.pending == {}
     asyncio.run(check())
 
 

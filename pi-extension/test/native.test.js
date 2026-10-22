@@ -114,6 +114,30 @@ test("a stage message whose round was cancelled is intercepted before the model 
   assert.equal(h.calls.some((c) => c.action === "stage_begin"), false);
   await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "aborted" }] });
   assert.equal(h.calls.some((c) => c.action === "stage_finish"), false);
+  const ordinary = { role: "user", content: "继续" };
+  const context = [{ role: "custom", ...message }, ordinary];
+  assert.deepEqual(h.hooks.get("context")({ messages: context }).messages, [ordinary]);
+  assert.equal(context.length, 2); // Filtering must not delete the audit history.
+});
+
+test("model context includes only the live stage, never finished or restored instructions", async (t) => {
+  const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
+  const h = harness(t, { stages: [{ request, claimed: false }] });
+  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await until(() => h.messages.some((m) => m.message.customType === "agentgenome.stage"));
+  const live = { role: "custom", ...h.messages[0].message };
+  const old = { ...live, details: { ...live.details, execution_id: "old-round" } };
+  const other = { role: "custom", customType: "other-plugin", content: "Keep me" };
+  const messages = [old, live, other];
+  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [other]);
+  await h.hooks.get("message_start")({ message: live });
+  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [live, other]);
+  await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] });
+  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [other]);
+  h.hooks.get("session_shutdown")();
+  h.hooks.get("session_start")({}, h.ctx);
+  assert.deepEqual(h.hooks.get("context")({ messages }).messages, [other]);
+  assert.equal(messages.length, 3);
 });
 
 test("SDK bridge owns wire conversion and propagates failures without local fallback", async () => {

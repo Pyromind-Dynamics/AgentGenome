@@ -53,8 +53,7 @@ class LocalService:
         # Freeze the identity at process startup, not after files are replaced.
         self.runtime_fingerprint = runtime_fingerprint()
         self.service = GenomeService(root)
-        self.stages = NativeStages(self.service,
-                                   deliverable=lambda scope: scope in self.stage_scopes())
+        self.stages = NativeStages(self.service)
         self.root = self.service.root
         self.idle_seconds = idle_seconds
         self.jobs: dict[str, asyncio.Task] = {}
@@ -92,16 +91,18 @@ class LocalService:
             db.execute("UPDATE native_runs SET progress=? WHERE run_id=?",
                        (json.dumps(state), run_id))
 
-    def stage_scopes(self) -> set[str]:
-        return {scope for key, scope in self.client_scopes.items() if key in self.stage_clients}
-
-    async def execute(self, scope: str, run_id: str, cwd: str) -> None:
+    async def execute(self, scope: str, run_id: str, cwd: str, connection_id: str | None = None) -> None:
         loop = asyncio.get_running_loop()
 
+        def deliverable():
+            # Scope names survive reopening a session; connection IDs do not.
+            return (connection_id in self.stage_clients
+                    and self.client_scopes.get(connection_id) == scope)
+
         async def handoff(request):
-            if scope not in self.stage_scopes():
+            if not deliverable():
                 return {"status": "interrupted"}
-            return await self.stages.wait(scope, request)
+            return await self.stages.wait(scope, request, deliverable=deliverable)
 
         def emit(event):
             self.progress(run_id, event)
@@ -146,7 +147,7 @@ class LocalService:
                     row = db.execute("SELECT cwd FROM native_runs WHERE run_id=?", (run_id,)).fetchone()
                 if row is None:
                     raise ValueError("not a native run")
-                self.jobs[run_id] = asyncio.create_task(self.execute(scope, run_id, row[0]))
+                self.jobs[run_id] = asyncio.create_task(self.execute(scope, run_id, row[0], connection_id))
             return state
         if action == "snapshot":
             return {"runs": self.records(scope), "stages": self.stages.snapshot(scope)}

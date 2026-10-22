@@ -6,17 +6,15 @@ from uuid import uuid4
 
 
 class NativeStages:
-    def __init__(self, service, timeout: float = 1800, deliverable=None):
+    def __init__(self, service, timeout: float = 1800):
         self.service, self.timeout = service, timeout
-        # An unclaimed stage whose session has no stage-capable client left can never
-        # be delivered; wait() interrupts it instead of parking until the timeout.
-        self.deliverable = deliverable if deliverable is not None else (lambda scope: True)
         self.pending = {}
 
-    async def wait(self, scope, request):
+    async def wait(self, scope, request, deliverable=None):
         request_id = request["request_id"]
         stage = {"scope": scope, "request": request, "owner": None,
                  "execution_id": uuid4().hex, "begun": False,
+                 "deliverable": deliverable if deliverable is not None else (lambda: True),
                  "future": asyncio.get_running_loop().create_future()}
         self.pending[request_id] = stage
         deadline = asyncio.get_running_loop().time() + self.timeout
@@ -25,12 +23,16 @@ class NativeStages:
                 signal = self.service._signals.get(request["run_id"])
                 if signal is not None and signal.is_set():
                     return {"status": "cancelled", "execution_id": stage["execution_id"]}
+                if not stage["deliverable"]():
+                    return {"status": "interrupted", "execution_id": stage["execution_id"]}
                 if asyncio.get_running_loop().time() >= deadline:
                     return {"status": "failed", "execution_id": stage["execution_id"]}
-                if stage["owner"] is None and not self.deliverable(scope):
-                    return {"status": "interrupted", "execution_id": stage["execution_id"]}
                 try:
-                    return await asyncio.wait_for(asyncio.shield(stage["future"]), .1)
+                    result = await asyncio.wait_for(asyncio.shield(stage["future"]), .1)
+                    # Cancellation can arrive while disconnect wakes the future.
+                    if signal is not None and signal.is_set():
+                        return {"status": "cancelled", "execution_id": stage["execution_id"]}
+                    return result
                 except asyncio.TimeoutError:
                     pass
         finally:
@@ -40,7 +42,8 @@ class NativeStages:
 
     def snapshot(self, scope):
         return [{"request": stage["request"], "claimed": stage["owner"] is not None}
-                for stage in self.pending.values() if stage["scope"] == scope and not stage["future"].done()]
+                for stage in self.pending.values() if stage["scope"] == scope
+                and stage["deliverable"]() and not stage["future"].done()]
 
     def claim(self, scope, request_id, owner):
         stage = self._active(scope, request_id)
@@ -90,7 +93,7 @@ class NativeStages:
 
     def _active(self, scope, request_id):
         stage = self.pending.get(request_id)
-        if stage is None or stage["scope"] != scope:
+        if stage is None or stage["scope"] != scope or not stage["deliverable"]():
             raise ValueError("stage request is not active in this session")
         state = self.service.status(scope, stage["request"]["run_id"])
         if state["status"] != "running":

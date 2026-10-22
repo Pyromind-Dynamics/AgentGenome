@@ -137,10 +137,12 @@ before scripts verify the files and the graph continues. Do not poll or start
 another graph from a stage. Stage handoffs expire after 30 minutes; cancellation,
 owner disconnection or service restart never re-delivers an old stage. Switching
 sessions closes the old handoff and fails it rather than sending it to the new
-session. A handoff is only created or kept while its own session still has a
-connected stage-capable client; if that session has already exited, the stage is
-interrupted instead of parking the run. A delivered stage message whose round is
+session. A handoff is only created or kept while the connection that started the
+execution remains connected and stage-capable. Reopening the same session file
+does not revive that connection's old execution. A delivered stage message whose round is
 already dead is intercepted and its turn aborted before the model acts on it.
+Only the active stage's instructions enter model context; old stage instructions
+remain in audit history but are filtered out of subsequent model requests.
 Later runs need an explicit new submission.
 
 Use `templates/native-agent-task-check` to test script → Agent → script. This does

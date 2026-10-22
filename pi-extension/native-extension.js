@@ -199,6 +199,16 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
 
   pi.on("session_start", (_event, ctx) => { begin(ctx); });
   pi.on("session_shutdown", () => { stop(); });
+  pi.on("context", (event) => {
+    const state = current, stage = state?.stage;
+    // Keep the audit history intact, but never send old stage instructions to
+    // a later model round (abort alone leaves the custom message in history).
+    return { messages: event.messages.filter((message) =>
+      message.role !== "custom" || message.customType !== STAGE
+      || (stage?.active && message.details?.request_id === stage.request.request_id
+        && message.details?.execution_id === stage.execution_id
+        && message.details?.scope === state.scope)) };
+  });
   pi.on("message_start", async (event) => {
     const state = current, stage = state?.stage, message = event.message;
     if (message?.role !== "custom" || message.customType !== STAGE) return;
