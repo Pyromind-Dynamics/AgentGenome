@@ -1,0 +1,11 @@
+version: "gt/1.0"
+node:
+  id: report
+  input:
+    summary: {type: text, from: params.summary}
+  do:
+    run: "python3 scripts/report.py {input.summary} > {artifact}"
+  output:
+    report: {type: path}
+  verify:
+    - run: "python3 scripts/judge.py prompts/criterion.txt {artifact}"

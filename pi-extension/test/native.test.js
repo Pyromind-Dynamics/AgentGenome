@@ -4,12 +4,50 @@ import agentGenome, { createBridgeHost, createGenomeExtension } from "../index.j
 import { nativeHost, deliveredRunIds, progressLines } from "../native-extension.js";
 
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+
+test("session restoration keeps its registry when the launch environment changes", async () => {
+  const hooks = new Map(), history = [], options = [];
+  let selected = "/tmp/registry-first";
+  const pi = { on: (key, fn) => hooks.set(key, fn), registerCommand() {},
+    appendEntry: (customType, data) => history.push({ type: "custom", customType, data }) };
+  const ctx = { cwd: "/tmp/work", hasUI: false,
+    sessionManager: { getEntries: () => history, getSessionFile: () => "/tmp/session" } };
+  const host = nativeHost(pi, { registryHome: () => selected, clientFactory: args => {
+    options.push(args);
+    return { close() {}, request: async () => ({ assets: [] }) };
+  } });
+  hooks.get("session_start")({}, ctx);
+  const first = await host.invoke("list", {}, "1", undefined, ctx);
+  assert.equal(first.registry.home, selected);
+  hooks.get("session_shutdown")();
+  selected = "/tmp/registry-other";
+  hooks.get("session_start")({}, ctx);
+  const second = await host.invoke("distill", { plan_id: "existing" }, "2", undefined, ctx);
+  assert.equal(second.registry.home, "/tmp/registry-first");
+  assert.equal(options[1].home, "/tmp/registry-first");
+  assert.equal(history.filter(e => e.customType === "agentgenome.registry").length, 1);
+  hooks.get("session_shutdown")();
+});
+
+test("a failed connection does not pin an unusable registry", async () => {
+  const hooks = new Map(), history = [];
+  const pi = { on: (key, fn) => hooks.set(key, fn), registerCommand() {},
+    appendEntry: (customType, data) => history.push({ type: "custom", customType, data }) };
+  const ctx = { cwd: "/tmp", hasUI: false, sessionManager: {
+    getSessionFile: () => "/tmp/session", getEntries: () => history } };
+  const host = nativeHost(pi, { registryHome: () => "/tmp/unavailable",
+    clientFactory: () => ({ close() {}, async request() { throw new Error("offline"); } }) });
+  hooks.get("session_start")({}, ctx);
+  await assert.rejects(host.invoke("list", {}, "1", undefined, ctx), /offline/);
+  assert.equal(history.length, 0);
+  hooks.get("session_shutdown")();
+});
 async function until(predicate) {
   for (let n = 0; n < 150; n++) { if (predicate()) return; await delay(20); }
   assert.fail("condition not reached");
 }
 
-function harness(t, { records = [], stages = [], history = [], delivered = true, snapshot, capture, onSend = () => {} } = {}) {
+function harness(t, { records = [], stages = [], history = [], delivered = true, snapshot, capture, judges = [], judge, judgeTimeout, toolRequests = [], onSend = () => {} } = {}) {
   const hooks = new Map(), calls = [], messages = [], widgets = [], aborts = [];
   const pi = {
     on: (name, callback) => hooks.set(name, callback), registerCommand() {}, registerTool() {},
@@ -35,18 +73,32 @@ function harness(t, { records = [], stages = [], history = [], delivered = true,
       };
     }
     if (action === "resume") return { id: args.run_id, status: "queued" };
+    if (action === "replay_requeue") return { id: "retry-1", status: "queued" };
     if (action === "capture") return capture ?? { capture_id: "c1", run_id: "r2", reused: false };
-    if (action === "snapshot") return snapshot ? snapshot() : { runs: [...records], stages };
+    if (action === "snapshot") return snapshot ? snapshot() : { runs: [...records], stages, judges: judges.filter(j => !j.claimed), tools: toolRequests.filter(t => !t.done) };
+    if (action === "tool_claim") {
+      const tool = toolRequests.find(item => item.execution_id === args.execution_id);
+      if (tool.claimed) return { claimed: false };
+      tool.claimed = true;
+      return { claimed: true, request: tool };
+    }
+    if (action === "tool_result") toolRequests.find(item => item.execution_id === args.execution_id).done = true;
+    if (action === "judge_claim") {
+      const pending = judges.find(j => j.request_id === args.request_id);
+      pending.claimed = true;
+      return { claimed: true, request: pending };
+    }
     if (action === "stage_claim") {
       const stage = stages.find((s) => s.request.request_id === args.request_id);
       stage.claimed = true;
       return { claimed: true, execution_id: "round-1", request: stage.request };
     }
+    if (action === "step_result") return { accepted: true };
     if (action === "claim") return { token: "lease" };
     if (action === "ack") records.splice(records.findIndex((run) => run.id === args.run_id), 1);
     return {};
   } };
-  const host = nativeHost(pi, { clientFactory: () => client });
+  const host = nativeHost(pi, { clientFactory: () => client, ...(judge ? { judge } : {}), ...(judgeTimeout ? { judgeTimeout } : {}) });
   hooks.get("session_start")({}, ctx);
   t.after(() => hooks.get("session_shutdown")());
   return { hooks, calls, messages, widgets, aborts, host, ctx, history, records };
@@ -79,7 +131,7 @@ test("default entry loads standalone; SDK factory registers no native lifecycle"
 test("native stage binds receipt and completion to the delivered model round", async (t) => {
   const request = { request_id: "stage-1", run_id: "r1", node_id: "flow.llm", prompt: "Write report", expected_outputs: ["/tmp/report"] };
   const h = harness(t, { stages: [{ request, claimed: false }] });
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   await until(() => h.messages.some((m) => m.message.customType === "agentgenome.stage"));
   const message = h.messages.find((m) => m.message.customType === "agentgenome.stage").message;
   await h.hooks.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop" }] });
@@ -87,6 +139,9 @@ test("native stage binds receipt and completion to the delivered model round", a
   await assert.rejects(h.host.invoke("step_result", { request_id: "stage-1", outcome: "completed" }, "early", undefined, h.ctx), /active llm stage/);
   await h.hooks.get("message_start")({ message: { role: "custom", ...message } });
   await assert.rejects(h.host.invoke("run", {}, "nested", undefined, h.ctx), /cannot start/);
+  await assert.rejects(h.host.invoke("confirm_run", { plan_id: "nested" }, "nested-confirm", undefined, h.ctx), /cannot start/);
+  await assert.rejects(h.host.invoke("confirm_distill", { plan_id: "nested" }, "nested-distill", undefined, h.ctx), /cannot start/);
+  await assert.rejects(h.host.invoke("replay_requeue", { run_id: "nested" }, "nested-retry", undefined, h.ctx), /cannot start/);
   await assert.rejects(h.host.invoke("step_result", { request_id: "other", outcome: "completed" }, "wrong", undefined, h.ctx), /active llm stage/);
   await h.host.invoke("step_result", { request_id: "stage-1", outcome: "completed", summary: "done" }, "receipt", undefined, h.ctx);
   const receipt = h.calls.find((c) => c.action === "step_result");
@@ -99,12 +154,40 @@ test("native stage binds receipt and completion to the delivered model round", a
   assert.equal(h.calls.filter((c) => c.action === "stage_finish").length, 1);
 });
 
+test("an accepted final stage receipt survives a provider error, but not later tool calls", async (t) => {
+  const request = { request_id: "stage-receipt", run_id: "r1", node_id: "flow.llm", prompt: "Write report" };
+  const h = harness(t, { stages: [{ request, claimed: false }] });
+  await confirmed(h);
+  await until(() => h.messages.some((m) => m.message.customType === "agentgenome.stage"));
+  const message = h.messages.find((m) => m.message.customType === "agentgenome.stage").message;
+  await h.hooks.get("message_start")({ message: { role: "custom", ...message } });
+  await h.host.invoke("step_result", { request_id: request.request_id, outcome: "completed", summary: "done" }, "receipt", undefined, h.ctx);
+  await h.hooks.get("agent_end")({ messages: [
+    { role: "assistant", content: [{ type: "toolCall", id: "receipt", name: "genome_step_result" }] },
+    { role: "assistant", stopReason: "error", errorMessage: "Connection error." },
+  ] });
+  assert.equal(h.calls.find((c) => c.action === "stage_finish").args.status, "completed");
+
+  const h2 = harness(t, { stages: [{ request, claimed: false }] });
+  await confirmed(h2);
+  await until(() => h2.messages.some((m) => m.message.customType === "agentgenome.stage"));
+  const message2 = h2.messages.find((m) => m.message.customType === "agentgenome.stage").message;
+  await h2.hooks.get("message_start")({ message: { role: "custom", ...message2 } });
+  await h2.host.invoke("step_result", { request_id: request.request_id, outcome: "completed", summary: "done" }, "receipt", undefined, h2.ctx);
+  await h2.hooks.get("agent_end")({ messages: [
+    { role: "assistant", content: [{ type: "toolCall", id: "receipt", name: "genome_step_result" }] },
+    { role: "assistant", content: [{ type: "toolCall", id: "after", name: "bash" }] },
+    { role: "assistant", stopReason: "error", errorMessage: "Connection error." },
+  ] });
+  assert.equal(h2.calls.find((c) => c.action === "stage_finish").args.status, "failed");
+});
+
 test("stages wait for an idle session and stale callbacks cannot complete a switched session", async (t) => {
   const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
   const h = harness(t, { stages: [{ request, claimed: false }] });
   let idle = false;
   h.ctx.isIdle = () => idle;
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   await until(() => h.calls.some((c) => c.action === "snapshot"));
   assert.equal(h.messages.length, 0);
   idle = true;
@@ -121,7 +204,7 @@ test("a stage message whose round was cancelled is intercepted before the model 
   const request = { request_id: "s1", run_id: "r1", prompt: "Task" };
   const records = [{ id: "r1", status: "running" }];
   const h = harness(t, { records, stages: [{ request, claimed: false }] });
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   await until(() => h.messages.some((m) => m.message.customType === "agentgenome.stage"));
   const message = h.messages.find((m) => m.message.customType === "agentgenome.stage").message;
   records[0].status = "cancelled";
@@ -155,6 +238,16 @@ test("submission returns before start; agent_end starts once and success resumes
   assert.match(h.messages[0].message.content, /实际产物/);
 });
 
+test("replay requeue tracks and starts the returned run after the turn", async (t) => {
+  const h = harness(t);
+  const result = await h.host.invoke("replay_requeue", { run_id: "failed-1" }, "retry", undefined, h.ctx);
+  assert.equal(result.id, "retry-1");
+  assert.equal(h.calls.some(call => call.action === "start"), false);
+  await h.hooks.get("agent_end")();
+  assert.deepEqual(h.calls.filter(call => call.action === "start").map(call => call.args.run_id), ["retry-1"]);
+  assert.ok(h.history.some(entry => entry.customType === "agentgenome.run" && entry.data.run_id === "retry-1"));
+});
+
 test("busy agent notification is acknowledged only after custom_message is persisted", async (t) => {
   const h = harness(t, { delivered: false });
   await confirmed(h);
@@ -174,7 +267,7 @@ test("interrupted stage waits for abort to settle before delivering its completi
   const h = harness(t, { records, stages: [{ request, claimed: false }] });
   let idle = true;
   h.ctx.isIdle = () => idle;
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   await until(() => h.messages.some(m => m.message.customType === "agentgenome.stage"));
   await h.hooks.get("message_start")({ message: { role: "custom", ...h.messages[0].message } });
   idle = false;
@@ -201,7 +294,7 @@ test("cancelling an active stage does not block a later explicit handoff", async
   const h = harness(t, { records, stages });
   let idle = true;
   h.ctx.isIdle = () => idle;
-  await h.host.invoke("run", {}, "call", undefined, h.ctx);
+  await confirmed(h);
   await until(() => h.messages.length === 1);
   await h.hooks.get("message_start")({ message: { role: "custom", ...h.messages[0].message } });
   idle = false;
@@ -328,4 +421,134 @@ test("pending completion restores without starting scripts and failed delivery r
   assert.equal(attempts, 2);
   assert.ok(h.calls.some((call) => call.action === "release"));
   assert.equal(h.calls.some((call) => ["run", "start"].includes(call.action)), false);
+});
+
+
+test("model evaluation runs independently while the chat is busy", async t => {
+  const judges = [{ request_id: "judge-1", run_id: "r1", criterion: "Fixed facts", evidence: "Report" }];
+  const h = harness(t, { records: [{ id: "r1", status: "running" }], judges,
+    judge: async (_ctx, request) => { assert.equal(request.evidence, "Report"); return { passed: false, reason: "Missing facts" }; } });
+  h.ctx.isIdle = () => false;
+  await confirmed(h);
+  await until(() => h.calls.some(c => c.action === "judge_result"));
+  assert.deepEqual(h.calls.find(c => c.action === "judge_result").args.response,
+    { verdict: { passed: false, reason: "Missing facts" } });
+  assert.equal(h.messages.length, 0);
+  assert.equal(h.calls.some(c => c.action.startsWith("stage_")), false);
+});
+
+test("judge timeout returns a call error even if the provider never settles", async t => {
+  const judges = [{ request_id: "judge-1", run_id: "r1" }];
+  const h = harness(t, { records: [{ id: "r1", status: "running" }], judges,
+    judge: () => new Promise(() => {}), judgeTimeout: 20 });
+  await confirmed(h);
+  await until(() => h.calls.some(c => c.action === "judge_result"));
+  assert.match(h.calls.find(c => c.action === "judge_result").args.response.error, /timed out/);
+});
+
+test("closing a judge's session aborts its independent call without writing to another session", async t => {
+  let signal;
+  const h = harness(t, { records: [{ id: "r1", status: "running" }],
+    judges: [{ request_id: "judge-1", run_id: "r1" }],
+    judge: async (_ctx, _request, active) => { signal = active; return new Promise(() => {}); } });
+  await confirmed(h);
+  await until(() => signal !== undefined);
+  h.hooks.get("session_shutdown")();
+  h.hooks.get("session_start")({}, h.ctx);
+  await delay(30);
+  assert.equal(signal.aborted, true);
+  assert.equal(h.calls.some(c => c.action === "judge_result"), false);
+});
+
+
+test("native tool dispatch uses the bound caller context once and preserves its result", async t => {
+  const toolRequests = [{ execution_id: "write-1", run_id: "r1", name: "business_write", arguments: { value: 7 } }];
+  const h = harness(t, { records: [{ id: "r1", status: "running" }], toolRequests });
+  let executions = 0;
+  h.ctx.tools = [{ name: "business_write" }];
+  h.ctx.executeTool = async (name, args) => {
+    executions++;
+    assert.equal(name, "business_write"); assert.deepEqual(args, { value: 7 });
+    return { isError: false, result: { structuredContent: { actual: 7 }, content: [] } };
+  };
+  await confirmed(h);
+  await until(() => h.calls.some(c => c.action === "tool_result"));
+  await delay(1100);
+  assert.equal(executions, 1);
+  assert.deepEqual(h.calls.find(c => c.action === "tool_result").args.response,
+    { is_error: false, result: { actual: 7 }, text: "" });
+  assert.equal(h.history.filter(e => e.customType === "agentgenome.tool").length, 1);
+});
+
+test("native tool cancellation waits for the executor's terminal outcome", async t => {
+  const toolRequests = [{ execution_id: "hold-1", run_id: "r1", name: "hold", arguments: {} }];
+  const h = harness(t, { records: [{ id: "r1", status: "running" }], toolRequests });
+  let signal;
+  h.ctx.tools = [{ name: "hold" }];
+  h.ctx.executeTool = (_name, _args, options) => {
+    signal = options.signal;
+    return new Promise(resolve => signal.addEventListener("abort", () => resolve({
+      isError: true, result: { content: [{ type: "text", text: "Stopped" }] },
+    }), { once: true }));
+  };
+  await confirmed(h);
+  await until(() => signal !== undefined);
+  assert.equal(h.calls.some(c => c.action === "tool_result"), false);
+  toolRequests[0].cancel_requested = true;
+  await until(() => h.calls.some(c => c.action === "tool_result"));
+  assert.equal(signal.aborted, true);
+  assert.equal(h.calls.find(c => c.action === "tool_result").args.response.is_error, true);
+});
+
+test("an unconfirmed uncooperative tool does not keep the notification watcher polling forever", async t => {
+  const toolRequests = [{ execution_id: "hung-1", run_id: "r1", name: "hung", arguments: {} }];
+  const records = [{ id: "r1", status: "running" }];
+  const h = harness(t, { records, toolRequests });
+  let signal;
+  h.ctx.tools = [{ name: "hung" }];
+  h.ctx.executeTool = (_name, _args, options) => {
+    signal = options.signal;
+    return new Promise(() => {}); // Intentionally ignores cancellation.
+  };
+  await confirmed(h);
+  await until(() => signal !== undefined);
+  records[0].status = "interrupted";
+  toolRequests[0].done = true; // Service timed out with an unknown receipt.
+  await until(() => h.calls.some(c => c.action === "ack"));
+  assert.equal(signal.aborted, true);
+  await delay(1100);
+  const polls = h.calls.filter(c => c.action === "snapshot").length;
+  await delay(1100);
+  assert.equal(h.calls.filter(c => c.action === "snapshot").length, polls);
+  assert.equal(h.calls.some(c => c.action === "tool_result"), false);
+});
+
+test("external await shows machine waiting without a human work order or model turn", async t => {
+  const records = [{id: 'r1', status: 'waiting', result: {waiting: {
+    kind: 'external', node: 'flow.wait', task_id: 'task-1', deadline: 2000000000,
+  }}}];
+  const h = harness(t, {records});
+  await confirmed(h);
+  await until(() => h.widgets.some(lines => lines.some(line => line.includes('task-1'))));
+  assert.equal(h.messages.length, 0);
+  assert.equal(h.calls.some(call => call.action === 'resume'), false);
+  records[0] = {id: 'r1', status: 'succeeded'};
+  await until(() => h.messages.some(message => message.message.customType === 'agentgenome.completed'));
+  assert.equal(h.messages.some(message => message.message.customType === 'agentgenome.waiting'), false);
+});
+
+test("restored await uses a freshly bound executor for its downstream tool", async t => {
+  const toolRequests = [{execution_id: 'after-await', run_id: 'restored', name: 'business_write', arguments: {value: 7}}];
+  const h = harness(t, {records: [{id: 'restored', status: 'running'}], toolRequests,
+    history: [{type: 'custom', customType: 'agentgenome.run', data: {run_id: 'restored'}}]});
+  let calls = 0;
+  h.ctx.tools = [{name: 'business_write'}];
+  h.ctx.executeTool = async () => {
+    calls++;
+    return {isError: false, result: {content: [], details: {actual: true}}};
+  };
+  await h.host.invoke('list', {}, 'rebind', undefined, h.ctx);
+  await until(() => h.calls.some(call => call.action === 'tool_result'));
+  assert.equal(calls, 1);
+  assert.deepEqual(h.calls.find(call => call.action === 'tool_result').args.response.result, {actual: true});
 });

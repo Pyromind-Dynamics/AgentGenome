@@ -14,6 +14,22 @@ def test_a_root_input_is_named_by_role_not_by_the_trial_size():
     assert _key_base("data/raw.csv") == "raw"
 
 
+@pytest.mark.parametrize("instruction", [
+    "请人工复核 out/prepared.jsonl，把结果放到 out/final.csv。",
+    "请将 out/prepared.jsonl 脱敏后保留，目前人工复核尚未确认。",
+    "请沉淀人工复核流程，验证输入使用 data/sample.csv，暂时不要执行。",
+])
+def test_requests_are_not_completed_human_handoffs(trace_factory, tool_entry, user_entry, instruction):
+    trace = trace_factory([
+        tool_entry("prepare", "python3 scripts/prelabel.py data/raw.csv > out/prepared.jsonl"),
+        user_entry("instruction", instruction),
+        tool_entry("finish", "python3 scripts/clean.py out/prepared.jsonl > out/final.csv"),
+    ])
+    candidate = build_candidate_plan([trace], final_artifact="out/final.csv")
+    assert len(candidate.steps) == 2
+    assert all("human" not in step for step in candidate.steps)
+
+
 def test_candidate_plan_extracts_the_artifact_connected_chain(pipeline_trace):
     trace = pipeline_trace("session-1")
 

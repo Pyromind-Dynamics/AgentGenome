@@ -5,12 +5,36 @@ import yaml
 
 from agentgenome.capture.pipeline import (
     CaptureError,
+    _output_params,
     _probe_plan,
     next_version,
     prepare_capture,
 )
 from agentgenome.parameters import parameter_spec
 from types import SimpleNamespace
+
+
+@pytest.mark.parametrize("flag", ["--output-dir", "--output_dir", "--outdir", "--output", "-o"])
+@pytest.mark.parametrize("syntax", ["{flag} {{input.out}}", '{flag} "{{input.out}}"', "{flag}={{input.out}}"])
+def test_output_sampling_understands_shell_argument_forms(flag, syntax):
+    node = SimpleNamespace(kind="run", command="python script.py " + syntax.format(flag=flag))
+    assert _output_params(SimpleNamespace(nodes=[node])) == {"out"}
+
+
+@pytest.mark.parametrize("flag", ["--data-dir", "--layout", "--input-dir", "--source-dir"])
+def test_input_flags_never_make_missing_inputs_optional(tmp_path, flag):
+    from agentgenome.capture.emit import LocalSource
+    from agentgenome.capture.sample import sample_inputs
+    node = SimpleNamespace(kind="run", command=f"python scan.py {flag} {{input.data}}")
+    optional = _output_params(SimpleNamespace(nodes=[node]))
+    samples = sample_inputs(LocalSource(tmp_path), {"data": "missing.csv"}, tmp_path / "samples", optional=optional)
+    assert samples["files"][0]["format"] == "unavailable"
+
+
+def test_a_path_used_as_both_input_and_output_is_not_optional():
+    nodes = [SimpleNamespace(kind="run", command="python a.py --output-dir {input.path}"),
+             SimpleNamespace(kind="run", command="python b.py --data-dir {input.path}")]
+    assert not _output_params(SimpleNamespace(nodes=nodes))
 
 
 def capture(service, host, workspace, traces, **kwargs):

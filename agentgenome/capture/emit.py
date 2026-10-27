@@ -7,6 +7,7 @@ authored by an editor tool, agent tasks) is reported instead of guessed.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -29,8 +30,9 @@ from ..parameters import (
 )
 from .align import Alignment, Slot
 from .slice import Slice
-from .trace import (KIND_HUMAN, KIND_LLM, KIND_SHELL, KIND_TOOL, KIND_WRITE, ROLE_SCRIPT,
-                    Step, Trace, canonical_path, parse_command, placeholder_key, role)
+from .trace import (KIND_HUMAN, KIND_LLM, KIND_SHELL, KIND_TOOL, KIND_WRITE, ROLE_REPORT,
+                    ROLE_SCRIPT, Step, Trace, canonical_path, parse_command,
+                    placeholder_key, role)
 
 DEFAULT_VERSION = "0.1.0"
 # Tools whose call is an external side effect: replaying one submits work to a
@@ -45,6 +47,56 @@ _SHAPE_HEAD = re.compile(r"([A-Za-z][A-Za-z0-9._+-]*)(?=\s|\Z)")
 _SUFFIX = re.compile(r"[a-z0-9]{1,12}")
 _RUNTIME_REF = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\.(?:py|sh)\b")
 _RUNTIME_LIMIT = 32
+
+
+def _runtime_names(origin: str, content: bytes) -> set[str]:
+    names = set(_RUNTIME_REF.findall(content.decode("utf-8", "replace")))
+    if PurePosixPath(origin).suffix == ".py":
+        try:
+            tree = ast.parse(content, filename=origin)
+        except (SyntaxError, ValueError) as exc:
+            raise EmitError(f"脚本无法编译：{origin} ({type(exc).__name__}: {exc})") from exc
+        for node in ast.walk(tree):
+            modules = ([item.name for item in node.names] if isinstance(node, ast.Import)
+                       else [node.module] if isinstance(node, ast.ImportFrom) else [])
+            names.update(f"{module}.py" for module in modules
+                         if module and module.isidentifier())
+    return names
+
+
+def sibling_guess_warnings(origin: str, content: bytes) -> list[str]:
+    """Flag sibling-file name guessing inside a packaged script.
+
+    A script that reads `Path(args.x).parent / "labels.csv"` reaches beside a
+    declared input instead of naming the file it needs on the command line.
+    Capture only sees the paths a step declares, and replay renames artifacts
+    to `node--file`, so the guessed name misses and reuse fails. A warning,
+    not a block: the same pattern also appears in scripts that only touch
+    their own products, which the bounded replay settles.
+    """
+    if PurePosixPath(origin).suffix != ".py":
+        return []
+    try:
+        tree = ast.parse(content, filename=origin)
+    except (SyntaxError, ValueError):
+        return []
+    hits = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "with_name"):
+            hits.add("with_name")
+        if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
+                and any(isinstance(part, ast.Attribute) and part.attr == "parent"
+                        for part in ast.walk(node.left))):
+            hits.add("parent / name")
+    if not hits:
+        return []
+    return [
+        f"脚本 `{origin}` 存在疑似兄弟文件路径拼接（{'、'.join(sorted(hits))}）。"
+        "静态检查不能确定它是输入依赖还是输出路径；请检查是否读取了未显式传入的文件。"
+        "若是输入依赖，请将文件作为命令行参数传入 run 步骤；llm/human/tool 步骤使用 input 声明。"
+        "图内产物回放时可能改名，不应依赖原来的兄弟文件名；仅创建输出目录无需修改。"
+    ]
 
 
 class EmitError(ValueError):
@@ -322,7 +374,7 @@ def artifact_ext(path: str) -> str | None:
     return f".{suffix}" if _SUFFIX.fullmatch(suffix) else None
 
 
-def _replace_tokens(command: str, mapping: Mapping[str, str]) -> str:
+def _replace_tokens(command: str, mapping: Mapping[str, str], *, require_all: bool = True) -> str:
     """Replace whole shell tokens, keeping the original quoting style intact."""
     text = command
     missing: list[str] = []
@@ -335,7 +387,7 @@ def _replace_tokens(command: str, mapping: Mapping[str, str]) -> str:
         text, count = pattern.subn(mapping[token], text)
         if not count:
             missing.append(token)
-    if missing:
+    if missing and require_all:
         raise EmitError(f"命令里找不到这些路径：{', '.join(missing)}；命令：{command}")
     return text
 
@@ -387,7 +439,6 @@ class _Plan:
         self.asset_id = asset_id or _slug(label, "capture", allow_digit=True)
         self.node_ids: dict[int, str] = {}
         self.outputs: dict[int, tuple[str, str, str]] = {}
-        self.linkable: dict[str, tuple[int, str, str, str]] = {}
         self.params: dict[str, str] = {}
         self.parameter_specs: dict[str, ParameterSpec] = {}
         self.scripts: dict[str, str] = {}
@@ -507,7 +558,9 @@ class _Plan:
         taken: dict[str, str] = {}
         queue: list[str] = []
         for order in self.node_ids:
-            for path in self.step(order).read_paths:
+            step = self.step(order)
+            verification = parse_command(step.verify).read_paths if step.verify else ()
+            for path in (*step.read_paths, *verification):
                 if role(path, writing=False) != ROLE_SCRIPT or path in self.scripts:
                     continue
                 self._plan_script(path, taken)
@@ -543,7 +596,7 @@ class _Plan:
                 if content is None:
                     continue
                 directory = PurePosixPath(origin).parent
-                names = set(_RUNTIME_REF.findall(content.decode("utf-8", "replace")))
+                names = _runtime_names(origin, content)
                 for name in sorted(names):
                     sibling = str(directory / name)
                     target = f"scripts/{name}"
@@ -581,17 +634,24 @@ class _Plan:
                 primary = step.write_paths[-1]
             if primary is not None:
                 key = self.keys.claim(_key_base(primary))
-                node_id = self.node_ids[order]
                 self.outputs[order] = (key, primary, output_type(primary))
-                self.linkable[self.file_of(primary)] = (
-                    order, node_id, key, output_type(primary))
             consumed.update(self.file_of(path) for path in step.read_paths)
 
     def _input_for(self, path: str, order: int) -> tuple[str, str, str]:
-        link = self.linkable.get(self.file_of(path))
-        if link is not None and link[0] < order:
-            _, node_id, key, type_name = link
-            return key, type_name, f"{node_id}.output.{key}"
+        for prior in sorted(self.node_ids, reverse=True):
+            if prior >= order:
+                continue
+            if not any(self.file_of(path) == self.file_of(written)
+                       for written in self.step(prior).write_paths):
+                continue
+            key, primary, type_name = self.outputs[prior]
+            if self.file_of(primary) != self.file_of(path):
+                raise EmitError(
+                    f"步骤 {prior} 的副产物 {path!r} 被步骤 {order} 消费；"
+                    "当前每个图节点只支持一个主 artifact，不能把副产物当根输入。"
+                    "请拆成单产物步骤，或将下游所需内容合并为一个文件后重新沉淀"
+                )
+            return key, type_name, f"{self.node_ids[prior]}.output.{key}"
         key = self.params.get(path)
         if key is None:
             key = self.keys.claim(_key_base(path))
@@ -657,6 +717,12 @@ class _Plan:
                 at = None
             else:
                 command = _replace_tokens(step.command, mapping)
+            unmapped = [path for path in extra if placeholder_key(path) and path in command]
+            if unmapped:
+                raise EmitError(
+                    f"节点 {self.node_ids[order]} 的副产物没有运行时绑定：{', '.join(unmapped)}；"
+                    "当前每个节点只有一个主 artifact。请拆分步骤或合并产物，"
+                    "不能把未替换的占位符当作文件名执行。")
             self.nodes.append(EmittedNode(
                 order=order,
                 id=self.node_ids[order],
@@ -668,7 +734,8 @@ class _Plan:
                 command=command,
                 extra_writes=extra,
                 kind=kind,
-                verify_command=step.verify or None,
+                verify_command=_replace_tokens(step.verify, {**self.scripts, **mapping},
+                                               require_all=False) if step.verify else None,
                 artifact_ext=ext,
                 artifact_at=at,
                 tool_name=step.tool_name if step.kind == KIND_TOOL else None,
@@ -710,8 +777,16 @@ class _Plan:
         names the file and the step's first resolvable input supplies the directory
         and suffix. Refusing to pin those (the previous behaviour) moved a manifest
         away from the images it names, and the failure only surfaced on the platform.
+
+        A report is the exception: it summarises its inputs and names no neighbour, so
+        pinning it beside the input only drags a run product into the caller's data
+        directory. That is how a captured `data/inputs/report.csv` became
+        `{input.input.dir}/report.csv` and every reuse dropped a tracking copy next to
+        the new batch while the deliverables went to the declared output directory.
         """
         if step.kind != KIND_SHELL:
+            return None
+        if role(self.file_of(primary), writing=True) == ROLE_REPORT:
             return None
         product = PurePosixPath(self.file_of(primary))
         if "{" in product.name or "}" in product.name:

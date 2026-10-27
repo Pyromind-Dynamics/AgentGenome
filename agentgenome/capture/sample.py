@@ -18,7 +18,9 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Collection, Mapping, Protocol, Sequence, runtime_checkable
+
+import yaml
 
 SAMPLE_BYTES = 32 * 1024
 TOTAL_BYTES = 512 * 1024
@@ -27,7 +29,7 @@ INDEX_NAME = "index.json"
 
 _TABLES = {".csv": ",", ".tsv": "\t"}
 _LINES = {".jsonl", ".ndjson"}
-_TEXT = {".txt", ".md", ".log", ".yaml", ".yml"}
+_TEXT = {".txt", ".md", ".log"}
 
 
 @runtime_checkable
@@ -61,6 +63,18 @@ def _directory(path: str) -> dict[str, Any]:
     return entry
 
 
+def _pending(path: str) -> dict[str, Any]:
+    """A declared output location: absent before the run, created by it.
+
+    Sampling every root parameter as an input made a fresh output directory look
+    like a broken input (`FileNotFoundError`), which then suppressed the replay
+    baseline on every reuse. An output the run creates is evidence of nothing yet.
+    """
+    entry = _blank(path, "输出路径，运行后创建")
+    entry["format"] = "pending"
+    return entry
+
+
 def _detect(path: str, text: str) -> tuple[str, str]:
     """The file's format and, for tables, the delimiter it uses."""
     suffix = PurePosixPath(path).suffix.lower()
@@ -70,6 +84,8 @@ def _detect(path: str, text: str) -> tuple[str, str]:
         return "jsonl", ""
     if suffix == ".json":
         return "json", ""
+    if suffix in {".yaml", ".yml"}:
+        return "yaml", ""
     if suffix in _TEXT:
         return "text", ""
     first = next((line for line in text.splitlines() if line.strip()), "")
@@ -100,10 +116,10 @@ def _shape(fmt: str, text: str, delimiter: str) -> tuple[dict[str, Any], int | N
                     if key not in fields:
                         fields.append(key)
         return {"fields": fields}, records
-    if fmt == "json":
+    if fmt in {"json", "yaml"}:
         try:
-            value = json.loads(text)
-        except ValueError:
+            value = json.loads(text) if fmt == "json" else yaml.safe_load(text)
+        except (ValueError, yaml.YAMLError):
             return {"complete": False}, 0
         if isinstance(value, list):
             first = value[0] if value and isinstance(value[0], dict) else {}
@@ -145,8 +161,13 @@ def inspect(source: Any, path: str, limit: int = SAMPLE_BYTES) -> dict[str, Any]
         if cut >= 0:
             text = text[: cut + 1]
     fmt, delimiter = _detect(path, text)
+    # A bounded read can contain the entire file even when its preview is shorter.
+    # Count that complete input before reducing the stored preview to ROWS.
+    complete_rows = _shape(fmt, text, delimiter)[1] if not truncated else None
     text = _trim(fmt, text)
     schema, rows = _shape(fmt, text, delimiter)
+    if not truncated:
+        rows = complete_rows
     entry.update(format=fmt, schema=schema, rows=rows, text=text)
     return entry
 
@@ -160,14 +181,26 @@ def _name(key: str, path: str) -> str:
 
 
 def sample_inputs(source: Any, bound: Mapping[str, Any], directory: Path,
-                  *, budget: int = TOTAL_BYTES) -> dict[str, Any]:
-    """Sample every root input into ``directory`` and index what was kept."""
+                  *, budget: int = TOTAL_BYTES,
+                  optional: Collection[str] = ()) -> dict[str, Any]:
+    """Sample every root input into ``directory`` and index what was kept.
+
+    ``optional`` names the parameters a node writes to (an output directory). A
+    destination is never an input: whatever sits there now is the previous batch's
+    product, so it is recorded as pending and never kept as a fixture — an output
+    directory that already exists would otherwise block the baseline.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     files: list[dict[str, Any]] = []
     used = 0
     for key in sorted(bound):
         value = bound[key]
         if not isinstance(value, str) or not value:
+            continue
+        if key in optional:
+            entry = _pending(value)
+            entry.pop("text", None)
+            files.append({"key": key, "name": None, **entry})
             continue
         remaining = budget - used
         if remaining <= 0:
@@ -187,6 +220,8 @@ def sample_inputs(source: Any, bound: Mapping[str, Any], directory: Path,
         "directory": str(directory),
         "index": str(directory / INDEX_NAME),
         "files": files,
+        "pending": sorted(entry["key"] for entry in files
+                           if entry.get("format") == "pending"),
         "budget": {"per_file": SAMPLE_BYTES, "total": budget, "used": used},
     }
     (directory / INDEX_NAME).write_text(
@@ -217,11 +252,14 @@ def compatibility(index: Mapping[str, Any] | None, contract: Mapping[str, Any] |
         declared = (contract or {}).get(key)
         declared = declared if isinstance(declared, Mapping) else {}
         actual_format = str(actual.get("format"))
-        if actual_format in {"unavailable", "binary", "dir"}:
+        if actual_format in {"unavailable", "binary", "dir", "pending"}:
             warnings.append(f"{key}：输入无法取样（{actual.get('note')}），未做契约校验")
             continue
         expected = str(declared.get("format") or (captured.get(key) or {}).get("format") or "")
-        if expected and actual_format != expected.lower():
+        expected_format = "yaml" if expected.lower() == "yml" else expected.lower()
+        # Earlier captures classified YAML as text; retain those valid contracts.
+        legacy_text = expected_format == "text" and actual_format == "yaml"
+        if expected and actual_format != expected_format and not legacy_text:
             problems.append(f"{key}：期望 {expected}，实际 {actual_format}（{actual.get('path')}）")
             continue
         seen = set(fields(actual))

@@ -7,6 +7,7 @@ unreferenced work, and leaves only genuine ambiguities for later semantic review
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
@@ -23,6 +24,7 @@ from .trace import (
     ROLE_SCRIPT,
     Step,
     Trace,
+    agent_write_inputs,
     parse_command,
     placeholder_key,
     probe_command,
@@ -36,8 +38,9 @@ _PATH_TOKEN = re.compile(
 _PATH_NOISE = "\"'`()[]{}<>.,;:，。；：、"
 _CARDINALITY = re.compile(r"(?:^|_)(\d{1,3})(?=_|$)")
 _HUMAN_HANDOFF = re.compile(
-    r"(复核|导出|标注|打完|弄好|改好|人工|手工|"
-    r"label\s*studio|reviewed|exported|handoff)",
+    r"(?:复核|标注|审核)(?:完(?:了)?|已?完成)|"
+    r"已(?:经)?(?:完成)?(?:复核|标注|审核|导出)|导出(?:了|的)|交回|"
+    r"\b(?:reviewed|exported|handoff)\b",
     re.IGNORECASE,
 )
 _MUTATING_TOOL = re.compile(
@@ -445,6 +448,28 @@ def _all_actions(traces: Sequence[Trace]) -> tuple[list[_Action], list[str], lis
                 )
                 continue
             if step.kind == KIND_WRITE and step.write_paths:
+                observed = agent_write_inputs(step)
+                if observed and len(step.write_paths) == 1 and all(role(path, writing=True) != ROLE_SCRIPT
+                                    for path in step.write_paths):
+                    context = step.agent_context
+                    prompt = (f"任务：{context['instruction']}\n"
+                              f"原执行意图：{context['intent']}\n"
+                              f"输入：{', '.join(observed)}\n"
+                              f"重新执行任务，将结果写入：{', '.join(step.write_paths)}")
+                    note = (f"`{source}` 的 write 来源待分类：用户已作决定用 human；"
+                            "模型独立判断用 llm 并填写 origin_reason；混合来源应拆分。"
+                            "依据原始用户指令和执行意图说明，不能只看写入内容。")
+                    actions.append(_Action(
+                        index=index, source=trace.trace_id, seq=step.seq,
+                        kind="llm", reads=observed, writes=step.write_paths,
+                        payload={"llm": prompt, "input": list(observed),
+                                 "output": step.write_paths[0], "from": source,
+                                 "verify": " && ".join(
+                                     f"test -s {shlex.quote(path)}"
+                                     for path in step.write_paths)}, ambiguity=note))
+                    ambiguities.append(note)
+                    index += 1
+                    continue
                 for path in step.write_paths:
                     if role(path, writing=True) == ROLE_SCRIPT:
                         continue
@@ -467,6 +492,15 @@ def _infer_final(
         if not action.generated_output
         and role(path, writing=True) != ROLE_SCRIPT
     ]
+    if not outputs:
+        # A session can end on a dictated write: no mechanical step produces a
+        # data artifact, and the person's handback is the chain's product.
+        outputs = [
+            (action.index, path)
+            for action in humans.values()
+            for path in action.writes
+            if role(path, writing=True) != ROLE_SCRIPT
+        ]
     if not outputs:
         inferred = None
         inferred_note = "没有从 trace 识别出可执行的最终产物"

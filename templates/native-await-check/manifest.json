@@ -1,0 +1,7 @@
+{
+  "id": "native-await-check", "version": "1.0.0", "name": "原生异步等待验证",
+  "description": "真实 Pi 工具启动后台进程并立即返回受理单，await 自动取得最终文件。",
+  "requires": ["tool", "await"],
+  "parameters": {"output_dir": {"type": "string", "description": "尚不存在的绝对测试目录"}},
+  "outputs": {"product": "后台任务的真实结果"}
+}

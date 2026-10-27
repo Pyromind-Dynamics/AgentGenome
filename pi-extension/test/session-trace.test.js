@@ -38,6 +38,62 @@ function result(id, toolCallId, text, { isError = false, timestamp = "2026-01-01
       content: [{ type: "text", text }], isError, timestamp } };
 }
 
+test("writer task provenance records observed inputs and omits thinking and literal output", () => {
+  const entries = [user("u", "Summarize data/source.txt"),
+    assistant("a", [call("read", "read", { path: "data/source.txt" })]),
+    result("r", "read", "input contents"),
+    assistant("b", [{ type: "thinking", thinking: "private reasoning" },
+      { type: "text", text: "I will summarize the document." },
+      call("write", "write", { path: "out/summary.md", content: "LITERAL ANSWER" })]),
+    result("w", "write", "written")];
+  const step = traceSteps(entries, 400, { complete: true }).steps.at(-1);
+  assert.deepEqual(step.agent_context.inputs, ["data/source.txt"]);
+  assert.equal(step.agent_context.complete, true);
+  assert.equal(step.agent_context.instruction, "Summarize data/source.txt");
+  assert.equal(JSON.stringify(step.agent_context).includes("private reasoning"), false);
+  assert.equal(JSON.stringify(step.agent_context).includes("LITERAL ANSWER"), false);
+  const changedTask = [...entries, user("new", "Create something else"),
+    assistant("c", [{ type: "text", text: "New task." }, call("next", "write", { path: "out/next.md" })])];
+  assert.deepEqual(traceSteps(changedTask).steps.at(-1).agent_context.inputs, []);
+});
+
+function writeStep(instruction, content, extra = []) {
+  const entries = [user("u", instruction),
+    ...extra,
+    assistant("b", [{ type: "text", text: "Record the task result." },
+      call("write", "write", { path: "out/decisions.json", content })]),
+    result("w", "write", "written")];
+  return traceSteps(entries, 400, { complete: true }).steps.at(-1);
+}
+
+test("writer content never determines whether the user or model decided it", () => {
+  const cases = [
+    ["For records 101 and 102 choose keep or reject", '[{"id":101,"decision":"keep"}]'],
+    ["For every row my decision is approve", '[{"id":101,"decision":"approve"}]'],
+    ["I approve; record my decision", '["approve"]'],
+    ["Keep item 1 and classify the rest", '[{"id":1,"decision":"keep"},{"summary":"spam"}]'],
+  ];
+  for (const [instruction, content] of cases) {
+    const step = writeStep(instruction, content);
+    assert.equal(step.agent_context.instruction, instruction);
+    assert.equal(step.agent_context.origin, undefined);
+    assert.equal(JSON.stringify(step.agent_context).includes(content), false);
+  }
+});
+
+test("writer context retains clipping and missing-content evidence", () => {
+  const clipped = writeStep(`${"review ".repeat(500)}keep item 1`, '{"1": "keep"}');
+  assert.equal(clipped.agent_context.complete, false);
+  assert.equal(clipped.agent_context.origin, undefined);
+  const entries = [user("u", "Save my decisions to out/decisions.json."),
+    assistant("b", [{ type: "text", text: "Record them." },
+      call("write", "write", { path: "out/decisions.json" })]),
+    result("w", "write", "written")];
+  assert.equal(traceSteps(entries, 400, { complete: true }).steps.at(-1).agent_context.origin, undefined);
+  const empty = writeStep("Save my decisions to out/decisions.json.", "");
+  assert.equal(empty.agent_context.origin, undefined);
+});
+
 function session(id, timestamp = "2026-01-01T00:00:00Z") {
   return { type: "session", id, timestamp, cwd: "/workspace" };
 }
@@ -320,4 +376,50 @@ test("exportTraces writes each trace under the workspace and returns file refere
   assert.equal(written.trace_id, "picked");
   assert.equal(written.steps[1].tool, "bash");
   assert.equal((await stat(join(dir, refs[0].path))).mode & 0o777, 0o600);
+});
+
+function otherSession(dir) {
+  return { cwd: dir, sessionManager: {
+    getSessionId: () => "current", getSessionFile: () => join(dir, "current.jsonl"),
+    getSessionDir: () => dir, getSessionName: () => "当前会话",
+    getEntries: () => [session("current"), user("u2", "清洗")],
+  } };
+}
+
+test("exportTraces resolves a session id that Pi stored with a timestamp prefix", async () => {
+  const dir = await workspace();
+  const stored = join(dir, "2026-10-26T14-34-44-946Z_task-a.jsonl");
+  await writeFile(stored, [
+    JSON.stringify(session("task-a")),
+    JSON.stringify(user("u1", "预打标")),
+    JSON.stringify(assistant("a1", [call("c1", "bash", { command: "python label.py" })])),
+    JSON.stringify(result("r1", "c1", "ok")),
+  ].join("\n"));
+  const ctx = otherSession(dir);
+  const sessions = await listSessions(ctx);
+  assert.equal(sessions[1].trace_id, "task-a");
+  const [ref] = await exportTraces(ctx, ["task-a"], { complete: true });
+  assert.equal(ref.trace_id, "task-a");
+  assert.equal(ref.step_count, 2);
+  const trace = JSON.parse(await readFile(join(dir, ref.path), "utf8"));
+  assert.equal(trace.steps[1].args.command, "python label.py");
+});
+
+test("exportTraces falls back to the session header when the file name carries no id", async () => {
+  const dir = await workspace();
+  await writeFile(join(dir, "renamed.jsonl"), [
+    JSON.stringify(session("archived")),
+    JSON.stringify(user("u1", "清洗")),
+  ].join("\n"));
+  const [ref] = await exportTraces(otherSession(dir), ["archived"]);
+  assert.equal(ref.trace_id, "archived");
+  assert.equal(ref.step_count, 1);
+});
+
+test("exportTraces names the available sessions instead of raising ENOENT", async () => {
+  const dir = await workspace();
+  await writeFile(join(dir, "2026-10-26T14-34-44-946Z_task-a.jsonl"),
+    JSON.stringify(session("task-a")));
+  await assert.rejects(() => exportTraces(otherSession(dir), ["typo"]),
+    /找不到会话 typo：.*可用会话：2026-10-26T14-34-44-946Z_task-a/);
 });

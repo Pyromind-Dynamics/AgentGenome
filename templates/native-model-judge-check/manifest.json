@@ -1,0 +1,14 @@
+{
+  "id": "native-model-judge-check",
+  "version": "1.0.0",
+  "name": "原生 Pi 模型验收验证",
+  "description": "仅依赖 model_judge：按冻结事实核验报告的准确性与完整性。",
+  "requires": ["model_judge"],
+  "parameters": {"summary": {"type": "string", "description": "待验收的报告"}},
+  "outputs": {"report": "通过固定标准验收的报告"},
+  "revision": {
+    "safe_to_rerun": true,
+    "editable_scripts": ["scripts/report.py"],
+    "verification_resources": ["scripts/judge.py", "prompts/criterion.txt"]
+  }
+}

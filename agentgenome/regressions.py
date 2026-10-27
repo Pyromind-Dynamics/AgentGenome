@@ -42,6 +42,11 @@ def validate_cases(cases):
         for value in case['params'].values():
             if isinstance(value, str) and value.startswith('fixture:') and value[8:] not in case['files']:
                 raise ValueError('unknown fixture reference')
+            if isinstance(value, str) and value.startswith('output:'):
+                name = value[7:]
+                path = PurePosixPath(name)
+                if not name or path.is_absolute() or '..' in path.parts or str(path) != name or name == '.':
+                    raise ValueError('output reference requires a relative path')
         if not isinstance(case['assertions'], list) or not case['assertions']:
             raise ValueError('each case requires expected output assertions')
         for assertion in case['assertions']:
@@ -79,6 +84,7 @@ class Regressions:
 
     def execute_case(self, package, case, host, cancel, emit, check_cancel, evidence, original=None, agent_task=None):
         check_cancel()
+        validate_cases([case])
         graph = compile(package)
         manifest = json.loads((package / 'manifest.json').read_text())
         params = self.service.validate_params(manifest, case['params'])
@@ -93,11 +99,23 @@ class Regressions:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
         fixtures = {k: v[8:] for k, v in params.items() if isinstance(v, str) and v.startswith('fixture:')}
-        plain = {k: v for k, v in params.items() if k not in fixtures}
+        outputs = {k: v[7:] for k, v in params.items() if isinstance(v, str) and v.startswith('output:')}
+        if any(manifest['parameters'][key]['type'] != 'path' for key in outputs):
+            raise ValueError('output references require path parameters')
+        if outputs:
+            output_root = staged / '.regression-outputs'
+            if output_root.exists():
+                raise ValueError('reserved regression output directory exists in asset')
+            for name in outputs.values():
+                (output_root / name).parent.mkdir(parents=True, exist_ok=True)
+        plain = {k: v for k, v in params.items() if k not in fixtures and k not in outputs}
         path_params = [k for k, spec in manifest['parameters'].items() if spec['type'] == 'path' and k in plain]
         ports, resolved = host.prepare(uuid4().hex, staged, plain, path_params, cancel, emit,
                                        **({'verification_package': original} if original else {}))
         resolved.update({k: str(ports.cwd / '.regression-inputs' / name) for k, name in fixtures.items()})
+        # Output locations are fresh paths in this case's execution workspace.
+        # Do not resolve them against business data or require them to exist.
+        resolved.update({k: str(ports.cwd / '.regression-outputs' / name) for k, name in outputs.items()})
         ports = replace(ports, check_cancel=check_cancel, on_event=emit, agent_task=agent_task)
         if handshake(graph, ports):
             raise RegressionFailure('host lacks capabilities required by regression graph')

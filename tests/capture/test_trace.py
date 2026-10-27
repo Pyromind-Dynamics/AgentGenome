@@ -77,6 +77,14 @@ def test_parse_command_reads_redirections_and_flags():
     assert command.writes == (ROLE_MODEL,)
 
 
+@pytest.mark.parametrize("flag", ["--outdir", "--output-dir", "--output_dir"])
+def test_parse_command_treats_output_directory_as_a_root_path_parameter(flag):
+    command = parse_command(f"python3 scripts/process.py --input data/raw.csv {flag} {{output_dir}} --output out/result.csv")
+    assert "{output_dir}" in command.read_paths
+    assert "{output_dir}" not in command.write_paths
+    assert "out/result.csv" in command.write_paths
+
+
 def test_parse_command_marks_inline_code_and_heredocs():
     assert parse_command("python3 -c \"print(1)\"").shape == f"python3 -c <inline>"
     heredoc = parse_command("cat > scripts/clean.py <<'PY'\nprint('clean')\nPY")
@@ -147,6 +155,43 @@ def test_parse_command_gives_every_line_its_own_head():
         "rm -f out/filtered.csv out/report.json; timeout 900 python3 "
         ".agents/skills/data/run.py --pipeline scripts/filter.py --input data/raw.csv "
         "--output out/filtered.csv 2>&1 | tail -25").shape == command.shape
+
+
+@pytest.mark.parametrize('command,reads,writes', [
+    # `||` 右侧只在左侧失败后才运行：左侧的写入不保证存在，同名文件必须保留为输入。
+    ('python3 fail.py --out data/existing.json '
+     '|| python3 fallback.py --input data/existing.json --out out/result.json',
+     ('fail.py', 'fallback.py', 'data/existing.json'), ('data/existing.json', 'out/result.json')),
+    # 管道两侧同时启动：路径同名不证明先写后读，数据流走的是 stdout。
+    ('python3 producer.py --out data/existing.json '
+     '| python3 consumer.py --input data/existing.json --out out/result.json',
+     ('producer.py', 'consumer.py', 'data/existing.json'), ('data/existing.json', 'out/result.json')),
+    # 后台执行与前段之间没有完成顺序保证。
+    ('python3 producer.py --out data/existing.json & python3 consumer.py --input data/existing.json',
+     ('producer.py', 'consumer.py', 'data/existing.json'), ('data/existing.json',)),
+    # `;` 只保证先后执行、不保证前段成功，保守保留输入。
+    ('python3 producer.py --out data/existing.json; python3 consumer.py --input data/existing.json',
+     ('producer.py', 'consumer.py', 'data/existing.json'), ('data/existing.json',)),
+    # 管道退出码是最后一个成员的：`&&` 之后只信任管道尾部的产出。
+    ('python3 gen.py --out out/a.json | python3 fix.py --out out/b.json '
+     '&& python3 use.py --input out/a.json --out out/c.json',
+     ('gen.py', 'fix.py', 'use.py', 'out/a.json'),
+     ('out/a.json', 'out/b.json', 'out/c.json')),
+])
+def test_parse_command_keeps_reads_the_order_does_not_guarantee(command, reads, writes):
+    parsed = parse_command(command)
+    assert parsed.read_paths == reads
+    assert parsed.write_paths == writes
+
+
+def test_parse_command_still_drops_readbacks_after_guaranteed_producers():
+    # `&&` 链上左段成功才会运行右段：先产出再预览不是自依赖。
+    parsed = parse_command('python3 gen.py --out out/a.json && head -3 out/a.json')
+    assert parsed.read_paths == ('gen.py',)
+    # 同一简单命令内的原地读写仍要暴露给后续校验。
+    parsed = parse_command('python3 gen.py --input out/a.json --out out/a.json')
+    assert parsed.read_paths == ('gen.py', 'out/a.json')
+    assert parsed.write_paths == ('out/a.json',)
 
 
 def test_parse_command_treats_brace_tokens_as_parameters():

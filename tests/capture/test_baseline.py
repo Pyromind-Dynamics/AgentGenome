@@ -196,3 +196,71 @@ def test_the_captured_baseline_fails_a_package_that_moves_an_artifact(
     result = service.execute("conv-1", child["id"], revision_host, lambda event: None)
     assert result["status"] == "failed"
     assert "does not match expected hash" in result["result"]["error"]
+
+
+def test_a_pending_output_parameter_still_yields_a_baseline(tmp_path):
+    """输出目录在采集时不存在是常态：它没有 fixture，但不能因此取消整条基线。"""
+    data = {
+        "directory": str(sampled(tmp_path)),
+        "files": [
+            {"key": "raw", "name": "raw.csv", "format": "csv",
+             "truncated": False, "rows": 2},
+            {"key": "out", "name": None, "format": "pending",
+             "truncated": False},
+        ],
+    }
+    result = derive("capture-abcdef", data, package(tmp_path, ("raw", "out")),
+                    completed(("clean", digest("a"))))
+    assert result["ready"] is True
+    assert result["cases"][0]["params"] == {
+        "raw": "fixture:inputs/raw.csv", "out": "output:out"}
+
+
+def test_pending_output_baseline_executes_in_an_isolated_directory(service, host, pipeline_workspace, tmp_path):
+    import hashlib
+    from threading import Event
+    from agentgenome.capture.distill import distill
+    from agentgenome.capture.pipeline import _output_params
+    from agentgenome.capture.sample import sample_inputs
+
+    pipeline_workspace.write("scripts/produce.py", '''import argparse
+from pathlib import Path
+p = argparse.ArgumentParser()
+p.add_argument('--input')
+p.add_argument('--output-dir')
+a = p.parse_args()
+out = Path(a.output_dir)
+assert not out.exists(), 'regression output must be fresh'
+out.mkdir(parents=True)
+text = Path(a.input).read_text()
+(out / 'copy.csv').write_text(text)
+print(text, end='')
+''')
+    plan = distill(service, label="isolated output", workspace=host,
+                   steps=[{"run": "python3 scripts/produce.py --input {raw} --output-dir {out} > reports/result.txt"}],
+                   params={"raw": "data/raw.csv", "out": "business-output"},
+                   final_artifact="reports/result.txt")
+    text = (pipeline_workspace.root / "data/raw.csv").read_text()
+    optional = _output_params(plan.package)
+    assert optional == {"out"}
+    sampled_inputs = sample_inputs(host, dict(plan.bound), tmp_path / "samples", optional=optional)
+    assert sampled_inputs["pending"] == ["out"]
+    node = plan.package.nodes[0]
+    result = derive("isolated", sampled_inputs, plan.package.directory, [{"node": f"{plan.package.root_id}.{node.id}",
+                                  "outputs": {node.output[0]: {"sha256": hashlib.sha256(text.encode()).hexdigest()}}}])
+    assert result["ready"]
+    case = result["cases"][0]
+    for attempt in range(2):
+        service.regressions.execute_case(plan.package.directory, case, host, Event(),
+                                         lambda _: None, lambda: None, tmp_path / f"evidence-{attempt}")
+    assert not (pipeline_workspace.root / "business-output").exists()
+    copies = list((service.root / "runs").glob("*/work/package/.regression-outputs/out/copy.csv"))
+    assert len(copies) == 2
+    assert all(path.read_text() == text for path in copies)
+
+
+@pytest.mark.parametrize("reference", ["output:", "output:../escape", "output:/absolute", "output:."])
+def test_regression_output_references_cannot_escape_the_case(reference):
+    with pytest.raises(ValueError, match="output reference"):
+        validate_cases([{"id": "bad", "files": {}, "params": {"out": reference},
+                         "assertions": [{"node": "n", "output": "o", "kind": "text", "expected": "x"}]}])

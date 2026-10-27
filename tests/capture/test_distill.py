@@ -435,6 +435,7 @@ def test_distill_plan_has_a_structural_review_for_the_user(
     review = plan["review"]
     assert set(plan) == {
         "plan_id",
+        "revision",
         "digest",
         "status",
         "requires_confirmation",
@@ -572,12 +573,14 @@ def test_confirm_accepts_the_dashed_spelling_of_a_plan_id(
     """把 plan_id 抄成带连字符的 UUID，不该变成"计划不存在"。
 
     计划 id 存的是裸 hex，人手抄一遍很容易写成 8-4-4-4-12；两种写法指的是同一行。
+    确认必须同时带当前 digest：绑定的是用户看过的那一版。
     """
     plan = prepare(service, distill_args(), host=host)
     raw = plan["plan_id"]
     dashed = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
     result = invoke(
-        service, "conv-1", "confirm_distill", {"plan_id": dashed}, "confirm-dash", host=host
+        service, "conv-1", "confirm_distill",
+        {"plan_id": dashed, "digest": plan["digest"]}, "confirm-dash", host=host
     )
     assert result["distill_plan"]["plan_id"] == raw
 
@@ -1853,7 +1856,8 @@ def test_distill_rejects_the_platform_chain_that_skipped_the_wait(
         {"tool": "label_studio_project",
          "args": {"operation": "create", "dataset_path": "{review}"},
          "output": "out/project.json", "keep": True},
-        {"human": "复核 {review} 并导出到 out/export.json", "output": "out/export.json"},
+        {"human": "复核 {review} 并导出到 out/export.json", "input": ["{review}"],
+         "output": "out/export.json"},
         {"run": "python3 scripts/to_sft.py out/export.json out/sft.jsonl",
          "output": "out/sft.jsonl"},
     ]
@@ -2201,6 +2205,76 @@ def test_distill_rejects_an_llm_prompt_that_drops_its_declared_paths(
             "params": {"data_file": "data/raw.csv"}}, "call-1", host=host)
 
 
+def test_plan_steps_rejects_an_llm_token_that_is_not_declared():
+    """A verify-only `{r}` has no input slot: emit would compile it to a literal."""
+    with pytest.raises(DistillError, match="未声明的占位符"):
+        plan_steps([{"llm": "按 {r} 为 {c} 逐条打标，写 {l}", "output": "{l}",
+                     "verify": "python3 scripts/verify_labels.py "
+                               "--labels {l} --cleaned {c} --label-rules {r}"}])
+
+
+def test_plan_steps_rejects_a_human_prompt_token_that_is_not_declared():
+    with pytest.raises(DistillError, match="未声明的占位符"):
+        plan_steps([{"human": "复核 {q} 并把决定写到 {dec}", "output": "{dec}"}])
+
+
+def test_plan_steps_rejects_a_run_verify_token_off_the_command_line():
+    with pytest.raises(DistillError, match="未声明的占位符"):
+        plan_steps([{"run": "python3 scripts/build.py --in data/raw.csv --out out/r.json",
+                     "verify": "python3 scripts/check.py --rules {r}"}])
+
+
+def test_plan_steps_accepts_an_llm_step_whose_tokens_are_all_declared():
+    steps = plan_steps([{"llm": "按 {r} 为 {c} 逐条打标，写 {l}", "input": ["{c}", "{r}"],
+                         "output": "{l}",
+                         "verify": "python3 scripts/verify_labels.py "
+                                   "--labels {l} --cleaned {c} --label-rules {r}"}])
+    assert steps[0].reads == ("{c}", "{r}")
+    assert steps[0].verify is not None
+
+
+def test_plan_steps_leaves_engine_refs_in_a_run_verify_alone():
+    steps = plan_steps([{"run": "python3 scripts/build.py --out out/r.json",
+                         "verify": "test -s {output.r}"}])
+    assert steps[0].verify == "test -s {output.r}"
+
+
+def test_freezing_a_script_token_rewrites_the_verify_too(pipeline_workspace, host):
+    from agentgenome.capture import distill as distill_module
+    pipeline_workspace.write("scripts/prep.py", "print('prep')\n")
+    planned = plan_steps([{"run": "python3 {prep} --in data/raw.csv --out out/p.jsonl",
+                           "verify": "python3 {prep} --selfcheck"}])
+    rewritten, _, materialized, _ = distill_module._materialize_scripts(
+        planned, {"prep": "scripts/prep.py"}, host)
+    assert materialized == (("prep", "scripts/prep.py"),)
+    assert "scripts/prep.py" in rewritten[0].run
+    assert rewritten[0].verify == "python3 scripts/prep.py --selfcheck"
+
+
+def test_draft_distill_flags_a_params_key_no_step_produces(service, host, trace_factory,
+                                                            tool_entry):
+    """`--reviewed {rev}` parses as a read: a params key nobody writes must be flagged.
+
+    Live failure: the phantom root input passed replay (no existence check) and only
+    broke at reuse compatibility, so the review the operator confirms has to name it.
+    """
+    trace = trace_factory([
+        tool_entry("c1", "python3 scripts/build_report.py --cleaned data/clean.csv "
+                         "--labels data/labels.csv --reviewed {rev} --report out/rep.json"),
+    ], trace_id="s1")
+    draft = draft_distill(
+        label="x",
+        steps=[{"run": "python3 scripts/build_report.py --cleaned {cleaned} "
+                        "--labels {labels} --reviewed {rev} --report {rep}",
+                "output": "{rep}"}],
+        workspace=host, final_artifact="{rep}",
+        params={"cleaned": "data/clean.csv", "labels": "data/labels.csv",
+                "rev": "out/reviewed.csv", "rep": "out/rep.json"},
+        input_contract={"cleaned": {"type": "path"}, "labels": {"type": "path"}},
+        traces=[trace])
+    assert any("rev" in item and "幽灵根输入" in item for item in draft.unresolved)
+
+
 def test_distill_rejects_a_fixed_command_declared_as_llm(
         service, host, pipeline_workspace, trace_factory, tool_entry):
     trace = trace_factory([
@@ -2236,6 +2310,7 @@ def test_distill_rejects_an_llm_step_without_a_from_link(
                 final_artifact="reports/metrics.json",
                 params={"data_file": "data/raw.csv"}, traces=[trace])
     assert "s1:0" in str(error.value)
+    assert "policy=adaptive-first" in str(error.value)
 
 
 def test_distill_accepts_an_llm_step_without_a_from_link_under_adaptive_policy(
@@ -2449,7 +2524,8 @@ def test_confirm_keeps_a_placeholder_final_artifact_as_the_output(
         "trace_refs": [{"trace_id": "s1", "path": trace_path}],
         **MINIMAL_VALIDATION,
     }
-    arguments["validation_params"] = dict(arguments["params"])
+    # Validation overrides name root inputs; sft_jsonl is an output binding.
+    arguments["validation_params"] = {"review": "out/review.jsonl"}
 
     plan = prepare(service, arguments, host=host)
     assert plan["blocking_issues"] == []
@@ -2558,11 +2634,22 @@ def test_validation_params_override_instead_of_replacing():
 
     assert _replay_params(plan, {"records": 3}) == {
         "manifest": "storage/x/m.jsonl", "records": 3}
-    # A key the plan never bound is not invented as a replay parameter.
-    assert _replay_params(plan, {"unknown": 1}) == {
-        "manifest": "storage/x/m.jsonl", "records": 10}
+    # A misspelled validation override must not silently replay the original input.
+    with pytest.raises(ValueError, match="validation_params.*unknown"):
+        _replay_params(plan, {"unknown": 1})
     assert _replay_params(plan, None) == {
         "manifest": "storage/x/m.jsonl", "records": 10}
+
+
+def test_unknown_validation_parameter_blocks_plan_before_confirmation(
+        service, host, pipeline_workspace):
+    plan = prepare(service, distill_args(
+        validation_params={"data_file": "data/raw2.csv"}), host=host)
+    assert plan["review"]["validation"]["ready"] is False
+    assert any("validation_params" in issue and "data_file" in issue
+               for issue in plan["blocking_issues"])
+    with pytest.raises(ValueError, match="blocking issues"):
+        confirm(service, plan, host)
 
 
 def test_a_template_path_is_rejected_with_a_way_out():
@@ -2627,3 +2714,74 @@ def test_plan_review_reports_template_paths_as_one_rule(pipeline_workspace):
     assert "第 1、2、3 步" in issues[0]
     assert "3 个路径" in issues[0]
     assert review["validation"]["ready"] is False
+
+
+def test_a_revision_inherits_the_trace_that_verified_it(
+        service, host, pipeline_workspace, trace_refs):
+    """修订只提交变化的部分，但来源轨迹不是可变参数：丢了它就等于没校验。"""
+    refs = trace_refs({"trace_id": "s1"})
+    first = prepare(service, distill_args(trace_refs=refs, source_traces=["s1"],
+                                          policy="adaptive-first"), "call-1", host)
+    assert first["review"]["source_traces"] == ["s1"]
+
+    revised = prepare(
+        service,
+        distill_args(plan_id=first["plan_id"], digest=first["digest"],
+                     policy="adaptive-first"),
+        "call-2", host,
+    )
+    assert revised["review"]["source_traces"] == ["s1"]
+    stored = service.distill_plans.get("conv-1", revised["plan_id"])["arguments"]
+    assert stored["source_traces"] == ["s1"]
+
+
+def test_adaptive_policy_needs_a_trace_unless_it_is_explicitly_accepted(
+        service, host, pipeline_workspace):
+    """adaptive-first 免除逐条 from 核对，导出的轨迹就是唯一的完整性证据。"""
+    with pytest.raises(ValueError, match="adaptive-first"):
+        prepare(service, distill_args(policy="adaptive-first"), "call-1", host)
+
+    accepted = prepare(service, distill_args(policy="adaptive-first",
+                                             allow_unverified=True), "call-2", host)
+    assert accepted["review"]["source_traces"] == []
+
+
+@pytest.mark.parametrize("policy", ["scripts-first", "adaptive-first"])
+def test_report_never_claims_source_checks_without_exported_traces(service, host, pipeline_workspace, policy):
+    plan = distill(service, label="unverified", steps=CHAIN, workspace=host,
+                   final_artifact=FINAL, policy=policy)
+    report = plan.report_path.read_text()
+    assert "链路完整性：未校验" in report
+    assert "按每步 from 核对" not in report
+    assert plan.payload()["chain"]["checked"] is False
+
+
+def test_plan_steps_append_a_truncation_hint_when_many_fields_go_missing():
+    with pytest.raises(DistillError) as error:
+        plan_steps([{"from": "t:1"}, {"from": "t:2"}])
+    message = str(error.value)
+    assert "沉淀校验发现 2 个问题" in message
+    assert "仅凭缺失项不能判断载荷是否被截断" in message
+    assert "当前 digest 和完整修正参数" in message
+    assert "不支持分批合并" in message
+
+
+def test_plan_steps_truncation_hint_stays_quiet_for_a_single_missing_problem():
+    with pytest.raises(DistillError) as error:
+        plan_steps([{"from": "t:1"}])
+    assert "仅凭缺失项" not in str(error.value)
+
+
+@pytest.mark.parametrize("use_binding", [False, True])
+def test_preparation_warns_about_packaged_helpers_and_bound_scripts(service, host, pipeline_workspace, use_binding):
+    pipeline_workspace.write("scripts/helpers.py", "from pathlib import Path\ndef labels(p): return Path(p).with_name('labels.csv')\n")
+    pipeline_workspace.write("scripts/sibling.py", "import helpers, sys\nprint(helpers.labels(sys.argv[1]))\n")
+    command = "python3 {script} {raw} > reports/result.txt" if use_binding else "python3 scripts/sibling.py {raw} > reports/result.txt"
+    params = {"raw": "data/raw.csv", **({"script": "scripts/sibling.py"} if use_binding else {})}
+    plan = prepare(service, {"label": "sibling warning", "steps": [{"run": command}],
+                             "final_artifact": "reports/result.txt", "params": params}, host=host)
+    warnings = plan["review"]["warnings"]
+    assert any("helpers.py" in warning and "疑似" in warning for warning in warnings)
+    assert "sibling_name_guesses" in plan["review"]["planning_preflight"]["checked"]
+    assert not plan["review"]["blocking_issues"]
+    assert plan["review"]["validation"]["ready"]

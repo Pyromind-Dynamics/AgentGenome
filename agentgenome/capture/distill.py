@@ -33,13 +33,14 @@ from ..service import GenomeService
 from .align import DEFAULT_THRESHOLD, Alignment, align_traces, render_alignment
 from .emit import (ASYNC_TOOLS, DEFAULT_VERSION, EmitError, Package, build_package,
                    is_async_tool, read_many, render_emit, source_for,
-                   unresolved_literals)
+                   unresolved_literals, sibling_guess_warnings)
 from .plan import recover_artifact_path
 from .policy import POLICY_SCRIPTS_FIRST, normalize_policy
 from .slice import OUTPUT_CONTRACT_HINT, Slice, SliceError, render_slice, reverse_slice
 from .trace import (INLINE_MARK, KIND_HUMAN, KIND_LLM, KIND_SHELL, KIND_TOOL, KIND_WRITE,
                     ROLE_SCRIPT, TRACE_VERSION, Command, Trace, arg_paths, canonical_path,
-                    capture_trace, parse_command, placeholder_key, probe_command, role)
+                    capture_trace, parse_command, placeholder_key, probe_command, role,
+                    agent_write_inputs)
 
 MAX_STEPS = 200
 KIND_RUN = "run"
@@ -84,6 +85,7 @@ class DistilledStep:
     tool_name: str | None = None
     arguments: Mapping[str, Any] | None = None
     keep: bool = False
+    origin_reason: str | None = None
 
     def payload(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -102,6 +104,8 @@ class DistilledStep:
             data["verify"] = self.verify
         if self.keep:
             data["keep"] = True
+        if self.origin_reason:
+            data["origin_reason"] = self.origin_reason
         return data
 
 
@@ -218,6 +222,41 @@ def _check_llm_prompt(step: DistilledStep) -> None:
         raise DistillError(
             f"第 {step.order} 步的 {step.kind} 提示词必须原样出现它声明的输入/产出路径，缺少："
             + "、".join(f"`{token}`" for token in missing))
+
+
+def _check_declared_tokens(step: DistilledStep) -> None:
+    """Every `{token}` a step's prompt or verify uses needs a slot on that step.
+
+    Emit rewrites prompts and verifies with one mapping: declared inputs, the
+    artifact, and — for a run step — the paths parsed off the do command. A token
+    that appears only in a prompt or only in a verify has no slot, compiles to a
+    literal, and the replay dies on it (an llm verify kept `{r}` while the model
+    had already labeled correctly). Dotted refs like `{output.metrics}` are
+    engine-resolved and exempt.
+    """
+    if step.kind in (KIND_LLM, KIND_HUMAN):
+        allowed = {key for token in (*step.reads, *step.writes)
+                   if (key := placeholder_key(token)) is not None}
+        parts: list[tuple[str, str]] = [("提示词", step.run)]
+        if step.verify:
+            parts.append(("verify", step.verify))
+    else:
+        allowed = {key for match in re.finditer(r"\{[^{}]*\}", step.run or "")
+                   if (key := placeholder_key(match.group(0))) is not None}
+        parts = [("verify", step.verify)] if step.verify else []
+    unknown: list[str] = []
+    for _, text in parts:
+        for match in re.finditer(r"\{[^{}]*\}", text or ""):
+            key = placeholder_key(match.group(0))
+            if (key is not None and key not in allowed
+                    and f"{{{key}}}" not in unknown):
+                unknown.append(f"{{{key}}}")
+    if unknown:
+        where = " 或 ".join(label for label, _ in parts)
+        raise DistillError(
+            f"第 {step.order} 步的 {where} 使用了未声明的占位符：{'、'.join(unknown)}。"
+            "这些占位符编译时没有可替换的输入槽，会按字面量进入图并在回放时失败；"
+            "llm/human 步请在同一步的 input 里声明它们，run 步请让 verify 只引用命令行上出现过的路径")
 
 
 def _tool_name(raw: Mapping[str, Any], order: int) -> str:
@@ -342,23 +381,37 @@ def _plan_step(raw: Any, order: int) -> DistilledStep:
         return DistilledStep(order, f"<tool:{name}>", derived, reads, (output,),
                              kind=KIND_TOOL, tool_name=name, arguments=args, keep=keep)
     if "llm" in raw:
+        reason = raw.get("origin_reason")
+        if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+            raise DistillError(f"第 {order} 步的 origin_reason 必须是非空的来源判断说明")
         step = DistilledStep(order, _llm_text(raw, order), derived,
                              *_llm_io(raw, order), kind=KIND_LLM,
-                             verify=_verify_command(raw, order), keep=keep)
+                             verify=_verify_command(raw, order), keep=keep,
+                             origin_reason=reason.strip() if reason else None)
         _check_llm_prompt(step)
+        _check_declared_tokens(step)
         return step
     if "human" in raw:
         step = DistilledStep(order, _human_text(raw, order), derived,
                              *_llm_io(raw, order, label="human"), kind=KIND_HUMAN,
                              keep=keep)
         _check_llm_prompt(step)
+        _check_declared_tokens(step)
         return step
     run = _run_text(raw, order)
     command = parse_command(run)
     _check_command(run, command, order)
     reads, writes = _run_io(raw, order, run, command)
-    return DistilledStep(order, run, derived, reads, writes,
+    step = DistilledStep(order, run, derived, reads, writes,
                          verify=_verify_command(raw, order), keep=keep)
+    _check_declared_tokens(step)
+    return step
+
+
+_TRUNCATION_HINT = (
+    "注意：检测到多个缺失项，请核对工具实际收到的参数与原计划；仅凭缺失项不能判断载荷是否被截断。"
+    "修订待审计划时保留 plan_id，携带当前 digest 和完整修正参数，不支持分批合并。"
+    "不要丢弃已有步骤重新生成候选；同类错误连续 2 次应停止盲试，说明具体阻塞。")
 
 
 def _aggregate(problems: Sequence[str]) -> DistillError:
@@ -366,8 +419,10 @@ def _aggregate(problems: Sequence[str]) -> DistillError:
     if len(problems) == 1:
         return DistillError(problems[0])
     listed = "\n".join(f"{index}. {text}" for index, text in enumerate(problems, start=1))
-    return DistillError(
-        f"沉淀校验发现 {len(problems)} 个问题，请一次改完再提交：\n{listed}")
+    message = f"沉淀校验发现 {len(problems)} 个问题，请一次改完再提交：\n{listed}"
+    if sum(1 for text in problems if "缺少" in text) >= 2:
+        message += "\n" + _TRUNCATION_HINT
+    return DistillError(message)
 
 
 def _check_chain(traces: Sequence[Trace], planned: Sequence[DistilledStep],
@@ -405,6 +460,8 @@ def _check_chain(traces: Sequence[Trace], planned: Sequence[DistilledStep],
     missing: list[str] = []
     boundaries: list[tuple[str | None, str]] = []
     declared: set[str] = set()
+    revised_inputs = {(trace.trace_id, paths.display(path))
+                      for trace in traces for path in trace.revised_inputs}
     for order, step in enumerate(planned, start=1):
         for path in step.reads:
             key = placeholder_key(path)
@@ -418,6 +475,12 @@ def _check_chain(traces: Sequence[Trace], planned: Sequence[DistilledStep],
             if producer is None:
                 continue
             trace_id, seq, kind, command, producer_step = producer
+            if (trace_id, concrete) in revised_inputs and producer_step.tool_name in {"edit", "multiedit"}:
+                if concrete not in declared:
+                    declared.add(concrete)
+                    boundaries.append((key, f"输入 `{concrete}` 在首次修改前已读取；"
+                                       f"使用会话修订后的输入版本（`{trace_id}:{seq}`）。"))
+                continue
             asset = role(concrete, writing=False) == ROLE_SCRIPT
             if key:
                 if concrete not in declared:
@@ -676,7 +739,8 @@ def _handover_steps(planned: Sequence[DistilledStep], traces: Sequence[Trace],
                                  given, writing=True)
     planned_reads = _data_paths([path for step in planned for path in step.reads],
                                 given, writing=False)
-    roots = planned_reads - planned_writes
+    revised = {canonical_path(path, given) for trace in traces for path in trace.revised_inputs}
+    roots = planned_reads - planned_writes - revised
     dropped: dict[str, list[Any]] = {}
     for trace_id, step in _uncovered_steps(planned, traces, params):
         dropped.setdefault(trace_id, []).append(step)
@@ -687,12 +751,72 @@ def _handover_steps(planned: Sequence[DistilledStep], traces: Sequence[Trace],
             continue
         turns = [step for step in trace.steps
                  if step.kind == KIND_HUMAN and step.command]
-        for step in steps:
-            later = [turn for turn in turns if turn.seq > step.seq]
-            if any(_names_artifact(turn.command, root)
-                   for turn in later for root in roots):
-                handovers.append((trace.trace_id, step))
+        for turn in turns:
+            # Merely naming a config in a later task is not a human handback.
+            handback = re.search(
+                r"已经|已(?:完成|复核|导出)|复核完|导出(?:了|的)|交回|"
+                r"\bI\s+(?:have\s+)?(?:reviewed|exported|finished|completed)\b",
+                turn.command, re.IGNORECASE)
+            if not handback or not any(_names_artifact(turn.command, root) for root in roots):
+                continue
+            prior = [step for step in steps if step.seq < turn.seq]
+            if not prior:
+                continue
+            # The upstream of the handover is the producer of the material the
+            # user says they handled, plus that producer's ancestors — not
+            # whichever dropped step happens to sit closest to the turn. Every
+            # named material counts; independent inputs must not collapse into
+            # the last one alone.
+            named = [step for step in prior
+                     if any(_names_artifact(turn.command, path)
+                            for path in step.write_paths)]
+            if named:
+                needed = {step.seq for step in named}
+                for index in range(len(prior) - 1, -1, -1):
+                    consumer = prior[index]
+                    if consumer.seq not in needed:
+                        continue
+                    reads = _data_paths(consumer.read_paths, given, writing=False)
+                    for producer in reversed(prior[:index]):
+                        supplied = _data_paths(producer.write_paths, given, writing=True) & reads
+                        if supplied:
+                            needed.add(producer.seq)
+                            reads -= supplied
+            else:
+                # The turn names the handback but not the material it came from,
+                # so no producer is identifiable: list every dropped prior step
+                # as a candidate for the user to sort out instead of guessing.
+                needed = {step.seq for step in prior}
+            for step in prior:
+                item = (trace.trace_id, step)
+                if step.seq in needed and item not in handovers:
+                    handovers.append(item)
     return handovers
+
+
+def _outputs_removed_at_end(step: Any, given: Mapping[str, str]) -> bool:
+    """A successful comparison that ends by removing every output is a probe."""
+    if step.kind != KIND_SHELL or not step.write_paths:
+        return False
+    try:
+        lexer = shlex.shlex(step.command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split, lexer.commenters = True, ""
+        words = list(lexer)
+    except ValueError:
+        return False
+    if not any(PurePosixPath(word).name in {"diff", "cmp"} for word in words):
+        return False
+    separators = [i for i, word in enumerate(words) if word in {"&&", ";", "||", "|", "&"}]
+    if not separators or words[separators[-1]] not in {"&&", ";"}:
+        return False
+    tail = words[separators[-1] + 1:]
+    if not tail or PurePosixPath(tail[0]).name != "rm":
+        return False
+    removed = [canonical_path(word, given).rstrip("/") for word in tail[1:]
+               if not word.startswith("-")]
+    return bool(removed) and all(
+        any((path := canonical_path(output, given)) == root or path.startswith(root + "/")
+            for root in removed) for output in step.write_paths)
 
 
 def _scope_split(planned: Sequence[DistilledStep], traces: Sequence[Trace],
@@ -712,6 +836,8 @@ def _scope_split(planned: Sequence[DistilledStep], traces: Sequence[Trace],
     planned_reads = _data_paths([path for step in planned for path in step.reads],
                                 given, writing=False)
     uncovered = _uncovered_steps(planned, traces, params)
+    ephemeral = {index for index, (_, step) in enumerate(uncovered)
+                 if _outputs_removed_at_end(step, given)}
     superseded = {
         index
         for index, (_, step) in enumerate(uncovered)
@@ -726,7 +852,7 @@ def _scope_split(planned: Sequence[DistilledStep], traces: Sequence[Trace],
     while changed:
         changed = False
         for index in range(len(uncovered)):
-            if index in connected:
+            if index in connected or index in ephemeral:
                 continue
             touches_plan = (
                 index not in superseded
@@ -859,7 +985,7 @@ def _review_scope(planned: Sequence[DistilledStep], traces: Sequence[Trace],
     """
     connected, branches = _scope_split(planned, traces, params)
     handover = [item for item in _handover_steps(planned, traces, params)
-                if item not in set(connected)]
+                if item not in connected]
     if not connected and not handover:
         return branches, None
     if not confirmed:
@@ -884,7 +1010,7 @@ def _review_scope(planned: Sequence[DistilledStep], traces: Sequence[Trace],
 
 
 def _check_llm_promotions(planned: Sequence[DistilledStep], traces: Sequence[Trace],
-                          policy: str) -> None:
+                          policy: str, params: Mapping[str, Any] | None = None) -> None:
     """An llm node may not stand in for a session step the graph could run or must gate.
 
     A fixed command belongs in `run` (LLM calls inside a script do not make it free-form),
@@ -921,11 +1047,17 @@ def _check_llm_promotions(planned: Sequence[DistilledStep], traces: Sequence[Tra
                 raise DistillError(
                     f"第 {step.order} 步的 from `{step.derived_from}` 不在 source_traces 里。"
                     "请填这一步真正来源的 `<trace_id>:<seq>`，会话里可选的步骤：\n"
-                    f"{_candidate_steps(traces)}")
+                    f"{_candidate_steps(traces)}。"
+                    "若这一步是模型的语义判断、会话里没有固定命令可核对，请改用 "
+                    "policy=adaptive-first 重新提交（from 变为可选、仅作审计），"
+                    "不要以 scripts-first 反复重交。")
             raise DistillError(
                 f"第 {step.order} 步声明成 llm 节点但没有 from：请补上这一步来源的 "
                 "`<trace_id>:<seq>`，插件据此核对它不是固定命令。会话里可选的步骤：\n"
-                f"{_candidate_steps(traces)}")
+                f"{_candidate_steps(traces)}。"
+                "若这一步是模型的语义判断、会话里没有固定命令可核对，请改用 "
+                "policy=adaptive-first 重新提交（from 变为可选、仅作审计），"
+                "不要以 scripts-first 反复重交。")
         if source.kind == KIND_TOOL:
             raise DistillError(
                 f"第 {step.order} 步声明成 llm 节点，但它在会话里是固定工具调用："
@@ -937,6 +1069,28 @@ def _check_llm_promotions(planned: Sequence[DistilledStep], traces: Sequence[Tra
                 f"`{step.derived_from}` `{source.command}`。有 LLM 参与、产出内容会变都不等于"
                 "自由裁量：只要调用形式固定，就用 run 提交，交给 graph 重跑。")
         if source.kind in (KIND_HUMAN, KIND_WRITE):
+            observed = agent_write_inputs(source)
+            given = bindings(params)
+            if source.kind == KIND_WRITE and not step.origin_reason:
+                raise DistillError(
+                    f"第 {step.order} 步 `{step.derived_from}` 的 write 不能证明内容由谁决定。"
+                    "请依据原始用户指令和执行意图分类：用户已作的决定用 human；"
+                    "模型独立判断用 llm，并填写 origin_reason 说明依据，随计划展示给用户；"
+                    "混合来源应拆分。不确定时先向用户核实，不能自动升级成 llm。")
+            declared = {canonical_path(read, given) for read in step.reads}
+            missing = [path for path in observed
+                       if canonical_path(path, given) not in declared]
+            if missing:
+                raise DistillError(
+                    f"第 {step.order} 步声明成 llm 节点，但会话证据显示这一步读取过 "
+                    + "、".join(f"`{path}`" for path in missing)
+                    + "，而 input 没有声明它们。llm 节点必须声明任务实际消费的全部输入，"
+                    "只声明其中一部分不足以复现任务。")
+            if (observed and step.verify and step.verify.strip()
+                    and {canonical_path(path, given) for path in step.writes}
+                    == {canonical_path(path, given) for path in source.write_paths}
+                    and all(role(path, writing=True) != ROLE_SCRIPT for path in step.writes)):
+                continue
             if source.kind == KIND_HUMAN:
                 raise DistillError(
                     f"第 {step.order} 步声明成 llm 节点，但它在会话里是人工门禁："
@@ -1031,27 +1185,29 @@ def _materialize_scripts(
     rewritten: list[DistilledStep] = []
     replaced: set[str] = set()
     for step in planned:
+        if step.kind not in (KIND_RUN, KIND_TOOL):
+            rewritten.append(step)
+            continue
+        frozen_here = tuple((key, value) for key, value in frozen.items()
+                            if any(placeholder_key(item) == key for item in step.reads))
+        verify = step.verify
+        if verify:
+            for key, value in frozen_here:
+                verify, _ = _replace_token(verify, f"{{{key}}}", value)
         if step.kind == KIND_TOOL:
             args = dict(step.arguments or {})
-            for key, value in frozen.items():
-                if not any(placeholder_key(item) == key for item in step.reads):
-                    continue
+            for key, value in frozen_here:
                 args, count = _replace_arg_token(args, f"{{{key}}}", value)
                 if count:
                     replaced.add(key)
             reads = _replace_reads(step.reads, frozen)
             rewritten.append(DistilledStep(step.order, step.run, step.derived_from,
                                            reads, step.writes, kind=step.kind,
-                                           verify=step.verify, tool_name=step.tool_name,
+                                           verify=verify, tool_name=step.tool_name,
                                            arguments=args, keep=step.keep))
             continue
-        if step.kind != KIND_RUN:
-            rewritten.append(step)
-            continue
         run = step.run
-        for key, value in frozen.items():
-            if not any(placeholder_key(item) == key for item in step.reads):
-                continue
+        for key, value in frozen_here:
             run, count = _replace_token(run, f"{{{key}}}", value)
             if count:
                 replaced.add(key)
@@ -1063,7 +1219,7 @@ def _materialize_scripts(
         reads = tuple(path for path in command.read_paths if path not in declared)
         rewritten.append(DistilledStep(step.order, run, step.derived_from,
                                        reads, writes, kind=step.kind,
-                                       verify=step.verify, keep=step.keep))
+                                       verify=verify, keep=step.keep))
     materialized = tuple(sorted((key, value) for key, value in frozen.items()
                                 if key in replaced))
     return (tuple(rewritten), {key: value for key, value in given.items()
@@ -1217,7 +1373,7 @@ def _step_material(step: DistilledStep) -> list[Any]:
     """What makes one step distinct, for the trace id a retry of the plan reuses."""
     if step.kind == KIND_TOOL:
         return [step.kind, step.tool_name, dict(step.arguments or {}), list(step.writes)]
-    return [step.kind, step.run]
+    return [step.kind, step.run, *([{"verify": step.verify}] if step.verify else [])]
 
 
 def _trace_id(label: str, steps: Sequence[DistilledStep],
@@ -1279,6 +1435,8 @@ def _trace_entry(step: DistilledStep) -> dict[str, Any]:
         "result": {"is_error": False, "text": "distilled"},
         **kept,
     }
+    if step.verify:
+        entry["verify"] = step.verify
     # A declared product the command line does not spell as a write would read as an
     # input downstream, so the entry carries the declaration into the capture stages.
     parsed = set(parse_command(step.run).write_paths)
@@ -1459,6 +1617,8 @@ def _step_semantics(
     }
     if step.kind == KIND_TOOL:
         data["tool"] = step.tool_name
+    if step.origin_reason:
+        data["origin_reason"] = step.origin_reason
     return data
 
 
@@ -1507,7 +1667,8 @@ def _script_references(steps: Sequence[DistilledStep],
     given = bindings(params)
     found: dict[str, dict[str, str]] = {}
     for step in steps:
-        for path in step.reads:
+        verification = parse_command(step.verify).read_paths if step.verify else ()
+        for path in (*step.reads, *verification):
             resolved = canonical_path(path, given)
             if role(resolved, writing=False) != ROLE_SCRIPT:
                 continue
@@ -1591,6 +1752,7 @@ def _async_wait_issues(steps: Sequence[DistilledStep]) -> list[str]:
 def _slice_boundary_issues(
     traces: Sequence[Trace],
     params: Mapping[str, Any] | None,
+    steps: Sequence[DistilledStep] = (),
 ) -> list[str]:
     """A root input that a slicing command produced is a trial run, not data.
 
@@ -1601,7 +1763,11 @@ def _slice_boundary_issues(
     """
     if not traces or not params:
         return []
-    roots = [(key, str(value)) for key, value in params.items() if isinstance(value, str)]
+    given = bindings(params)
+    produced = {canonical_path(path, given) for step in steps for path in step.writes}
+    roots = [(key, str(value)) for key, value in params.items()
+             if isinstance(value, str)
+             and canonical_path(value, given) not in produced]
     written_at: list[tuple[str, int]] = []
     for trace in traces:
         for step in trace.steps:
@@ -1611,15 +1777,18 @@ def _slice_boundary_issues(
     for trace in traces:
         for step in trace.steps:
             command = step.command if isinstance(step.command, str) else ""
-            if not command or not _SLICE_COMMAND.search(command):
+            if not command:
                 continue
-            for written in (*step.write_paths, *step.reported_writes):
+            # Only the file fed by a slicing command is a slice. A producer
+            # followed by `head` on stdout or a readback keeps its real output.
+            parsed = parse_command(command)
+            for written, sources in parsed.slice_sources:
                 matched = [key for key, value in roots if _same_path(value, written)]
                 if not matched:
                     continue
                 key = matched[0]
                 source = next(
-                    (path for path in step.read_paths
+                    (path for path in sources
                      if path != written and PurePosixPath(path).suffix),
                     None,
                 )
@@ -1684,7 +1853,10 @@ def _generated_root_issues(
         for trace in traces:
             for step in trace.steps:
                 command = step.command if isinstance(step.command, str) else ""
-                if command and _SLICE_COMMAND.search(command):
+                if command and any(_same_path(value, path)
+                                   for path in parse_command(command).slice_paths):
+                    continue
+                if any(_same_path(value, path) for path in trace.revised_inputs):
                     continue
                 written = (*step.write_paths, *step.reported_writes)
                 if any(_same_path(value, path) for path in written):
@@ -1805,7 +1977,7 @@ def _static_issues(draft: DistillDraft) -> tuple[list[str], list[str]]:
         if count is not None:
             warnings.append(_cardinality_issue(key, count))
     issues.extend(_async_wait_issues(draft.steps))
-    warnings.extend(_slice_boundary_issues(draft.traces, draft.params))
+    warnings.extend(_slice_boundary_issues(draft.traces, draft.params, draft.steps))
     warnings.extend(_generated_root_issues(draft.traces, draft.params, draft.steps))
     warnings.extend(_spelling_issues(draft))
     issues.extend(_relocation_issues(draft.steps, draft.params))
@@ -1988,6 +2160,7 @@ class DistillDraft:
         for step in self.steps:
             item = _step_semantics(step, self.params, self.input_contract)
             item["command"] = step.run
+            item["included_in_graph"] = step.order in self.graph_steps
             if step.kind == KIND_TOOL:
                 item["args"] = dict(step.arguments or {})
             steps.append(item)
@@ -2021,6 +2194,13 @@ class DistillDraft:
         ]
         unresolved = list(self.unresolved)
         blocking, warnings = _static_issues(self)
+        excluded = [item for item in steps if not item["included_in_graph"]]
+        if excluded:
+            warnings.append(
+                f"声明步骤 {[item['step'] for item in excluded]} 被最终产物依赖切片排除，"
+                "不会执行。若它们是必需验收，请将验收结果设为最终产物并声明上游依赖，"
+                "或将检查写入对应节点的 verify；展示图时以 effective_steps 为准"
+            )
         if not validation.get("will_start_replay"):
             blocking.append(
                 "缺少有界验证回放（bounded validation replay）所需的 "
@@ -2028,6 +2208,8 @@ class DistillDraft:
                 "请补充最小输入后重新生成计划，否则不能确认沉淀或发布。"
             )
         blocking = list(dict.fromkeys(blocking))
+        if sum(1 for text in blocking if "缺少" in text) >= 2:
+            blocking.append(_TRUNCATION_HINT)
         warnings = list(dict.fromkeys(warnings))
         validation = dict(validation)
         validation["ready"] = not blocking
@@ -2040,8 +2222,11 @@ class DistillDraft:
                 for path, digest in self.trace_evidence
             ],
             "steps": steps,
+            "effective_steps": [item for item in steps if item["included_in_graph"]],
+            "excluded_steps": excluded,
             "scripts": _script_references(self.steps, self.params),
             "branches": list(self.branches),
+            "revised_inputs": sorted({path for trace in self.traces for path in trace.revised_inputs}),
             "scope_warnings": list(self.scope_warnings),
             "human_gates": human_gates,
             "side_effects": side_effects,
@@ -2090,10 +2275,10 @@ def draft_distill(
     source_ids = tuple(
         dict.fromkeys(source_traces or tuple(trace.trace_id for trace in traces))
     )
-    branches, connected = _scope_split(planned, traces, params)
+    connected, branches = _scope_split(planned, traces, params)
     handover = [
         item for item in _handover_steps(planned, traces, params)
-        if item not in set(connected)
+        if item not in connected
     ]
     scope_warnings = tuple(
         f"预检可能要求复核：{_step_line(trace_id, step)}"
@@ -2161,6 +2346,32 @@ def draft_distill(
             "这些占位符没有在 params 里给出真实值："
             + "、".join(f"`{{{key}}}`" for key in missing_params)
         )
+    given = bindings(params)
+    produced_values = set()
+    for step in planned:
+        for path in step.writes:
+            key = placeholder_key(path)
+            produced_values.add(given.get(key, path) if key else path)
+    unproduced_params = sorted(
+        {
+            key
+            for step in planned
+            for path in step.reads
+            if (
+                (key := placeholder_key(path)) is not None
+                and key in (params or {})
+                and key not in produced_params
+                and given.get(key) not in produced_values
+                and key not in (input_contract or {})
+            )
+        }
+    )
+    if unproduced_params:
+        unresolved.append(
+            "这些 params 键被链路读取，但没有任何步骤产出它们，也不在 input_contract 里声明："
+            + "、".join(f"`{{{key}}}`" for key in unproduced_params)
+            + "。它们会编译成幽灵根输入——回放存在性检查被绕过，复用时兼容性检查必然失败。"
+            "若该路径实际由脚本在运行中写出（先写后读），请把它声明为该步的产物或从命令行移除该输入")
     graph_steps = _expected_graph_steps(planned, final_artifact, params)
     return DistillDraft(
         label=label,
@@ -2235,6 +2446,7 @@ class DistillPlan:
     scope_review: str | None = None
     branches: tuple[str, ...] = ()
     kept: tuple[int, ...] = ()
+    script_warnings: tuple[str, ...] = ()
 
     @property
     def report_path(self) -> Path:
@@ -2293,8 +2505,12 @@ def _report(label: str, plan: DistillPlan, alignment: Alignment,
         + ("（llm 节点必须带可解析的 from，且来源不能是固定命令）"
            if plan.policy == POLICY_SCRIPTS_FIRST else "（按 agent 判断接受 llm 节点）"),
         f"- 最终产物：{final}",
-        "- 链路完整性：" + ("已按 " + "、".join(f"`{item}`" for item in plan.chain_traces)
-                             + " 校验" if plan.chain_traces else "未提供来源轨迹，未校验"),
+        "- 链路完整性：" + (
+            "已按 " + "、".join(f"`{item}`" for item in plan.chain_traces) + " 校验"
+            if plan.chain_traces
+            else "未校验（未导出来源轨迹，无法核对每步 from 或链路完整性）"
+            if plan.policy == POLICY_SCRIPTS_FIRST
+            else "未校验（无来源轨迹，无法核对链路完整性）"),
         "- 输入绑定：" + ("、".join(f"`{key}` = `{value}`" for key, value in plan.bound)
                           or "无根输入"),
         f"- 草稿：`{plan.directory}`",
@@ -2362,9 +2578,9 @@ def distill(service: GenomeService, *, label: str, steps: Sequence[Any],
                         "不能从步骤顺序推断最终产物")
     problems.extend(_template_path_issues(planned))
     problems.extend(_async_wait_issues(planned))
-    problems.extend(_slice_boundary_issues(traces, params))
+    problems.extend(_slice_boundary_issues(traces, params, planned))
     try:
-        _check_llm_promotions(planned, traces, policy)
+        _check_llm_promotions(planned, traces, policy, params)
     except DistillError as exc:
         problems.append(str(exc))
     final_token: str | None = None
@@ -2432,7 +2648,10 @@ def distill(service: GenomeService, *, label: str, steps: Sequence[Any],
                            materialized, materialize_notes, policy,
                            scope_review,
                            tuple(_step_line(trace_id, step) for trace_id, step in branches),
-                           slice_.kept)
+                           slice_.kept,
+                           tuple(warning for origin, target in package.scripts
+                                 for warning in sibling_guess_warnings(
+                                     origin, (package.directory / target).read_bytes())))
         plan.report_path.parent.mkdir(parents=True, exist_ok=True)
         plan.report_path.write_text(_report(label, plan, alignment, slice_), encoding="utf-8")
         return plan

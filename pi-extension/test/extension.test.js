@@ -3,7 +3,48 @@ import test from "node:test";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { findPackageJSON } from "node:module";
 import { createGenomeExtension } from "../index.js";
+
+test("distill schema distinguishes a plan query from a new request", {
+  skip: !process.env.AGENTGENOME_TEST_PI_MODULE,
+}, async () => {
+  const { validateToolArguments } = await import(new URL(
+    "./dist/utils/validation.js",
+    pathToFileURL(findPackageJSON("@earendil-works/pi-ai",
+      pathToFileURL(process.env.AGENTGENOME_TEST_PI_MODULE)))).href);
+  const registered = [];
+  createGenomeExtension({ invoke() {} })({ registerTool(t) { registered.push(t); }, on() {} });
+  const tool = registered.find(t => t.name === "genome_distill");
+  const validate = arguments_ => validateToolArguments(tool, { name: tool.name, arguments: arguments_ });
+  assert.throws(() => validate({}), /Validation failed/);
+  assert.throws(() => validate({ label: "task" }), /Validation failed/);
+  assert.throws(() => validate({ label: "task", source_traces: [] }), /Validation failed/);
+  assert.deepEqual(validate({ plan_id: "plan-1" }), { plan_id: "plan-1" });
+  const creation = { label: "task", source_traces: ["session-1"] };
+  assert.deepEqual(validate(creation), creation);
+  const unverified = { label: "task", policy: "adaptive-first", allow_unverified: true,
+    steps: [{ run: "python scripts/task.py" }] };
+  assert.deepEqual(validate(unverified), unverified);
+  assert.throws(() => validate({ ...unverified, allow_unverified: false }), /Validation failed/);
+  assert.throws(() => validate({ ...unverified, steps: [] }), /Validation failed/);
+});
+
+test("distill exposes and forwards explicit unverified preparation without a session", async () => {
+  const registered = [], calls = [];
+  createGenomeExtension({ async invoke(...args) { calls.push(args); return { status: "planned" }; } })(
+    { registerTool(t) { registered.push(t); }, on() {} });
+  const tool = registered.find(t => t.name === "genome_distill");
+  assert.equal(tool.parameters.properties.allow_unverified.type, "boolean");
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.ok(tool.parameters.anyOf.some(branch => branch.properties?.allow_unverified?.const === true
+    && branch.required.includes("steps") && branch.properties.steps.minItems === 1));
+  const args = { label: "task", policy: "adaptive-first", allow_unverified: true,
+    steps: [{ run: "python scripts/task.py" }] };
+  await tool.execute("unverified", args);
+  assert.deepEqual(calls[0], ["distill", args, "unverified", undefined, undefined]);
+});
 
 test("plugin owns tool schemas and delegates using the original call id", async () => {
   const registered = [], calls = [], hooks = new Map();
@@ -29,12 +70,19 @@ test("plugin owns tool schemas and delegates using the original call id", async 
   assert.ok(prompt.length < 3000);
   assert.ok(registered.every((tool) => tool.label.startsWith("历史经验")));
   const distill = registered.find((t) => t.name === "genome_distill");
-  assert.deepEqual(distill.parameters.required, ["label", "source_traces"]);
+  assert.deepEqual(distill.parameters.required, []);
+  assert.equal(distill.parameters.properties.plan_id.type, "string");
+  assert.equal(distill.parameters.properties.digest.type, "string");
   assert.equal(distill.parameters.additionalProperties, false);
   assert.match(distill.description, /First call it .* no steps/);
   assert.match(distill.description, /mechanically builds a candidate chain/);
+  assert.match(distill.description, /automatically review the generated scripts AND their verifiers/);
+  assert.match(distill.description, /Accept zero-result collections/);
+  assert.match(distill.description, /reusable output destination.*root path parameter/);
   assert.match(distill.parameters.properties.steps.description, /第一次沉淀不要提交 steps/);
   assert.equal(distill.parameters.properties.steps.items.properties.label, undefined);
+  assert.match(distill.parameters.properties.steps.items.properties.origin_reason.description, /模型/);
+  assert.match(prompt, /origin_reason/);
   assert.equal(distill.parameters.properties.input_contract.type, "object");
   assert.match(distill.parameters.properties.input_contract.description, /type.*number/);
   assert.ok(distill.parameters.properties.determinism.enum.includes("human-gated"));
@@ -43,7 +91,9 @@ test("plugin owns tool schemas and delegates using the original call id", async 
   const capture = registered.find((t) => t.name === "genome_capture");
   assert.equal(capture.parameters.properties.review_confirmed, undefined);
   const confirmDistill = registered.find((t) => t.name === "genome_confirm_distill");
-  assert.deepEqual(confirmDistill.parameters.required, ["plan_id"]);
+  assert.deepEqual(confirmDistill.parameters.required, ["plan_id", "digest"]);
+  assert.match(confirmDistill.description, /current digest/);
+  assert.match(confirmDistill.description, /missing, stale or superseded digest is rejected/);
   assert.match(confirmDistill.description, /creates the capture/);
   assert.match(confirmDistill.description, /starts the replay/);
   assert.match(confirmDistill.description, /published only after that replay succeeds/);
@@ -83,11 +133,13 @@ test("guidance teaches keep, async wait steps, batch validation and the data-flo
   assert.match(prompt, /一次全列出来/);
   assert.match(prompt, /机械生成候选链路/);
   assert.match(prompt, /不读脚本内容、不物化脚本、不建包、不编译 graph、不回放/);
-  assert.match(prompt, /genome_confirm_distill 只做一次机械 preflight/);
+  assert.match(prompt, /带当前 digest 调用 genome_confirm_distill/);
   assert.match(prompt, /预检失败时不会创建 capture/);
-  assert.match(prompt, /本回合必须修正并立即重新调用对应工具/);
-  assert.match(prompt, /不能只说「准备重新提交」就结束/);
-  assert.match(prompt, /只有需要用户决策时才停/);
+  assert.match(prompt, /修正原因后再重交/);
+  assert.match(prompt, /需要用户决策时停下/);
+  assert.match(prompt, /同类错误连续 2 次必须止损/);
+  assert.match(prompt, /不要原样重试/);
+  assert.match(prompt, /不要原样重试或拆分提交完整计划/);
   assert.match(prompt, /链路范围按数据流判断/);
   assert.match(prompt, /范围确实有歧义/);
   assert.match(prompt, /先用一句具体问题让用户选两个范围/);

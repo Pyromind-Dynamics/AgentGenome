@@ -213,7 +213,11 @@ class GenomeService:
         if self._requires_tool(graph.node):
             required.add("tool")
         if missing := required - capabilities:
-            raise ValueError(f"execution host lacks capabilities: {sorted(missing)}")
+            message = f"execution host lacks capabilities: {sorted(missing)}"
+            if "tool" in missing:
+                message += "; native tool nodes require a Pi tool context exposing " \
+                    "ExtensionToolContext.executeTool (tested on Pi 1.1.0)"
+            raise ValueError(message)
 
     def list(self) -> list[dict[str, Any]]:
         with self._db() as db:
@@ -333,7 +337,8 @@ class GenomeService:
             state.update(phase='waiting_agent', stage_request_id=stage['id'])
         if state['status'] in _PARKED:
             waiting = (state.get('result') or {}).get('waiting')
-            state.update(phase='waiting_human',
+            external = isinstance(waiting, dict) and waiting.get('kind') == 'external'
+            state.update(phase='waiting_external' if external else 'waiting_human',
                          waiting=waiting if isinstance(waiting, dict) else None)
         revision = self.revisions.for_run(run_id)
         if revision:

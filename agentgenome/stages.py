@@ -50,9 +50,20 @@ class StageRequests:
             with self.service._db() as db:
                 row = db.execute('SELECT receipt FROM stage_requests WHERE id=?', (request['request_id'],)).fetchone()
             receipt = json.loads(row['receipt']) if row['receipt'] else None
-            if (not isinstance(result, dict) or result.get('status') != 'completed'
-                    or not receipt or receipt['execution_id'] != result.get('execution_id')):
-                raise PortError('Agent stage ended without a matching successful round and receipt', kind='bad_output')
+            reason = None
+            if not isinstance(result, dict):
+                reason = ('Host returned no stage result. Check whether the host disconnected or exited '
+                          '(e.g. a one-shot `pi -p` session); llm stages need a connected host to handle the handoff.')
+            elif result.get('status') != 'completed':
+                reason = f"Model round did not complete successfully (status={result.get('status')!r})."
+            elif not receipt:
+                reason = 'Missing genome_step_result receipt; submit it before ending the model round.'
+            elif receipt.get('execution_id') != result.get('execution_id'):
+                reason = 'Receipt execution_id does not match the completed model round; use the active stage execution ID.'
+            if reason:
+                raise PortError(
+                    'Agent stage ended without a matching successful round and receipt. ' + reason,
+                    kind='bad_output')
             if receipt['outcome'] != 'completed':
                 raise PortError(receipt['summary'] or 'Agent could not complete this stage', kind='bad_output')
             return receipt['summary']

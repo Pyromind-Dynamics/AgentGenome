@@ -1,0 +1,13 @@
+version: "gt/1.0"
+node:
+  id: write
+  input:
+    target: {type: text, from: params.target}
+  do:
+    tool:
+      name: write
+      args: {path: "{input.target}", content: "agentgenome real tool\n"}
+  output:
+    receipt: {type: json}
+  verify:
+    - run: "python3 scripts/verify.py {input.target}"

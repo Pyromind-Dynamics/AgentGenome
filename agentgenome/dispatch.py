@@ -1,5 +1,6 @@
 """Transport-independent operations shared by Pi and embedded hosts."""
 import hashlib
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -16,9 +17,9 @@ from .capture.distill import (
 from .capture.emit import Source
 from .capture.pipeline import prepare_capture
 from .capture.plan import build_candidate_plan
-from .capture.policy import POLICY_SCRIPTS_FIRST
+from .capture.policy import POLICY_ADAPTIVE_FIRST, POLICY_SCRIPTS_FIRST
 from .capture.sample import compatibility, inspect
-from .capture.trace import Trace, capture_trace
+from .capture.trace import ROLE_SCRIPT, Trace, capture_trace, role
 from .manifest import MATCH_KEYS
 from .service import GenomeService
 
@@ -50,10 +51,12 @@ def invoke(service: GenomeService, scope: str, action: str,
            capabilities: set[str] | None = None, host: Any = None) -> dict[str, Any]:
     capabilities = capabilities or set()
     if action == "list":
+        plans = service.distill_plans.previews(scope)
         return {"assets": [{**asset,
                             "has_samples": service.captures.has_samples(
                                 asset["id"], asset["version"])}
-                           for asset in service.list()]}
+                           for asset in service.list()],
+                **({"distill_plans": plans} if plans else {})}
     if action == "capture":
         return _capture(service, scope, arguments, host, request_id)
     if action == "prepare_distill":
@@ -348,6 +351,12 @@ class _DistillInputs:
     arguments: dict[str, Any]
 
     @property
+    def validation_overrides(self) -> Mapping[str, Any] | None:
+        # Inferred defaults are already in plan.bound, including any slicing.
+        # Only caller-supplied overrides need parameter-name validation.
+        return self.validation_params if self.arguments.get("validation_params") else None
+
+    @property
     def minimal_validation(self) -> bool:
         return (
             self.validation_params is not None
@@ -525,9 +534,13 @@ def _replay_params(
     bound = dict(plan.bound)
     if validation_params is None:
         return bound
-    bound.update(
-        {key: value for key, value in validation_params.items() if key in bound}
-    )
+    unknown = sorted(set(validation_params) - set(bound))
+    if unknown:
+        raise ValueError(
+            f"validation_params contains unknown parameters {unknown}; "
+            f"use the graph's bound parameter names {sorted(bound)}"
+        )
+    bound.update(validation_params)
     return bound
 
 
@@ -554,7 +567,7 @@ def _capture_distilled(
         version=_text(parsed.arguments, "version"),
         asset_id=_text(parsed.arguments, "asset_id"),
         declarations=_declarations(parsed.arguments),
-        replay_params=_replay_params(plan, parsed.validation_params),
+        replay_params=_replay_params(plan, parsed.inputs.validation_overrides),
         bindings=bindings(parsed.params),
         request_id=request_id,
         execution_scope=parsed.execution_scope,
@@ -626,6 +639,8 @@ def _distill_validation(
         "will_start_replay": parsed.minimal_validation,
         "ready": parsed.minimal_validation,
         "required": True,
+        "engine_row_limit": False,
+        "scope": dict(parsed.execution_scope or {}),
     }
 
 
@@ -635,6 +650,7 @@ def _dry_build_problems(
     host: Any,
     traces: list[Trace],
     arguments: dict[str, Any],
+    warnings: list[str],
 ) -> list[str]:
     """Build the package now and report what the compiler says.
 
@@ -646,7 +662,7 @@ def _dry_build_problems(
     if inputs.steps is None:
         return []
     try:
-        distill_plan(
+        plan = distill_plan(
             service, label=inputs.label, steps=inputs.steps, workspace=host,
             final_artifact=_text(arguments, "final_artifact"),
             asset_id=_text(arguments, "asset_id"),
@@ -661,6 +677,8 @@ def _dry_build_problems(
             review_reason=_text(arguments, "review_reason"),
             dry_run=True,
         )
+        warnings.extend(plan.script_warnings)
+        _replay_params(plan, inputs.validation_overrides)
     except DistillError as exc:
         return [str(exc)]
     except (ValueError, OSError) as exc:
@@ -675,12 +693,46 @@ def _prepare_distill(
     host: Any,
     request_id: str,
 ) -> dict[str, Any]:
+    plan_id = _text(arguments, "plan_id")
+    base_digest = _text(arguments, "digest")
+    if plan_id and not base_digest:
+        if set(arguments) - {"plan_id", "label"}:
+            raise ValueError('revising a distillation plan requires its current digest')
+        state = service.distill_plans.get(scope, plan_id)
+        return {"plan_id": state['plan_id'], "digest": state['digest'],
+                "revision": state['revision'], "status": state['status'],
+                "requires_confirmation": state['requires_confirmation'],
+                "review": state['analysis'].get('review', {}),
+                "blocking_issues": state['analysis'].get('review', {}).get('blocking_issues', [])}
+    if base_digest and not plan_id:
+        raise ValueError('digest requires plan_id when revising a distillation plan')
+    # Identity and optimistic concurrency belong to the request, not the plan's
+    # replay arguments or semantic digest.
+    arguments = {key: value for key, value in arguments.items()
+                 if key not in {"plan_id", "digest"}}
+    if plan_id:
+        # A revision only spells out what changed, but the trace binding is not a
+        # changeable parameter: dropping it silently turned "chain checked" into
+        # "not checked" on every revision while the plan kept being published.
+        inherited = service.distill_plans.get(scope, plan_id).get("arguments") or {}
+        for key in ("source_traces", "trace_refs"):
+            if not arguments.get(key) and inherited.get(key):
+                arguments[key] = inherited[key]
     if not isinstance(host, Source):
         raise ValueError("distill needs a host that can read the source traces")
     clock = _Clock()
     inputs = _distill_inputs(arguments)
     clock.mark("inputs")
     traces, evidence = _load_distill_traces(inputs, host)
+    if (inputs.policy == POLICY_ADAPTIVE_FIRST and not traces
+            and arguments.get("allow_unverified") is not True):
+        # adaptive-first waives the per-step `from` check, so the exported trace is
+        # the only remaining evidence that the chain is complete. Without it the
+        # report used to say "未校验" and publish anyway.
+        raise ValueError(
+            "adaptive-first 沉淀没有任何可核对的来源轨迹，链路完整性无法校验；"
+            "请传 genome_trace 返回的 source_traces（或导出的 trace_refs），"
+            "确实拿不到轨迹时显式传 allow_unverified=true，报告会标明未校验")
     clock.mark("traces")
     planning: dict[str, Any] = {
         "mode": "provided_steps" if inputs.steps is not None else "mechanical_candidate",
@@ -698,10 +750,30 @@ def _prepare_distill(
             params=inputs.params,
         )
         if not candidate.steps:
-            raise ValueError(
-                "could not mechanically extract a replayable chain from the trace; "
-                "inspect the trace, then call genome_distill again with corrected steps"
-            )
+            observed = []
+            scripts = set()
+            for trace in traces:
+                for step in trace.steps:
+                    found = [path for path in (*step.read_paths, *step.write_paths)
+                             if role(path, writing=False) == ROLE_SCRIPT]
+                    if step.success and found:
+                        scripts.update(found)
+                        observed.append({"source": f"{trace.trace_id}:{step.seq}",
+                                         "kind": step.kind, "scripts": found,
+                                         "inputs": list(step.read_paths),
+                                         "outputs": list(step.write_paths)})
+            return {
+                "status": "needs_normalization", "requires_confirmation": False,
+                "planning": planning, "source_traces": inputs.source_traces,
+                "normalization": {"scripts": sorted(scripts), "observed_steps": observed,
+                                  "excluded": list(candidate.branches),
+                                  "ambiguities": list(candidate.ambiguities)},
+                "instruction": "No replayable chain has been declared yet. Read the named scripts, "
+                    "make implicit inputs/outputs explicit and separate batch results from reusable logic. "
+                    "Then resubmit normalized steps with their actual source evidence. "
+                    "Continue automatically for implementation fixes; ask only for a user policy decision. "
+                    "Do not rerun historical commands or present this response as a ready plan.",
+            }
         resolved_arguments = candidate.arguments(arguments)
         if not resolved_arguments.get("source_traces"):
             resolved_arguments["source_traces"] = [trace.trace_id for trace in traces]
@@ -723,10 +795,21 @@ def _prepare_distill(
     # rules could only guess at, and confirming was the first place a plan heard
     # the truth — one wasted round per wrong plan. The build runs the chain and
     # artifact checks itself, so they are not repeated here.
-    dry = _dry_build_problems(service, inputs, host, traces, resolved_arguments)
+    guessed: list[str] = []
+    dry = _dry_build_problems(service, inputs, host, traces, resolved_arguments, guessed)
     if dry:
         review["blocking_issues"] = list(dict.fromkeys([*review["blocking_issues"], *dry]))
     review["validation"]["ready"] = not review["blocking_issues"]
+    if guessed:
+        review["warnings"] = list(dict.fromkeys([*review.get("warnings", []), *guessed]))
+    review["planning_preflight"] = {
+        "status": "blocked" if review["blocking_issues"] else "passed",
+        "temporary_build": True, "may_read_scripts": True,
+        "starts_replay": False, "publishes": False,
+        "checked": ["graph_build", "python_syntax", "local_python_helpers"]
+                  + (["sibling_name_guesses"] if not dry else []),
+        "not_checked": ["external_dependencies", "business_correctness", "replay"],
+    }
     clock.mark("dry_build")
     analysis = {
         "status": "structural_plan",
@@ -742,6 +825,8 @@ def _prepare_distill(
         request_id=request_id,
         arguments=resolved_arguments,
         analysis=analysis,
+        plan_id=plan_id,
+        base_digest=base_digest,
     )
     clock.mark("persist")
     if state.get("repeated"):
@@ -751,6 +836,7 @@ def _prepare_distill(
         return {
             "plan_id": state["plan_id"],
             "digest": state["digest"],
+            "revision": state["revision"],
             "status": "planned",
             "requires_confirmation": True,
             "planning": state["analysis"].get("planning"),
@@ -762,6 +848,7 @@ def _prepare_distill(
     return {
         "plan_id": state["plan_id"],
         "digest": state["digest"],
+        "revision": state["revision"],
         "status": "planned",
         "requires_confirmation": True,
         "planning": planning,
@@ -792,7 +879,8 @@ def _confirm_distill(
     if blocking:
         raise ValueError(
             "distillation plan has blocking issues; fix them and call "
-            "genome_distill again: " + "; ".join(str(item) for item in blocking)
+            "genome_distill with plan_id and the current digest to revise this plan: "
+            + "; ".join(str(item) for item in blocking)
         )
     state = service.distill_plans.begin_confirmation(
         scope,

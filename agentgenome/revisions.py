@@ -130,6 +130,8 @@ class Revisions:
 
     def policy(self, state):
         manifest, package, _ = self.context(state)
+        if self.service.tool_receipts.unresolved(state['id']):
+            raise ValueError('tool outcome/stop is unconfirmed; do not revise and re-execute automatically')
         policy = manifest.get('revision', {})
         if 'revision' in manifest and policy.get('safe_to_rerun') is not True:
             raise ValueError('asset does not permit safe revision reruns')

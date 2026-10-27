@@ -11,9 +11,10 @@ frozen.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 from uuid import uuid4
 
 from builder import CompileError, compile
@@ -116,6 +117,10 @@ def render_samples(samples: Mapping[str, Any]) -> str:
     if not files:
         lines.append("- 本条链路没有可采样的根输入")
     for entry in files:
+        if entry.get("format") == "pending":
+            lines.append(f"- `{entry.get('key')}` ← `{entry.get('path')}`："
+                         "输出路径，运行后创建（不作为输入采样）")
+            continue
         schema = entry.get("schema") or {}
         names = schema.get("columns") or schema.get("fields") or []
         detail = "、".join(f"`{name}`" for name in names)
@@ -131,7 +136,8 @@ def render_samples(samples: Mapping[str, Any]) -> str:
 
 
 def _samples(workspace: Any, bound: Mapping[str, Any], directory: Path,
-             path_names: Sequence[str] | None = None) -> dict[str, Any]:
+             path_names: Sequence[str] | None = None,
+             optional: Collection[str] = ()) -> dict[str, Any]:
     """Sampling is evidence: a broken input is reported, never raised."""
     selected = (
         {key: value for key, value in bound.items() if key in path_names}
@@ -139,9 +145,48 @@ def _samples(workspace: Any, bound: Mapping[str, Any], directory: Path,
         else bound
     )
     try:
-        return sample_inputs(source_for(workspace), selected, directory)
+        return sample_inputs(source_for(workspace), selected, directory,
+                             optional=optional)
     except Exception as exc:
         return {"index": None, "files": [], "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+_ROOT_ARG = re.compile(r"\{input\.([a-z][a-z0-9_-]*)\}")
+_OUTPUT_FLAGS = frozenset({
+    "-o", "--out", "--output", "--output-file", "--output_file",
+    "--out-dir", "--out_dir", "--outdir", "--output-dir", "--output_dir",
+})
+
+
+def _output_params(package: Package) -> frozenset[str]:
+    """Root parameters a node writes into, e.g. `--output-dir {input.output_dir}`.
+
+    They name a location the run creates: sampling one as an input reports a
+    missing file every time the capture is reused with a fresh output directory.
+    """
+    keys: set[str] = set()
+    reads: set[str] = set()
+    for node in package.nodes or ():
+        if node.kind != "run":
+            reads.update(_ROOT_ARG.findall(node.command or ""))
+            reads.update(_ROOT_ARG.findall(str(node.arguments or {})))
+            continue
+        try:
+            words = shlex.split(node.command or "")
+        except ValueError:
+            reads.update(_ROOT_ARG.findall(node.command or ""))
+            continue
+        for index, word in enumerate(words):
+            flag, sep, value = word.partition("=")
+            if not sep:
+                flag, value = words[index - 1] if index else "", word
+            found = set(_ROOT_ARG.findall(value))
+            if flag in _OUTPUT_FLAGS and _ROOT_ARG.fullmatch(value):
+                keys.update(found)
+            else:
+                reads.update(found)
+    # A parameter also consumed as an input must still be readable before replay.
+    return frozenset(keys - reads)
 
 
 def _failure_report(capture_id: str, label: str, traces: Sequence[Trace],
@@ -347,6 +392,7 @@ def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: s
                 bound,
                 directory / "samples",
                 path_keys(package.parameter_specs, bound),
+                _output_params(package),
             )
             probe, probe_note = _probe_plan(package, new_params, bound)
             if queue_allowed:
@@ -400,6 +446,7 @@ def prepare_capture(service: GenomeService, *, traces: Sequence[Trace], label: s
         bound,
         directory / "samples",
         path_keys(package.parameter_specs, bound),
+        _output_params(package),
     )
     probe, note = _probe_plan(package, new_params, bound)
     notes = (note,)

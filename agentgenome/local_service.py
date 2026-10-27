@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import importlib
+import logging
 import os
 import shutil
 import stat
@@ -17,8 +18,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from .dispatch import invoke
-from .local_host import LocalExecutionHost, NativeHuman
+from .local_host import LocalExecutionHost, NativeHuman, LocalTool, LocalAwait
+from .native_tools import NativeTools
 from .native_stages import NativeStages
+from .native_judges import NativeJudges
 from .service import GenomeService
 
 PROTOCOL = 1
@@ -55,12 +58,17 @@ class LocalService:
         self.runtime_fingerprint = runtime_fingerprint()
         self.service = GenomeService(root)
         self.stages = NativeStages(self.service)
+        self.judges = NativeJudges(self.service)
+        self.tools = NativeTools(self.service)
+        self.tool_clients = {}
         self.root = self.service.root
         self.idle_seconds = idle_seconds
         self.jobs: dict[str, asyncio.Task] = {}
+        self.run_owners: dict[str, str] = {}
         self.clients: set[asyncio.StreamWriter] = set()
         self.client_scopes: dict[str, str] = {}
         self.stage_clients: set[str] = set()
+        self.judge_clients: set[str] = set()
         self.last_used = time.monotonic()
         with self.service._db() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS native_runs (
@@ -75,6 +83,57 @@ class LocalService:
 
     def reclaim_draft(self, revision_id: str) -> None:
         shutil.rmtree(self.root / "revision-drafts" / revision_id, ignore_errors=True)
+
+    def capabilities(self, connection_id):
+        available = {"revision", "await"}
+        if connection_id in self.stage_clients:
+            available.add("agent_task")
+        if connection_id in self.judge_clients:
+            available.add("model_judge")
+        if connection_id in self.tool_clients:
+            available.add("tool")
+        return available
+
+    async def wake_awaits(self):
+        """Probe parked local tasks without re-executing the graph on pending."""
+        with self.service._db() as db:
+            rows = db.execute('''SELECT r.*, n.cwd FROM runs r JOIN native_runs n
+                ON r.id=n.run_id WHERE r.status IN ('waiting','waiting_external')''').fetchall()
+        has_external = False
+        for row in rows:
+            run_id, scope = row['id'], row['scope']
+            state = self.service._run(row)
+            waiting = (state.get('result') or {}).get('waiting') or {}
+            if waiting.get('kind') != 'external' or run_id in self.jobs:
+                continue
+            has_external = True
+            try:
+                deadline = waiting.get('deadline')
+                expired = deadline is not None and time.time() >= deadline
+                if not expired:
+                    outcome = await asyncio.to_thread(LocalAwait(Path(row['cwd'])).probe, waiting['receipt'])
+                    if outcome.status == 'pending':
+                        continue
+                owner = self.run_owners.get(run_id)
+                if self.client_scopes.get(owner) != scope:
+                    owner = None
+                # A fresh Pi connection must explicitly bind its own capabilities;
+                # never reuse an old connection's executor or stage requests.
+                try:
+                    self.service.check_capabilities(row['asset_id'], row['version'], self.capabilities(owner))
+                except ValueError:
+                    continue
+                with self.service._lock:
+                    current = self.service.status(scope, run_id)
+                    if (current['status'] not in {'waiting', 'waiting_external'}
+                            or (current.get('result') or {}).get('waiting') != waiting
+                            or run_id in self.jobs):
+                        continue
+                    self.service.resume(scope, run_id)
+                    self.jobs[run_id] = asyncio.create_task(self.execute(scope, run_id, row['cwd'], owner))
+            except Exception:
+                logging.getLogger(__name__).exception('Cannot probe native await %s', run_id)
+        return has_external
 
     def reclaim_submitted_drafts(self) -> None:
         """Drop editable copies whose revision was submitted or never registered."""
@@ -120,6 +179,23 @@ class LocalService:
                 return {"status": "interrupted"}
             return await self.stages.wait(scope, request, deliverable=deliverable)
 
+        def judge(request):
+            def judge_deliverable():
+                return (connection_id in self.judge_clients
+                        and self.client_scopes.get(connection_id) == scope)
+            return asyncio.run_coroutine_threadsafe(
+                self.judges.wait(scope, connection_id, {**request, 'run_id': run_id}, judge_deliverable), loop).result()
+
+        def tool_call(name, arguments, execution_id):
+            def available():
+                return connection_id in self.tool_clients and self.client_scopes.get(connection_id) == scope
+            request = dict(run_id=run_id, execution_id=execution_id, name=name, arguments=arguments)
+            return asyncio.run_coroutine_threadsafe(
+                self.tools.call(scope, connection_id, request, available), loop).result()
+
+        def tool_cancel(execution_id):
+            loop.call_soon_threadsafe(self.tools.cancel, scope, connection_id, execution_id)
+
         def emit(event):
             self.progress(run_id, event)
             if event["event"] == "waiting_agent":
@@ -128,7 +204,9 @@ class LocalService:
 
         try:
             await asyncio.to_thread(self.service.execute, scope, run_id,
-                                    LocalExecutionHost(self.root, Path(cwd), human=NativeHuman()),
+                                    LocalExecutionHost(self.root, Path(cwd), human=NativeHuman(),
+                                                       judge=judge if connection_id in self.judge_clients else None,
+                                                       tool=LocalTool(tool_call, tool_cancel) if connection_id in self.tool_clients else None),
                                     emit)
         finally:
             self.jobs.pop(run_id, None)
@@ -137,12 +215,15 @@ class LocalService:
     async def dispatch(self, scope: str, cwd: str, message: dict, connection_id: str | None = None) -> dict:
         action, args = message["action"], message.get("arguments", {})
         # The local host can always stage and collect revision files on this machine.
-        capabilities = {"revision"}
-        if connection_id in self.stage_clients:
-            capabilities.add("agent_task")
+        capabilities = self.capabilities(connection_id)
         request_id = message.get("request_id", message["id"])
+        if action == 'tool_bind':
+            if connection_id is None or args.get('protocol') != 1:
+                raise ValueError('tool binding requires a connected Pi tool context')
+            self.tool_clients[connection_id] = True
+            return {'accepted': True}
         if action in {"run", "validate", "capture", "distill", "prepare_revision",
-                      "prepare_run", "confirm_run", "confirm_distill"}:
+                      "prepare_run", "confirm_run", "confirm_distill", "replay_requeue"}:
             host = LocalExecutionHost(self.root, Path(cwd))
             if action == "validate":
                 self.service.check_capabilities(args["asset_id"], args["version"], capabilities)
@@ -175,10 +256,35 @@ class LocalService:
                     row = db.execute("SELECT cwd FROM native_runs WHERE run_id=?", (run_id,)).fetchone()
                 if row is None:
                     raise ValueError("not a native run")
+                self.run_owners[run_id] = connection_id
                 self.jobs[run_id] = asyncio.create_task(self.execute(scope, run_id, row[0], connection_id))
             return state
         if action == "snapshot":
-            return {"runs": self.records(scope), "stages": self.stages.snapshot(scope)}
+            records = self.records(scope)
+            for run in records:
+                waiting = (run.get('result') or {}).get('waiting') or {}
+                if (run['status'] in {'waiting', 'waiting_external'} and waiting.get('kind') == 'external'
+                        and self.run_owners.get(run['id']) not in self.client_scopes):
+                    try:
+                        self.service.check_capabilities(run['asset_id'], run['version'], capabilities)
+                    except ValueError:
+                        continue
+                    self.run_owners[run['id']] = connection_id
+            return {"runs": records, "stages": self.stages.snapshot(scope),
+                    'judges': self.judges.snapshot(scope, connection_id),
+                    'tools': self.tools.snapshot(scope, connection_id)}
+        if action in {'tool_claim', 'tool_result'}:
+            if connection_id not in self.tool_clients:
+                raise ValueError('tool execution requires a bound Pi tool context')
+            if action == 'tool_claim':
+                return self.tools.claim(scope, connection_id, args['execution_id'])
+            return self.tools.result(scope, connection_id, args)
+        if action in {'judge_claim', 'judge_result'}:
+            if connection_id not in self.judge_clients:
+                raise ValueError('model judge requires a judge-capable Pi client')
+            if action == 'judge_claim':
+                return self.judges.claim(scope, connection_id, args['request_id'])
+            return self.judges.result(scope, connection_id, args)
         if action in {"stage_claim", "stage_begin", "stage_finish", "step_result"}:
             if "agent_task" not in capabilities:
                 raise ValueError("native stages require a stage-capable Pi client")
@@ -243,6 +349,8 @@ class LocalService:
                         self.client_scopes[connection_id] = scope
                         if args.get("stage_protocol") == 1:
                             self.stage_clients.add(connection_id)
+                        if args.get('judge_protocol') == 1:
+                            self.judge_clients.add(connection_id)
                         result = {"protocol": PROTOCOL, "version": VERSION,
                                   "runtime_fingerprint": self.runtime_fingerprint}
                     elif scope is None:
@@ -260,6 +368,8 @@ class LocalService:
             self.clients.discard(writer)
             self.client_scopes.pop(connection_id, None)
             self.stage_clients.discard(connection_id)
+            self.judge_clients.discard(connection_id)
+            self.tool_clients.pop(connection_id, None)
             remaining = [s for key, s in self.client_scopes.items() if key in self.stage_clients]
             abandoned = scope if scope not in remaining else None
             self.stages.disconnect(connection_id, abandoned_scope=abandoned)
@@ -281,7 +391,11 @@ class LocalService:
             server = await asyncio.start_unix_server(self.client, path=path, limit=1024 * 1024)
             path.chmod(0o600)
             async with server:
-                while self.clients or self.jobs or time.monotonic() - self.last_used < self.idle_seconds:
+                while True:
+                    waiting = await self.wake_awaits()
+                    if not (self.clients or self.jobs or waiting
+                            or time.monotonic() - self.last_used < self.idle_seconds):
+                        break
                     await asyncio.sleep(min(1, self.idle_seconds))
         finally:
             path.unlink(missing_ok=True)

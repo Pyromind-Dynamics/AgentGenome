@@ -1,0 +1,7 @@
+{
+  "id": "native-tool-check", "version": "1.0.0", "name": "原生 Pi 真实工具调用验证",
+  "description": "调用 Pi 的 write 工具创建文件，再由脚本读取实际文件验收。",
+  "requires": ["tool"],
+  "parameters": {"target": {"type": "string", "description": "待创建文件的绝对路径"}},
+  "outputs": {"receipt": "Pi write 工具的真实结果"}
+}

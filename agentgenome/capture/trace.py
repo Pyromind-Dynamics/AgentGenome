@@ -54,11 +54,12 @@ _VALUE_SHORT_FLAGS = {"-o", "-i", "-m", "-c", "-e", "-d", "-t", "-s", "-w",
 _BOOLEAN_FLAGS = {"--verbose", "--quiet", "--force", "--recursive", "--all", "--dry-run",
                   "--debug", "--help", "--version", "--no-cache", "--yes", "--check"}
 _WRITE_FLAGS = {
-    "-o", "--output", "--out", "--outdir", "--output-dir", "--output_dir",
+    "-o", "--output", "--out",
     "--output-file", "--dest", "--destination", "--save", "--save-to", "--target",
 }
 _READ_FLAGS = {
-    "-i", "--input", "--in", "--input-dir", "--input_dir", "--source", "--src",
+    "-i", "--input", "--in", "--input-dir", "--input_dir", "--outdir",
+    "--output-dir", "--output_dir", "--source", "--src",
     "--data", "--data-file", "--dataset", "--config", "--rules", "--model",
     "--weights", "--checkpoint", "--from",
 }
@@ -95,7 +96,7 @@ _REFUSAL = re.compile(
 
 _REPORTED_WRITE = re.compile(
     r"(?i)\b(?:wrote|written|saved|output|outputted)\b|"
-    r"(?:已写入|写入|输出到|产物(?:为|在|保存在|写到)?)"
+    r"(?:已写入|写入|输出到|产物(?:为|在|保存在|写到|[：:]))"
 )
 _REPORTED_ARROW = re.compile(
     r"(?:->|=>)[ \t]*(?P<path>[^\s\"'`<>，。；、]+)"
@@ -103,7 +104,7 @@ _REPORTED_ARROW = re.compile(
 _REPORTED_DIRECT = re.compile(
     r"(?i)(?:"
     r"\b(?:written|saved|output|outputted)\b[ \t]*(?:to|into|:)"
-    r"|(?:已写入|写入|输出到|产物(?:为|在|保存在|写到)?)"
+    r"|(?:已写入|写入|输出到|产物(?:为|在|保存在|写到|[：:]))"
     r")[ \t:：]*(?P<path>[^\s\"'`<>，。；、]+)"
 )
 
@@ -148,6 +149,7 @@ class Step:
     # reads by default; the report names them so a chain that loses a product says
     # why instead of failing silently.
     unresolved: tuple[str, ...] = ()
+    agent_context: Mapping[str, Any] | None = None
 
     @property
     def signature(self) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
@@ -180,6 +182,8 @@ class Step:
         }
         if self.arguments is not None:
             data["arguments"] = dict(self.arguments)
+        if self.agent_context is not None:
+            data["agent_context"] = dict(self.agent_context)
         return data
 
 
@@ -205,6 +209,9 @@ class Trace:
     steps: tuple[Step, ...]
     dropped: tuple[Dropped, ...]
     export_dropped_steps: int = 0
+    # Files observed before an in-place editor change are revised inputs, not
+    # newly generated intermediates. Keep this evidence even when reads are pruned.
+    revised_inputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,6 +231,8 @@ class Command:
     # are read by default and reported here; a stage that freezes the command asks
     # the caller to declare its output instead of guessing.
     unresolved: tuple[str, ...] = ()
+    slice_paths: tuple[str, ...] = ()
+    slice_sources: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def _basename(token: str) -> str:
@@ -480,7 +489,7 @@ def _simple_command(tokens: list[str]) -> Command:
                 pending_flag = None
                 continue
             shape.append(flag)
-            if flag in _INLINE_FLAGS and index < len(tokens):
+            if name in _INTERPRETERS and flag in _INLINE_FLAGS and index < len(tokens):
                 shape.append(INLINE_MARK)
                 index += 1
                 pending = False
@@ -573,13 +582,58 @@ def parse_command(command: str) -> Command:
             shape.append(part.shape)
     if inline:
         shape.extend(["<<", INLINE_MARK])
-    read_paths = _last_wins([path for part in parsed for path in part.read_paths])
+    # A readback after a producer is not an external input to the whole call, but
+    # only when the shell guarantees the producer ran to success before the reader.
+    # `&&` chains carry that guarantee. `||` runs its right side only after the
+    # left FAILED, `|` starts both sides at once (the data flows through stdout,
+    # not through a shared file), and `;`/`&` order execution without promising
+    # success — so writes on those connectors prove nothing about what the next
+    # segment reads. A pipeline's status is its last member's, so `&&` after a
+    # pipeline trusts only the tail's writes. Reads and writes within the SAME
+    # simple command remain visible (in-place IO).
+    # After `||`, keep reads for the rest of that conditional chain: an adjacent
+    # `&&` does not prove its producer was reached (A || B && C can skip B).
+    read_paths: list[str] = []
+    guaranteed: set[str] = set()
+    tail_writes: set[str] = set()
+    branched = False
+    slice_paths: list[str] = []
+    slice_sources: list[tuple[str, tuple[str, ...]]] = []
+    stream_reads: list[str] = []
+    sliced_stream = False
+    for index, part in enumerate(parsed):
+        if index:
+            separator = separators[index - 1]
+            if separator == "||":
+                branched = True
+            elif separator in {";", "&"}:
+                branched = False
+            if separator == "&&" and not branched:
+                guaranteed |= tail_writes
+            elif separator != "|":
+                guaranteed = set()
+        if index and separators[index - 1] != "|":
+            sliced_stream = False
+            stream_reads = []
+        stream_reads.extend(path for path in part.read_paths
+                            if role(path, writing=False) != ROLE_SCRIPT)
+        if part.name != "cd":
+            read_paths.extend(path for path in part.read_paths
+                              if str(PurePosixPath(path)) not in guaranteed)
+        tail_writes = {str(PurePosixPath(path)) for path in part.write_paths}
+        sliced_stream = sliced_stream or part.name in {"head", "tail", "shuf", "split"} or (
+            part.name == "sed" and "-n" in segments[index])
+        if sliced_stream:
+            slice_paths.extend(part.write_paths)
+            slice_sources.extend((path, tuple(dict.fromkeys(stream_reads))) for path in part.write_paths)
+    read_paths = _last_wins(read_paths)
     write_paths = _last_wins([path for part in parsed for path in part.write_paths])
     return Command(" ".join(shape), _roles(read_paths, writing=False),
                    _roles(write_paths, writing=True), tuple(read_paths),
                    tuple(write_paths), parsed[0].name,
                    tuple(item for part in parsed for item in part.literals),
-                   tuple(_last_wins([item for part in parsed for item in part.unresolved])))
+                   tuple(_last_wins([item for part in parsed for item in part.unresolved])),
+                   tuple(_last_wins(slice_paths)), tuple(slice_sources))
 
 
 def probe_command(command: Command) -> bool:
@@ -621,6 +675,20 @@ def _declared_paths(write_paths: tuple[str, ...], declared: tuple[str, ...],
     return tuple(written)
 
 
+def _reported_path(token: str) -> bool:
+    """Whether a tool result names a product rather than prose.
+
+    Tool output quotes source and messages, so `写入…` inside a `grep` hit looks
+    like a write. Prose reaches this check with sentence slashes but no file
+    shape, so a value that is not rooted needs a real suffix to count.
+    """
+    if not _is_path(token):
+        return False
+    if token.startswith(("/", "./", "../", "~/")):
+        return True
+    return bool(_suffix(token))
+
+
 def _reported_writes(text: str, *, success: bool) -> tuple[str, ...]:
     """Products a successful tool reports in its result text.
 
@@ -644,7 +712,7 @@ def _reported_writes(text: str, *, success: bool) -> tuple[str, ...]:
         )
         for match in matches:
             path = match.group("path").rstrip(").,;:")
-            if not path or path in _DEVICE_PATHS or not _is_path(path):
+            if not path or path in _DEVICE_PATHS or not _reported_path(path):
                 continue
             if path.endswith("/"):
                 continue
@@ -672,8 +740,11 @@ def _tool_step(entry: dict[str, Any], trace_id: str, seq: int) -> tuple[Step, st
         arguments = dict(args) if kind == KIND_TOOL else None
         return Step(seq, trace_id, kind, tool, str(args.get("command") or ""), shape, reads,
                     writes, read_paths, write_paths, success, rejected, raw_ref,
+                    verify=str(entry.get("verify") or ""),
                     arguments=arguments, reported_writes=reported_writes,
-                    unresolved=unresolved)
+                    unresolved=unresolved,
+                    agent_context=entry.get("agent_context")
+                    if isinstance(entry.get("agent_context"), dict) else None)
 
     if tool in _SHELL_TOOLS:
         text_command = str(args.get("command") or "")
@@ -735,6 +806,28 @@ def arg_paths(value: Any) -> list[str]:
     if isinstance(value, list):
         return [path for item in value for path in arg_paths(item)]
     return []
+
+
+def agent_write_inputs(step: Step) -> tuple[str, ...]:
+    """Observed inputs for an agent task materialized through write, never edit.
+
+    Old traces without task context remain ambiguous. Writer bytes alone are not
+    evidence of a replayable semantic task.
+    """
+    context = step.agent_context or {}
+    if (step.kind != KIND_WRITE or step.tool_name != "write"
+            or context.get("complete") is not True
+            or not isinstance(context.get("instruction"), str)
+            or not context["instruction"].strip()
+            or not isinstance(context.get("intent"), str)
+            or not context["intent"].strip()):
+        return ()
+    inputs = context.get("inputs")
+    if not isinstance(inputs, list):
+        return ()
+    return tuple(path for path in inputs if isinstance(path, str) and _is_path(path)
+                 and role(path, writing=False) != ROLE_SCRIPT
+                 and path not in step.write_paths)
 
 
 def _tool_call_step(entry: dict[str, Any], trace_id: str, seq: int) -> tuple[Step, str | None]:
@@ -824,6 +917,9 @@ def capture_trace(text: str, *, source: str = "") -> Trace:
         raise ValueError("trace dropped_steps must be a non-negative integer")
     steps: list[Step] = []
     dropped: list[Dropped] = []
+    observed: set[str] = set()
+    written: set[str] = set()
+    revised: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -844,6 +940,21 @@ def capture_trace(text: str, *, source: str = "") -> Trace:
         if candidate is None:
             continue
         step, reason = candidate
+        if step.success and not step.rejected:
+            if step.kind == KIND_READ:
+                observed.update(str(PurePosixPath(path)) for path in step.write_paths)
+            elif step.kind == KIND_SHELL and probe_command(parse_command(step.command)):
+                observed.update(str(PurePosixPath(path)) for path in step.read_paths)
+            elif step.kind != KIND_HUMAN:
+                products = {str(PurePosixPath(path))
+                            for path in (*step.write_paths, *step.reported_writes)}
+                editing = step.kind == KIND_WRITE and step.tool_name in {"edit", "multiedit"}
+                for path in products:
+                    if editing and path in observed and path not in written:
+                        revised.add(path)
+                    elif not editing:
+                        revised.discard(path)
+                written.update(products)
         if entry.get("keep") is True:
             step = replace(step, keep=True)
         if reason is not None:
@@ -854,7 +965,7 @@ def capture_trace(text: str, *, source: str = "") -> Trace:
     session_name = document.get("session_name")
     return Trace(trace_id, None if session_id is None else str(session_id),
                  None if session_name is None else str(session_name), source,
-                 tuple(steps), tuple(dropped), export_dropped)
+                 tuple(steps), tuple(dropped), export_dropped, tuple(sorted(revised)))
 
 
 def steps_payload(trace: Trace) -> dict[str, Any]:
@@ -866,6 +977,7 @@ def steps_payload(trace: Trace) -> dict[str, Any]:
         "step_count": len(trace.steps),
         "dropped_count": len(trace.dropped),
         "export_dropped_steps": trace.export_dropped_steps,
+        "revised_inputs": list(trace.revised_inputs),
         "steps": [step.payload() for step in trace.steps],
         "dropped": [item.payload() for item in trace.dropped],
     }

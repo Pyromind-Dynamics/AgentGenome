@@ -405,8 +405,16 @@ class DistillPlans:
                 );
                 CREATE INDEX IF NOT EXISTS distill_plans_scope_status
                     ON distill_plans(scope, status);
+                CREATE TABLE IF NOT EXISTS distill_plan_requests (
+                    scope TEXT NOT NULL, request_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY(scope, request_id)
+                );
                 """
             )
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(distill_plans)')}
+            if 'revision' not in columns:
+                db.execute('ALTER TABLE distill_plans ADD COLUMN revision INTEGER NOT NULL DEFAULT 1')
 
     @staticmethod
     def _payload(row: Any) -> dict[str, Any]:
@@ -425,6 +433,7 @@ class DistillPlans:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "requires_confirmation": row["status"] == "planned",
+            "revision": row["revision"],
         }
 
     @staticmethod
@@ -442,25 +451,74 @@ class DistillPlans:
         request_id: str,
         arguments: dict[str, Any],
         analysis: dict[str, Any],
+        plan_id: str | None = None,
+        base_digest: str | None = None,
     ) -> dict[str, Any]:
         if not scope or not request_id:
             raise ValueError("scope and request id are required")
         digest = self.digest_for(arguments=arguments, analysis=analysis)
+        fingerprint = self.digest_for(arguments={"plan_id": plan_id, "base_digest": base_digest},
+                                      analysis={"digest": digest})
         issues = tuple(
             (analysis.get("review") or {}).get("blocking_issues") or ()
         )
         with self._lock, self.service._db() as db:
+            receipt = db.execute(
+                'SELECT fingerprint,payload FROM distill_plan_requests WHERE scope=? AND request_id=?',
+                (scope, request_id)).fetchone()
+            if receipt is not None:
+                if receipt['fingerprint'] != fingerprint:
+                    raise ValueError('request id reused with a different distillation plan')
+                return {**json.loads(receipt['payload']), 'repeated': True}
             previous = db.execute(
                 "SELECT * FROM distill_plans WHERE scope=? AND request_id=?",
                 (scope, request_id),
             ).fetchone()
             if previous is not None:
+                if plan_id is not None:
+                    # The id already names a plan's creation — another plan's, or
+                    # this same plan's. Either way it may not also name a revision:
+                    # one request id stands for exactly one create/revise operation.
+                    raise ValueError(
+                        'request id already used by another distillation plan'
+                        if previous['id'] != _plan_key(plan_id)
+                        else 'request id already used to create this distillation plan; '
+                             'revise with a fresh request id')
                 current = self._payload(previous)
                 if current["digest"] != digest:
                     raise ValueError(
-                        "request id reused with a different distillation plan"
-                    )
+                        "request id reused with a different distillation plan")
+                # A creation recorded before request receipts existed:
+                # register it so the same id cannot be reused elsewhere.
+                db.execute('INSERT OR IGNORE INTO distill_plan_requests VALUES(?,?,?,?)',
+                           (scope, request_id, fingerprint, _encoded(current)))
                 return current
+            if plan_id is not None:
+                row = db.execute('SELECT * FROM distill_plans WHERE scope=? AND id=?',
+                                 (scope, _plan_key(plan_id))).fetchone()
+                if row is None:
+                    raise ValueError('distillation plan not found in this conversation')
+                current = self._payload(row)
+                if current['status'] != 'planned':
+                    raise ValueError('only an unconfirmed distillation plan can be revised')
+                if not base_digest or base_digest != current['digest']:
+                    raise ValueError('distillation plan digest changed; query the current plan before revising')
+                initial_fingerprint = self.digest_for(
+                    arguments={"plan_id": None, "base_digest": None},
+                    analysis={"digest": current['digest']})
+                db.execute('INSERT OR IGNORE INTO distill_plan_requests VALUES(?,?,?,?)',
+                           (scope, current['request_id'], initial_fingerprint, _encoded(current)))
+                if digest != current['digest']:
+                    db.execute('UPDATE distill_plans SET arguments=?,analysis=?,digest=?, '
+                               'revision=revision+1,updated_at=? WHERE id=? AND scope=?',
+                               (_encoded(arguments), _encoded(analysis), digest, _now(),
+                                _plan_key(plan_id), scope))
+                row = db.execute('SELECT * FROM distill_plans WHERE scope=? AND id=?',
+                                 (scope, _plan_key(plan_id))).fetchone()
+                state = self._payload(row)
+                db.execute('INSERT INTO distill_plan_requests VALUES(?,?,?,?)',
+                           (scope, request_id, fingerprint, _encoded(state)))
+                return state
             # Re-submitting without changing anything used to open a new plan that
             # reported the same problems, so a fix round looked like progress when
             # nothing had moved. Answer with the plan already on the table.
@@ -476,7 +534,12 @@ class DistillPlans:
                         (stored["analysis"].get("review") or {}).get("blocking_issues")
                         or ()
                     )
-                    if stored_issues == issues:
+                    if (stored_issues == issues and stored['arguments'] == arguments
+                            and stored['analysis'].get('review', {}).get('trace_evidence')
+                            == analysis.get('review', {}).get('trace_evidence')):
+                        db.execute(
+                            'INSERT OR IGNORE INTO distill_plan_requests VALUES(?,?,?,?)',
+                            (scope, request_id, fingerprint, _encoded(stored)))
                         return {**stored, "repeated": True}
             plan_id = uuid4().hex
             now = _now()
@@ -499,6 +562,12 @@ class DistillPlans:
                     now,
                 ),
             )
+            # Register the creation request itself: the same id may not later name
+            # a revision of another plan.
+            row = db.execute('SELECT * FROM distill_plans WHERE scope=? AND id=?',
+                             (scope, plan_id)).fetchone()
+            db.execute('INSERT INTO distill_plan_requests VALUES(?,?,?,?)',
+                       (scope, request_id, fingerprint, _encoded(self._payload(row))))
         return self.get(scope, plan_id)
 
     def get(self, scope: str, plan_id: str) -> dict[str, Any]:
@@ -511,6 +580,16 @@ class DistillPlans:
             raise ValueError("distillation plan not found in this conversation")
         return self._payload(row)
 
+    def previews(self, scope: str) -> list[dict[str, Any]]:
+        with self.service._db() as db:
+            rows = db.execute('SELECT * FROM distill_plans WHERE scope=? '
+                              'ORDER BY updated_at DESC LIMIT 20', (scope,)).fetchall()
+        return [{key: state[key] for key in ('plan_id', 'digest', 'revision', 'status',
+                                             'capture_id', 'run_id', 'updated_at')}
+                | {'label': state['arguments'].get('label'),
+                   'ready': state['analysis'].get('review', {}).get('validation', {}).get('ready', False)}
+                for state in map(self._payload, rows)]
+
     def begin_confirmation(
         self,
         scope: str,
@@ -520,6 +599,16 @@ class DistillPlans:
         stale_after_seconds: int = 600,
     ) -> dict[str, Any]:
         plan_id = _plan_key(plan_id)
+        if not digest or not digest.strip():
+            # A plan id is stable across revisions, so the id alone no longer
+            # proves the user saw the current content: confirmation is bound to
+            # the digest of the exact version that was shown.
+            raise ValueError(
+                "confirming a distillation plan requires its current digest; "
+                "query the plan with genome_distill, show that version to the "
+                "user, and confirm with the digest you showed"
+            )
+        digest = digest.strip()
         stale_before = datetime.fromtimestamp(
             datetime.now(timezone.utc).timestamp() - stale_after_seconds,
             timezone.utc,
@@ -536,7 +625,7 @@ class DistillPlans:
                 if row is None:
                     raise ValueError("distillation plan not found in this conversation")
                 state = self._payload(row)
-                if digest is not None and digest != state["digest"]:
+                if digest != state["digest"]:
                     raise ValueError(
                         "distillation plan digest changed; "
                         "show the plan again and ask the user"

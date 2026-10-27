@@ -106,8 +106,9 @@ async function runtimeFingerprint(python) {
 }
 
 export class NativeClient {
-  constructor({ home = defaultHome(), scope, cwd, python } = {}) {
+  constructor({ home = defaultHome(), scope, cwd, python, judgeProtocol = false } = {}) {
     this.home = resolve(home); this.scope = scope; this.cwd = cwd; this.python = python;
+    this.judgeProtocol = judgeProtocol;
     this.pending = new Map(); this.closed = false;
   }
 
@@ -147,7 +148,8 @@ export class NativeClient {
     }
     try {
       const hello = await this.send("hello", { protocol: PROTOCOL, version: VERSION,
-        runtime_fingerprint: fingerprint, stage_protocol: 1, scope: this.scope, cwd: this.cwd });
+        runtime_fingerprint: fingerprint, stage_protocol: 1,
+        ...(this.judgeProtocol ? { judge_protocol: 1 } : {}), scope: this.scope, cwd: this.cwd });
       if (hello.runtime_fingerprint !== fingerprint) {
         throw new Error("AgentGenome service build mismatch: an older service is still running. Finish existing runs, close all Pi clients and wait for idle exit before reconnecting; no runs were restarted.");
       }

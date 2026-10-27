@@ -34,7 +34,13 @@ def evaluate(prompt: Path, evidence: Path, directory: Path, timeout: float = 120
         if (directory / 'response.ready').exists():
             response = json.loads(read_small(directory / 'response.json'))
             if response.get('request_id') != request_id:
-                raise ValueError('judge response does not match request')
+                # A stale answer from an earlier judge round: one verify command
+                # may ask the model about several criteria in sequence. Consume
+                # the marker so the watcher serves the fresh request that was
+                # just written, then keep waiting for the matching response.
+                (directory / 'response.ready').unlink(missing_ok=True)
+                time.sleep(.05)
+                continue
             if response.get('error'):
                 raise ValueError(response['error'])
             verdict = response.get('verdict')

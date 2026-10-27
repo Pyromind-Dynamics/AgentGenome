@@ -24,7 +24,7 @@ test("standard Pi loader discovers the installed plugin without extensionFactori
   assert.deepEqual(result.errors, []);
   assert.equal(result.extensions.length, 1);
   const extension = result.extensions[0];
-  assert.deepEqual([...extension.tools.keys()].sort(), ["genome_list", "genome_trace", "genome_capture", "genome_distill", "genome_capture_status", "genome_get", "genome_run", "genome_prepare_revision", "genome_takeover", "genome_step_result", "genome_status", "genome_resume", "genome_cancel"].sort());
+  assert.deepEqual([...extension.tools.keys()].sort(), ["genome_prepare_run", "genome_confirm_run", "genome_confirm_distill", "genome_replay_requeue", "genome_list", "genome_trace", "genome_capture", "genome_distill", "genome_capture_status", "genome_get", "genome_run", "genome_prepare_revision", "genome_takeover", "genome_step_result", "genome_status", "genome_resume", "genome_cancel"].sort());
   assert.ok(extension.commands.has("genome"));
   assert.ok(extension.handlers.has("session_start"));
   assert.ok(extension.handlers.has("session_shutdown"));

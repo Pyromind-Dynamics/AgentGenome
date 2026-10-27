@@ -1,0 +1,29 @@
+version: "gt/1.0"
+node:
+  id: flow
+  mode: sequence
+  children:
+    - id: submit
+      input:
+        directory: {type: text, from: params.output_dir}
+      do:
+        tool:
+          name: demo_async_submit
+          args: {output_dir: "{input.directory}"}
+      output: {receipt: {type: json}}
+      artifact: {ext: json}
+      verify:
+        - run: "test -s {artifact}"
+    - id: wait
+      input:
+        receipt: {type: json, from: submit.output.receipt}
+      do:
+        await: {receipt: "{input.receipt}", timeout: 30}
+      output: {product: {type: text}}
+      artifact: {ext: jsonl}
+      verify:
+        - run: "python3 -c 'import json,sys; assert json.load(open(sys.argv[1])) == {\"actual\": True}' {artifact}"
+  output:
+    product: {type: text, compose: [wait.output.product]}
+  verify:
+    - run: "test -s {output.product}"

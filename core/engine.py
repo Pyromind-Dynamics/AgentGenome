@@ -569,8 +569,6 @@ class Engine:
             )
             if not isinstance(result, ToolResult):
                 raise PortError("ToolPort.call 返回不符合协议", kind="bad_output")
-            if self.ports.check_cancel:
-                self.ports.check_cancel()
         except PortError as exc:
             if self.ports.on_event:
                 self.ports.on_event({
@@ -623,6 +621,10 @@ class Engine:
             artifact=self.artifacts.describe(str(artifact)),
             duration_ms=round((time.monotonic() - started) * 1000),
         )
+        # Preserve the proven terminal outcome before cancellation stops the graph.
+        # Checking inside the dispatch try would turn a returned result into unknown.
+        if self.ports.check_cancel:
+            self.ports.check_cancel()
         if result.is_error:
             raise NodeFailed(
                 Failure(node.path, "do", seq,

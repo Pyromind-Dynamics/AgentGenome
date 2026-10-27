@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from agentgenome.capture.emit import LocalSource
 from agentgenome.capture.pipeline import prepare_capture
-from agentgenome.capture.sample import SAMPLE_BYTES, inspect, sample_inputs
+from agentgenome.capture.sample import SAMPLE_BYTES, compatibility, inspect, sample_inputs
 from agentgenome.dispatch import invoke
 
 
@@ -41,6 +43,24 @@ def test_large_input_is_truncated_to_a_whole_line_head(tmp_path):
     assert len(entry["text"].encode("utf-8")) <= SAMPLE_BYTES
     assert entry["text"].endswith("\n")
     assert entry["note"] == "只保留文件头部"
+
+
+@pytest.mark.parametrize("name,content", [
+    ("small.csv", "id,value\n" + "".join(f"{i},x\n" for i in range(28))),
+    ("small.jsonl", "".join(json.dumps({"id": i}) + "\n" for i in range(28))),
+])
+def test_complete_small_input_counts_all_records_before_preview_trim(tmp_path, name, content):
+    from agentgenome.analysis import _input
+
+    write(tmp_path, name, content)
+    source = LocalSource(tmp_path)
+    entry = inspect(source, name)
+    assert entry["rows"] == 28
+    assert entry["truncated"] is False
+    assert len(entry["text"].splitlines()) == (21 if name.endswith("csv") else 20)
+    analysis = _input(source, "data", name)
+    assert analysis["rows"] == 28
+    assert analysis["row_count_exact"] is True
 
 
 def test_jsonl_sample_reports_the_fields_it_saw(tmp_path):
@@ -157,3 +177,56 @@ def test_genome_get_and_list_expose_the_samples(
 
     listed = invoke(service, "conv-1", "list", {}, "call-3", host=host)
     assert [asset["has_samples"] for asset in listed["assets"]] == [True]
+
+
+@pytest.mark.parametrize("suffix", ["yaml", "yml"])
+def test_yaml_contract_recognizes_top_level_fields_and_legacy_text_samples(tmp_path, suffix):
+    path = write(tmp_path, f"config/rules.{suffix}",
+                 "labels:\n  - name: keep\nthreshold: 0.6\n")
+    actual = inspect(LocalSource(tmp_path), path)
+    assert actual["format"] == "yaml"
+    assert actual["schema"] == {"type": "object", "fields": ["labels", "threshold"]}
+    contract = {"rules": {"format": "yaml", "required_fields": ["labels", "threshold"]}}
+    assert compatibility(None, contract, [("rules", actual)])["problems"] == []
+    missing = {"rules": {"format": "yaml", "required_fields": ["missing"]}}
+    assert "missing" in str(compatibility(None, missing, [("rules", actual)])["problems"])
+    legacy = {"files": [{"key": "rules", "format": "text"}]}
+    assert compatibility(legacy, {}, [("rules", actual)])["problems"] == []
+
+
+def test_an_absent_output_directory_is_pending_not_unreadable(tmp_path):
+    """输出目录由本次运行创建：采不到不代表输入坏了，否则换批必误报。"""
+    write(tmp_path, "data/raw.csv", "text,label\none,a\n")
+    index = sample_inputs(
+        LocalSource(tmp_path), {"raw": "data/raw.csv", "out": "runs/task/output"},
+        tmp_path / "samples", optional={"out"})
+    entry = {item["key"]: item for item in index["files"]}["out"]
+    assert entry["format"] == "pending"
+    assert entry["bytes"] is None
+    assert index["pending"] == ["out"]
+
+
+def test_an_existing_output_directory_is_pending_too(tmp_path):
+    """上一次的产物就躺在输出目录里：它是目的地，不是这次链路的输入。"""
+    write(tmp_path, "data/raw.csv", "text,label\none,a\n")
+    write(tmp_path, "runs/task/output/cleaned.csv", "text\none\n")
+    index = sample_inputs(
+        LocalSource(tmp_path), {"raw": "data/raw.csv", "out": "runs/task/output"},
+        tmp_path / "samples", optional={"out"})
+    entry = {item["key"]: item for item in index["files"]}["out"]
+    assert entry["format"] == "pending"
+    assert entry["name"] is None
+    assert index["pending"] == ["out"]
+    # Keeping the old product would freeze the previous batch as a fixture.
+    assert not (tmp_path / "samples" / "out").exists()
+
+
+def test_a_missing_input_is_still_unreadable_when_it_is_not_an_output(tmp_path):
+    """不能因为上面那条放松：输入路径写错仍然要报出来。"""
+    write(tmp_path, "data/raw.csv", "text,label\none,a\n")
+    index = sample_inputs(
+        LocalSource(tmp_path), {"raw": "data/raw.csv", "data": "data/missing.csv"},
+        tmp_path / "samples")
+    entry = {item["key"]: item for item in index["files"]}["data"]
+    assert entry["format"] == "unavailable"
+    assert index["pending"] == []

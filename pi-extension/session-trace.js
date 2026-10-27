@@ -115,12 +115,17 @@ export function traceSteps(entries, maxSteps = DEFAULT_MAX_STEPS, { complete = f
     }
   }
   const steps = [];
+  let instruction = "", intent = "";
+  let inputs = [];
   for (const entry of entries) {
     if (entry?.type !== "message") continue;
     const message = entry.message;
     if (message?.role === "user") {
       const clippedFields = [];
       const text = textOf(message.content);
+      instruction = text;
+      intent = "";
+      inputs = [];
       const projected = complete
         ? projectText(text)
         : { text: clip(text, TEXT_LIMIT, clippedFields, "text"), excerpt: null };
@@ -131,6 +136,8 @@ export function traceSteps(entries, maxSteps = DEFAULT_MAX_STEPS, { complete = f
       continue;
     }
     if (message?.role !== "assistant") continue;
+    const explanation = textOf(message.content);
+    if (explanation) intent = explanation;
     for (const block of message.content ?? []) {
       if (block?.type !== "toolCall") continue;
       const result = results.get(block.id);
@@ -141,13 +148,23 @@ export function traceSteps(entries, maxSteps = DEFAULT_MAX_STEPS, { complete = f
       const projected = complete && resultText !== null
         ? projectText(resultText)
         : { text: clip(resultText, TEXT_LIMIT, clippedFields, "result.text"), excerpt: null };
+      // Record the task and observed inputs, not the bytes the editor wrote.
+      // A later explicit llm declaration can then cite verifiable provenance.
+      const context = block.name === "write" && instruction && intent
+        ? { instruction: clip(instruction), intent: clip(intent), inputs: [...inputs],
+          complete: instruction.length <= TEXT_LIMIT && intent.length <= TEXT_LIMIT }
+        : null;
       steps.push({ kind: "tool", entry_id: entry.id, timestamp: entry.timestamp,
         tool: block.name, call_id: block.id, args,
+        ...(context ? { agent_context: context } : {}),
         result: result
           ? { is_error: result.isError === true, text: projected.text,
             ...(projected.excerpt ? { excerpt: projected.excerpt } : {}) }
           : null,
         ...(clippedFields.length ? { clipped_fields: clippedFields } : {}) });
+      const readPath = block.arguments?.path ?? block.arguments?.file_path;
+      if (block.name === "read" && result && !result.isError
+        && typeof readPath === "string" && !inputs.includes(readPath)) inputs.push(readPath);
     }
   }
   const dropped = complete ? 0 : Math.max(0, steps.length - maxSteps);
@@ -231,18 +248,47 @@ function preview(steps) {
   return steps.filter((step) => step.kind === "tool").map((step) => step.tool).slice(0, 4).join(" → ");
 }
 
+async function isFile(path) {
+  const info = await stat(path).catch(() => null);
+  return Boolean(info?.isFile());
+}
+
+// Pi writes `<ISO timestamp>_<session id>.jsonl`, so a session id is not a file
+// name. Resolve by exact name first, then by that timestamp prefix, and read the
+// header only as a last resort — a caller passing an id from `listSessions` must
+// not get a bare ENOENT.
+async function sessionFiles(directory) {
+  const names = await readdir(directory).catch(() => []);
+  const found = [];
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) continue;
+    const path = join(directory, name);
+    const info = await stat(path).catch(() => null);
+    if (info?.isFile()) found.push({ path, name, modified: info.mtimeMs });
+  }
+  return found.sort((left, right) => right.modified - left.modified);
+}
+
 async function sessionFile(manager, id) {
   if (isAbsolute(id)) return id;
   const directory = manager.getSessionDir();
   const direct = join(directory, id);
-  if (id.endsWith(".jsonl")) return direct;
-  const named = join(directory, `${id}.jsonl`);
-  try {
-    await stat(named);
-    return named;
-  } catch {
-    return direct;
+  const named = id.endsWith(".jsonl") ? direct : join(directory, `${id}.jsonl`);
+  if (await isFile(named)) return named;
+  if (await isFile(direct)) return direct;
+  const files = await sessionFiles(directory);
+  const suffix = id.endsWith(".jsonl") ? id : `${id}.jsonl`;
+  const prefixed = files.find((file) => file.name.endsWith(`_${suffix}`));
+  if (prefixed) return prefixed.path;
+  for (const file of files) {
+    const entries = parseSessionLog(await readFile(file.path, "utf8").catch(() => ""));
+    const header = entries.find((entry) => entry?.type === "session");
+    if (header?.id === id || header?.id === suffix) return file.path;
   }
+  const available = files.map((file) => basename(file.name, ".jsonl"));
+  throw new Error(`找不到会话 ${id}：${directory} 下没有匹配的 .jsonl 文件。`
+    + `可用会话：${available.slice(0, SESSION_LIMIT).join("、") || "（无）"}。`
+    + "请把 genome_sessions 列出的 trace_id 原样传入。");
 }
 
 async function readEntries(manager, id) {

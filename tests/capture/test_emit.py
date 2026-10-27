@@ -14,6 +14,7 @@ from agentgenome.capture.emit import (
     output_type,
     package_payload,
     render_emit,
+    sibling_guess_warnings,
 )
 from agentgenome.capture.slice import reverse_slice
 
@@ -85,6 +86,46 @@ def test_output_type_follows_the_extension():
     assert output_type("reports/metrics.json") == "json"
     assert output_type("out/clean.csv") == "text"
     assert output_type("models/model.pt") == "path"
+
+
+def test_output_directory_is_a_reusable_root_parameter_not_a_node_product(
+        tmp_path, workspace, trace_factory, tool_entry):
+    trace = trace_factory([
+        tool_entry("run", "python3 scripts/clean.py --input data/raw.csv "
+                   "--output-dir {output_dir} --output out/report.csv"),
+    ])
+    alignment = align_traces([trace])
+    package = build_package(
+        tmp_path / "package", alignment=alignment,
+        slice_=reverse_slice(alignment, "out/report.csv"), traces=[trace],
+        label="reusable output directory", workspace=workspace,
+        bindings={"output_dir": "runs/task-a/output"},
+        declarations={"input_contract": {
+            "output_dir": {"type": "path", "format": "dir"},
+        }},
+    )
+    assert package.graph.params == frozenset({"output_dir", "raw"})
+    assert package.nodes[0].command == (
+        "python3 scripts/clean.py --input {input.raw} "
+        "--output-dir {input.output_dir} --output {artifact}"
+    )
+
+
+@pytest.mark.parametrize("secondary", ["out/notes.json", "./out/notes.json"])
+def test_consumed_secondary_product_cannot_become_a_root_input(
+        tmp_path, workspace, trace_factory, tool_entry, secondary):
+    producer = tool_entry("p", "python3 scripts/normalize.py data/raw.csv "
+                          "--output out/main.csv --notes out/notes.json")
+    producer["declared_writes"] = ["out/main.csv", "out/notes.json"]
+    trace = trace_factory([
+        producer,
+        tool_entry("c", f"python3 scripts/clean.py out/main.csv {secondary} > out/final.csv"),
+    ])
+    alignment = align_traces([trace])
+    with pytest.raises(EmitError, match="副产物.*notes.json"):
+        build_package(tmp_path / "package", alignment=alignment,
+                      slice_=reverse_slice(alignment, "out/final.csv"),
+                      traces=[trace], label="two products", workspace=workspace)
 
 
 def test_artifact_ext_follows_the_captured_output_name():
@@ -193,6 +234,37 @@ def test_a_product_written_elsewhere_stays_in_the_run_directory(
                             label="子集清单", workspace=workspace)
     data = yaml.safe_load((package.directory / "graph.yaml").read_text(encoding="utf-8"))
     assert data["node"]["children"][0]["artifact"] == {"ext": "jsonl"}
+
+
+def test_a_tracked_report_is_not_pinned_into_the_input_directory(
+    tmp_path, workspace, trace_factory, tool_entry
+):
+    """A run product must not follow the input into the user's data directory.
+
+    The captured command wrote its report next to the batch it read, so emit pinned
+    the artifact at `{input.input.dir}/report.csv`. Every reuse then dropped a
+    tracking copy into whichever directory the new input lived in (a B batch under
+    `data/inputs/`), while the four deliverables went to the declared output
+    directory. A report summarises its inputs and carries no relative references to
+    neighbours, so there is nothing to preserve: it keeps the run-directory artifact.
+    """
+    trace = trace_factory([
+        tool_entry("a1", "python3 scripts/clean.py --input data/inputs/batch-a.csv "
+                         "--rules rules.yaml --output-dir {output_dir} "
+                         "--output data/inputs/report.csv"),
+    ], "s1")
+    alignment = align_traces([trace])
+    package = build_package(
+        tmp_path / "package", alignment=alignment,
+        slice_=reverse_slice(alignment, "data/inputs/report.csv"), traces=[trace],
+        label="tracked report", workspace=workspace,
+        bindings={"output_dir": "runs/task-a/output"},
+        declarations={"input_contract": {
+            "output_dir": {"type": "path", "format": "dir"},
+        }},
+    )
+    data = yaml.safe_load((package.directory / "graph.yaml").read_text(encoding="utf-8"))
+    assert data["node"]["children"][0]["artifact"] == {"ext": "csv"}
 
 
 def test_a_token_named_product_is_pinned_under_the_file_it_binds(
@@ -440,3 +512,23 @@ def test_labels_without_ascii_still_get_a_usable_asset_id(capture):
     assert package.asset_id.startswith("capture-")
     assert package.root_id.startswith("capture-")
     assert package.root_id == package.asset_id
+
+
+def test_sibling_guess_warning_flags_parent_and_with_name_only_in_python():
+    guessing = (b"from pathlib import Path\n"
+                b"labels = Path(args.cleaned).parent / 'labels.csv'\n")
+    assert sibling_guess_warnings("scripts/queue.py", guessing)
+    renamed = b"from pathlib import Path\nPath(args.x).with_name('labels.csv')\n"
+    assert sibling_guess_warnings("scripts/queue.py", renamed)
+    declared = b"from pathlib import Path\nPath('out/labels.csv').write_text('x')\n"
+    assert sibling_guess_warnings("scripts/queue.py", declared) == []
+    assert sibling_guess_warnings("scripts/queue.sh", b"cat \"$(dirname \"$1\")/labels.csv\"") == []
+    assert sibling_guess_warnings("scripts/broken.py", b"def (") == []
+
+
+def test_sibling_warning_does_not_flag_creating_output_parents():
+    assert sibling_guess_warnings("script.py", b"Path(args.output).parent.mkdir(parents=True, exist_ok=True)") == []
+    warning = sibling_guess_warnings("script.py", b"Path(args.input).parent / 'labels.csv'")[0]
+    assert "疑似" in warning
+    assert "reads" not in warning
+    assert "命令行参数" in warning

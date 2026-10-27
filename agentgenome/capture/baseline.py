@@ -27,6 +27,12 @@ def _fixtures(samples: Mapping[str, Any], manifest: Mapping[str, Any]
         if not isinstance(entry, Mapping):
             return None
         key, name = entry.get("key"), entry.get("name")
+        if entry.get("format") == "pending" and isinstance(key, str):
+            # An output location the run creates: it has no fixture to keep, but it
+            # is still one of the case's parameters. Without this a capture whose
+            # output directory does not exist yet never gets a baseline at all.
+            params[key] = f"output:{key}"
+            continue
         if (not isinstance(key, str) or not isinstance(name, str)
                 or entry.get("truncated") or entry.get("format") in {"unavailable", "binary"}):
             return None

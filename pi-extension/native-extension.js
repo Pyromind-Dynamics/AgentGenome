@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { NativeClient, setupRuntime } from "./native-client.js";
+import { NativeClient, setupRuntime, defaultHome, VERSION } from "./native-client.js";
+import { modelJudge, supportsModelJudge } from "./native-judge.js";
+import { executeNativeTool } from "./native-tools.js";
 
 const ACTIVE = new Set(["queued", "running", "cancelling"]);
 const RECEIPT = "agentgenome.completed";
@@ -41,19 +43,38 @@ export function deliveredRunIds(entries) {
 export function progressLines(run) {
   const progress = run.progress || {};
   const waiting = run.status === "waiting" ? run.result?.waiting || {} : null;
+  const external = waiting?.kind === "external";
   return [`历史经验 ${run.asset_id}@${run.version} · ${run.status}`,
     `节点：${progress.node || waiting?.node || run.node || "等待启动"} · ${progress.event || run.status}`,
     ...(waiting?.question ? [`待办：${waiting.question}`] : []),
     ...(waiting?.artifact ? [`产物：${waiting.artifact}`] : []),
+    ...(external ? ["正在等待外部任务：后台自动检查，无需人工写入产物或重新提交。",
+      ...(waiting.task_id ? [`任务：${waiting.task_id}`] : []),
+      ...(waiting.deadline ? [`截止时间：${new Date(waiting.deadline * 1000).toISOString()}`] : []),
+      "后续需要 Pi 工具或模型时须保持会话连接并具备执行上下文。取消仅停止工作流等待。"] : []),
     ...(progress.command ? [`命令：${progress.command}`] : []),
     ...(progress.verdict ? [`验收：${progress.verdict}`] : []),
     ...(progress.tail ? [progress.tail.slice(-2000)] : [])];
 }
 
-export function nativeHost(pi, { clientFactory = (options) => new NativeClient(options), setup = setupRuntime } = {}) {
+export function nativeHost(pi, { clientFactory = (options) => new NativeClient(options), setup = setupRuntime,
+  judge = modelJudge, judgeTimeout = 90000, registryHome = defaultHome } = {}) {
   let current;
 
   function alive(state) { return current === state && !state.closed; }
+  function receiptWasFinalAction(messages, callId) {
+    if (!callId || !Array.isArray(messages)) return false;
+    let receiptSeen = false;
+    for (const message of messages) {
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+      for (const part of message.content) {
+        if (part?.type !== "toolCall") continue;
+        if (part.id === callId) receiptSeen = true;
+        else if (receiptSeen) return false;
+      }
+    }
+    return receiptSeen;
+  }
   function show(state, lines) {
     if (alive(state) && state.ctx.hasUI) state.ctx.ui.setWidget("agentgenome", lines);
   }
@@ -61,26 +82,106 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
   function begin(ctx) {
     if (current) stop();
     const scope = `pi:${ctx.sessionManager.getSessionFile() || ctx.sessionManager.getSessionId()}`;
+    const saved = [...ctx.sessionManager.getEntries()].reverse().find(entry =>
+      entry.type === "custom" && entry.customType === "agentgenome.registry"
+      && typeof entry.data?.home === "string" && entry.data.home.startsWith("/"));
+    const home = saved?.data.home || registryHome();
     const state = { ctx, scope, ready: new Set(), sent: new Map(),
-      gates: deliveredGates(ctx.sessionManager.getEntries()), closed: false };
-    state.client = clientFactory({ scope, cwd: ctx.cwd });
+      gates: deliveredGates(ctx.sessionManager.getEntries()), closed: false, judges: new Map(),
+      toolExecutors: new Map(), toolTasks: new Map() };
+    state.client = clientFactory({ home, scope, cwd: ctx.cwd, judgeProtocol: supportsModelJudge(ctx) });
+    state.registry = { home, scope, version: VERSION };
+    state.registryPinned = Boolean(saved);
     current = state;
+    if (saved && registryHome() !== home && ctx.hasUI) {
+      ctx.ui.notify?.(`AgentGenome 继续使用本会话的 registry：${home}`, "info");
+    }
     const delivered = deliveredRunIds(entries(state));
     if (entries(state).some((entry) => entry.type === "custom" && entry.customType === "agentgenome.run"
       && !delivered.has(entry.data?.run_id))) watch(state);
     return state;
   }
+  function rememberRegistry(state) {
+    if (alive(state) && !state.registryPinned) {
+      pi.appendEntry?.("agentgenome.registry", state.registry);
+      state.registryPinned = true;
+    }
+  }
   function stop() {
     if (!current) return;
     current.closed = true;
     clearTimeout(current.timer);
+    for (const task of current.judges.values()) task.controller.abort();
+    for (const task of current.toolTasks.values()) { task.controller.abort(); clearTimeout(task.timer); }
     current.client.close();
     current = undefined;
   }
 
   async function refresh(state) {
-    const { runs, stages = [] } = await state.client.request("snapshot");
+    const { runs, stages = [], judges = [], tools = [] } = await state.client.request("snapshot");
     if (!alive(state)) return false;
+    rememberRegistry(state);
+    for (const [id, task] of state.toolTasks) {
+      const pending = tools.find(item => item.execution_id === id);
+      if (!pending || pending.cancel_requested) task.controller.abort();
+      if (!pending) clearTimeout(task.timer);
+    }
+    for (const pending of tools) {
+      if (pending.claimed || pending.cancel_requested || state.toolTasks.has(pending.execution_id)) continue;
+      const claim = await state.client.request("tool_claim", { execution_id: pending.execution_id });
+      if (!claim.claimed || !alive(state)) continue;
+      const controller = new AbortController();
+      const task = { controller, timer: setTimeout(() => controller.abort(), 300000) };
+      state.toolTasks.set(pending.execution_id, task);
+      void (async () => {
+        try {
+          let response;
+          try {
+            response = await executeNativeTool(state.toolExecutors.get(pending.run_id) || state.toolExecutor,
+              claim.request, controller.signal);
+          } catch (error) { response = { error: String(error.message || "Tool outcome unknown").slice(0, 2000) }; }
+          if (alive(state)) {
+            pi.appendEntry("agentgenome.tool", { run_id: pending.run_id, execution_id: pending.execution_id,
+              name: claim.request.name, state: typeof response.is_error === "boolean"
+                ? response.is_error ? "failed" : "completed" : "unknown" });
+            await state.client.request("tool_result", { execution_id: pending.execution_id, response });
+          }
+        } catch (error) { if (alive(state)) show(state, [`工具结果未确认，勿自动重复执行：${error.message}`]); }
+        finally { clearTimeout(task.timer); state.toolTasks.delete(pending.execution_id); }
+      })();
+    }
+    for (const task of state.judges.values()) {
+      if (!runs.some(run => run.id === task.run_id && run.status === "running")) task.controller.abort();
+    }
+    for (const pending of judges) {
+      if (state.judges.has(pending.request_id)) continue;
+      const claim = await state.client.request("judge_claim", { request_id: pending.request_id });
+      if (!claim.claimed || !alive(state)) continue;
+      const controller = new AbortController();
+      state.judges.set(pending.request_id, { controller, run_id: pending.run_id });
+      // Separate request: no chat message, agent turn, tool, or stage receipt.
+      void (async () => {
+        let timer, abort;
+        try {
+          const aborted = new Promise((_, reject) => {
+            abort = () => reject(new Error("Model judge cancelled or timed out"));
+            controller.signal.addEventListener("abort", abort, { once: true });
+          });
+          timer = setTimeout(() => controller.abort(), judgeTimeout);
+          let response;
+          try { response = { verdict: await Promise.race([judge(state.ctx, claim.request, controller.signal), aborted]) }; }
+          catch (error) { response = { error: String(error.message || "Model judge failed").slice(0, 2000) }; }
+          if (alive(state)) {
+            await state.client.request("judge_result", { request_id: pending.request_id, response });
+          }
+        } catch (error) { if (alive(state)) show(state, [`模型验收回执未确认：${error.message}`]); }
+        finally {
+          clearTimeout(timer);
+          controller.signal.removeEventListener("abort", abort);
+          state.judges.delete(pending.request_id);
+        }
+      })();
+    }
     const delivered = deliveredRunIds(entries(state));
     if (state.ctx.isIdle?.() ?? true) state.aborting = false;
     if (!state.stage && !state.aborting && (state.ctx.isIdle?.() ?? true)) {
@@ -117,6 +218,8 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
         state.stage = undefined;
       }
       show(state, progressLines(run));
+      if ((run.status === "waiting" || run.status === "waiting_external")
+          && run.result?.waiting?.kind === "external") continue;
       if (run.status === "waiting") {
         const waiting = run.result?.waiting || {};
         const gate = gateKey(waiting);
@@ -164,7 +267,7 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
       }
       // Ack only after the actual custom_message appears in Pi history, not when queued.
     }
-    return runs.length > 0 || stages.length > 0;
+    return runs.length > 0 || stages.length > 0 || state.judges.size > 0;
   }
 
   function watch(state) {
@@ -195,6 +298,7 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
 
   function remember(state, run) {
     if (!alive(state)) return;
+    if (state.toolExecutor) state.toolExecutors.set(run.id, state.toolExecutor);
     pi.appendEntry("agentgenome.run", { run_id: run.id });
     if (run.status === "queued") state.ready.add(run.id);
     watch(state);
@@ -241,7 +345,10 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     const state = current, stage = state?.stage;
     if (stage?.active) {
       const last = [...(event?.messages || [])].reverse().find((message) => message.role === "assistant");
-      const status = last?.stopReason === "stop" ? "completed" : last?.stopReason === "aborted" ? "aborted" : "failed";
+      const receiptSurvivedProviderError = last?.stopReason === "error"
+        && receiptWasFinalAction(event?.messages, stage.receiptCallId);
+      const status = last?.stopReason === "stop" || receiptSurvivedProviderError
+        ? "completed" : last?.stopReason === "aborted" ? "aborted" : "failed";
       try {
         await state.client.request("stage_finish", {
           request_id: stage.request.request_id, execution_id: stage.execution_id, status,
@@ -252,7 +359,7 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     if (current?.ready.size) await startReady(current);
   });
   pi.registerCommand("genome", {
-    description: "AgentGenome: setup | import <path> | validate <id> <version> <JSON params> | publish <id> <version>",
+    description: "AgentGenome: registry | setup | import <path> | validate <id> <version> <JSON params> | publish <id> <version>",
     async handler(input, ctx) {
       try {
         const text = input.trim();
@@ -263,6 +370,10 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
           return;
         }
         const state = current || begin(ctx);
+        if (text === "registry") {
+          ctx.ui.notify(JSON.stringify(state.registry), "info");
+          return;
+        }
         let action, args;
         if (text.startsWith("import ")) { action = "import"; args = { source: text.slice(7).trim() }; }
         else {
@@ -283,7 +394,7 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
     async invoke(action, args, callId, _signal, ctx) {
       const state = current || begin(ctx);
       if (state.stage?.active) {
-        if (["run", "resume", "capture", "distill", "prepare_revision"].includes(action)) {
+        if (["run", "confirm_run", "confirm_distill", "resume", "replay_requeue", "capture", "distill", "prepare_revision"].includes(action)) {
           throw new Error("An llm stage cannot start or resume another graph");
         }
       }
@@ -293,10 +404,26 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
           throw new Error("genome_step_result must belong to this active llm stage round");
         }
         args = { ...args, execution_id: stage.execution_id };
+        const result = await state.client.request(action, args, callId);
+        if (result?.accepted === true) stage.receiptCallId = callId;
+        rememberRegistry(state);
+        return result;
       }
+      const executor = typeof ctx.executeTool === "function"
+        ? { execute: ctx.executeTool.bind(ctx), names: () => (ctx.tools || []).map(tool => tool.name) } : undefined;
+      if (executor && !state.toolsBound) {
+        await state.client.request("tool_bind", { protocol: 1 });
+        state.toolsBound = true;
+      }
+      if (executor) state.toolExecutor = executor;
       const result = await state.client.request(action, args, callId);
+      rememberRegistry(state);
+      const run = result?.run?.id ? result.run : result?.id ? result : result?.run_id ? { id: result.run_id } : null;
+      if (executor && run && ["confirm_run", "run", "resume", "replay_requeue", "capture", "confirm_distill"].includes(action)) {
+        state.toolExecutors.set(run.id, executor);
+      }
       if (action === "prepare_run") return result;
-      if (action === "confirm_run" || action === "run" || action === "resume") {
+      if (["confirm_run", "run", "resume", "replay_requeue"].includes(action)) {
         rememberRun(state, result);
       }
       else if (action === "capture" || action === "confirm_distill") rememberCapture(state, result);
@@ -304,6 +431,8 @@ export function nativeHost(pi, { clientFactory = (options) => new NativeClient(o
         if (state.stage?.active && state.stage.request.run_id === args.run_id) state.ctx.abort?.();
         watch(state);
       }
+      if (["list", "distill", "prepare_distill"].includes(action)
+        && result && typeof result === "object") return { ...result, registry: state.registry };
       return result;
     },
   };
