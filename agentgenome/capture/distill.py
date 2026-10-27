@@ -273,8 +273,9 @@ def _tool_io(raw: Mapping[str, Any], order: int) -> tuple[tuple[str, ...], str, 
     args = _tool_args(raw, order)
     values = _strings(args)
     reads = [item.strip() for item in declared]
-    # Compare through the canonical namespace: `storage/datasets/x` and `datasets/x`
-    # are one object, and a plain substring test called the declaration missing.
+    # Compare through the canonical namespace: `/target-workspace/datasets/x`,
+    # `storage/datasets/x` (old captures) and `/datasets/x` are one object, and a
+    # plain substring test called the declaration missing.
     missing = [token for token in reads
                if not any(paths.same(token, value) for value in values)]
     if missing:
@@ -571,8 +572,8 @@ def _names_artifact(text: str, path: str) -> bool:
     """Whether a user turn names this artifact, whichever root it spells.
 
     The turn may write the path with the host's own prefix (`/workspace/datasets/x`
-    against `storage/datasets/x`), so any long-enough tail of the path counts as
-    naming it.
+    against `/datasets/x`), so any long-enough tail of the path counts as naming
+    it.
     """
     segments = [part for part in path.strip().strip("\"'`").split("/") if part]
     if not segments:
@@ -591,9 +592,10 @@ def _data_paths(paths_: Sequence[str], given: Mapping[str, str],
     steps that touch the same `.py` file are not chained by data: a local trial run
     sharing a pipeline script with the planned submission is not a truncated chain.
 
-    Spellings go through `paths.display` so `storage/datasets/x` and `datasets/x`
-    compare as the one file they are; comparing raw strings made a producer look
-    unconsumed and invited a `keep` that hid the real mismatch.
+    Spellings go through `paths.display` so `/datasets/x`, `datasets/x` and the
+    old `storage/datasets/x` compare as the one file they are; comparing raw
+    strings made a producer look unconsumed and invited a `keep` that hid the
+    real mismatch.
     """
     result: set[str] = set()
     for item in paths_:
@@ -643,8 +645,8 @@ def _check_unconsumed(planned: Sequence[DistilledStep], traces: Sequence[Trace],
         problems.append(
             f"第 {step.order} 步的产出 {produced} 没有被链路里的任何后续步骤消费，"
             "反向切片会把它当辅助步骤丢掉。按这个顺序确认，别急着加 keep：\n"
-            "1. 后续步骤读的其实是同一个文件、只是写法不同（`storage/datasets/x` 与 "
-            "`datasets/x` 是同一个对象）——那就把两处写成同一种路径；\n"
+            "1. 后续步骤读的其实是同一个文件、只是写法不同（`/target-workspace/datasets/x` 与 "
+            "`/datasets/x` 是同一个对象）——那就把两处写成同一种路径；\n"
             "2. 它的产出本身有意义（建项目产生的 project_id、提交任务产生的 receipt），"
             "只是没有被下一步读——那就把它声明成资产输出，而不是 keep；\n"
             "3. 只有纯副作用、产出对外无意义时，才加 `keep: true`。\n"
@@ -1730,7 +1732,7 @@ def _relocation_issues(
                     f"第 {step.order} 步把 `{path}` 写到了运行目录，但它是从 Storage 清单 "
                     f"`{source}` 派生的。清单里的图片等相对路径是按清单所在目录解析的，"
                     f"换到运行目录就失效，平台提交前预检会报「清单目录下找不到图片」。"
-                    f"把这一步的 output 写成 `storage/{PurePosixPath(source).parent}/"
+                    f"把这一步的 output 写成 `/{PurePosixPath(source).parent}/"
                     f"{PurePosixPath(path).name}`，或让脚本把相对路径改写成绝对路径。"
                 )
     return list(dict.fromkeys(issues))
@@ -1740,10 +1742,9 @@ def _spelling_issues(draft: DistillDraft) -> list[str]:
     """A plan may not remember a sandbox path.
 
     `/target-workspace/.pyromind-agent/<id>/…` is what a sandbox prints for the
-    conversation's own directory. The next replay mounts somewhere else and the
-    platform never sees that prefix, so a plan carrying one names a file that
-    will not exist. The same holds for `/storage/…`: the platform addresses
-    Storage without the alias.
+    conversation's own directory. The platform addresses Storage by its object
+    path (`/datasets/…`), so a plan carrying the mount leaks a deployment detail
+    into every replay.
     """
     issues: list[str] = []
     seen: set[str] = set()
@@ -1770,14 +1771,9 @@ def _spelling_issues(draft: DistillDraft) -> list[str]:
         seen.add(value)
         if paths.mount_spelling(value):
             issues.append(
-                f"{where} 用了沙箱挂载路径 `{value}`。挂载前缀是执行环境的临时拼写，"
-                f"下次回放换个挂载就不存在了；请改成相对工作区的写法 "
-                f"`{paths.display(value)}`。"
-            )
-        elif paths.storage_spelling(value):
-            issues.append(
-                f"{where} 用了 `{value}`。平台按对象路径读 Storage，"
-                f"`/storage/…` 这个别名它不认；请写成 `{paths.display(value)}`。"
+                f"{where} 用了沙箱挂载路径 `{value}`。挂载前缀属于执行环境，"
+                f"平台按对象路径读 Storage；请改成 `{paths.display(value)}`，"
+                "需要在沙箱里执行时由执行方自己拼挂载前缀。"
             )
     return issues
 

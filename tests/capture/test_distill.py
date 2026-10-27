@@ -2038,7 +2038,7 @@ def test_a_manifest_sliced_out_of_storage_must_stay_beside_it(
         host,
     )
     blocking = plan["review"]["blocking_issues"]
-    assert any("运行目录" in item and "storage/datasets/test_100" in item
+    assert any("运行目录" in item and "/datasets/test_100" in item
                for item in blocking)
 
 

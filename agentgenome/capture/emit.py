@@ -405,9 +405,9 @@ class _Plan:
     def file_of(self, path: str) -> str:
         """The file a path token names, so both spellings of it pair up.
 
-        `storage/datasets/x` (the sandbox alias) and `datasets/x` (the object path)
-        are one file; comparing raw strings made them two, which produced a duplicate
-        `_2` parameter and hid the producer from the reverse slice.
+        `/datasets/x`, `datasets/x` and the old `storage/datasets/x` are one file;
+        comparing raw strings made them several, which produced a duplicate `_2`
+        parameter and hid the producer from the reverse slice.
         """
         return paths.display(canonical_path(path, self.bindings))
 
