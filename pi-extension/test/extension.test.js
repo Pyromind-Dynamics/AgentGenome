@@ -26,7 +26,7 @@ test("plugin owns tool schemas and delegates using the original call id", async 
   assert.match(prompt, /机械生成候选链路/);
   assert.match(prompt, /ambiguity/);
   assert.match(prompt, /llm 节点的 prompt 必须写明原会话使用的 skill、命令形态和输入输出路径/);
-  assert.ok(prompt.length < 3000);
+  assert.ok(prompt.length < 6000);
   assert.ok(registered.every((tool) => tool.label.startsWith("历史经验")));
   const distill = registered.find((t) => t.name === "genome_distill");
   assert.deepEqual(distill.parameters.required, ["label", "source_traces"]);
@@ -34,6 +34,8 @@ test("plugin owns tool schemas and delegates using the original call id", async 
   assert.match(distill.description, /First call it .* no steps/);
   assert.match(distill.description, /mechanically builds a candidate chain/);
   assert.match(distill.parameters.properties.steps.description, /第一次沉淀不要提交 steps/);
+  assert.equal(distill.parameters.properties.steps.items.properties.await.type, "string");
+  assert.match(distill.parameters.properties.steps.description, /前序异步工具的回执路径/);
   assert.equal(distill.parameters.properties.steps.items.properties.label, undefined);
   assert.equal(distill.parameters.properties.input_contract.type, "object");
   assert.match(distill.parameters.properties.input_contract.description, /type.*number/);
@@ -79,10 +81,10 @@ test("guidance teaches keep, async wait steps, batch validation and the data-flo
   assert.match(prompt, /keep: true/);
   assert.match(prompt, /本地试跑小样/);
   assert.match(prompt, /试跑与正式执行共用脚本不算相连/);
-  assert.match(prompt, /wait_pipeline\.py/);
+  assert.match(prompt, /轮询脚本/);
   assert.match(prompt, /一次全列出来/);
   assert.match(prompt, /机械生成候选链路/);
-  assert.match(prompt, /不读脚本内容、不物化脚本、不建包、不编译 graph、不回放/);
+  assert.match(prompt, /不发布、不回放的临时包预检/);
   assert.match(prompt, /genome_confirm_distill 只做一次机械 preflight/);
   assert.match(prompt, /预检失败时不会创建 capture/);
   assert.match(prompt, /本回合必须修正并立即重新调用对应工具/);
@@ -242,7 +244,7 @@ test("genome_distill forwards the normalized chain without touching the session"
   } })({ registerTool(tool) { registered.push(tool); }, on() {} });
   const distill = registered.find((t) => t.name === "genome_distill");
   assert.match(distill.description, /structural distillation plan/);
-  assert.match(distill.description, /does not read script bytes/);
+  assert.match(distill.description, /may read scripts and compile a temporary graph/);
   assert.match(distill.description, /one complete preflight/);
   assert.match(distill.description, /queues only the approved bounded sample\/subset replay/);
   assert.match(distill.description, /Publication waits for replay success/);

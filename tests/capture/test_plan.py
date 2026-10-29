@@ -14,6 +14,30 @@ def test_a_root_input_is_named_by_role_not_by_the_trial_size():
     assert _key_base("data/raw.csv") == "raw"
 
 
+def test_candidate_plan_parameterizes_a_storage_directory_and_its_outputs(
+        trace_factory, tool_entry):
+    trace = trace_factory([
+        tool_entry(
+            "manifest",
+            "python3 public_data/scripts/build_manifest.py "
+            "--input-dir /target-workspace/datasets/set-a "
+            "--output /target-workspace/datasets/set-a/manifest.jsonl",
+        ),
+    ], trace_id="dataset-root")
+
+    candidate = build_candidate_plan(traces=[trace])
+
+    assert candidate.params == {"data_dir": "/datasets/set-a"}
+    assert candidate.steps == ({
+        "run": "python3 public_data/scripts/build_manifest.py "
+               "--input-dir {data_dir} --output {data_dir}/manifest.jsonl",
+        "from": "dataset-root:0",
+    },)
+    assert candidate.final_artifact == "{data_dir}/manifest.jsonl"
+    assert candidate.input_contract == {
+        "data_dir": {"type": "path", "format": "directory"}}
+
+
 def test_candidate_plan_extracts_the_artifact_connected_chain(pipeline_trace):
     trace = pipeline_trace("session-1")
 

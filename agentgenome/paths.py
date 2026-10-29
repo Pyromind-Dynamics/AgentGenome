@@ -110,5 +110,19 @@ def display(value: str) -> str:
     return path
 
 
+def portable(value: str) -> str:
+    """The same file without a sandbox mount prefix, when one is present.
+
+    A trace records what the sandbox printed; a plan must remember the spelling
+    that outlives that sandbox. The mount root itself is left alone — rewriting it
+    to an empty string would turn `cd <mount>` into `cd`.
+    """
+    text = str(value).strip().replace("\\", "/")
+    stripped, mounted = _strip_mount(text)
+    if not mounted or not stripped:
+        return value
+    return display(stripped)
+
+
 def suffix(path: str) -> str:
     return PurePosixPath(path).suffix

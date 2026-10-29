@@ -389,3 +389,20 @@ def test_unknown_tools_carry_the_paths_their_args_name():
     assert step.command_shape == "<tool:df_submit_pipeline>"
     assert step.read_paths == ("datasets/raw.csv", "public_data/pipeline.py")
     assert step.write_paths == ()
+
+
+def test_an_attached_short_flag_placeholder_is_a_read():
+    """`head -{limit}` 的 `{limit}` 是参数值，不是字面量：漏掉它回放就会看到 `{`。"""
+    command = parse_command("head -{limit} data/raw.jsonl > out/subset.jsonl")
+    assert "{limit}" in command.read_paths
+    assert command.write_paths == ("out/subset.jsonl",)
+
+    # `-n {limit}` 是推荐写法，两种都要能进契约。
+    spaced = parse_command("head -n {limit} data/raw.jsonl > out/subset.jsonl")
+    assert "{limit}" in spaced.read_paths
+
+
+def test_an_unknown_flag_value_that_is_a_path_still_reads():
+    """`--window={data_dir}/x` 这种未知 flag 的取值也不能被丢掉。"""
+    command = parse_command("python3 scripts/run.py --window={data_dir}/x.jsonl")
+    assert "{data_dir}/x.jsonl" in command.read_paths

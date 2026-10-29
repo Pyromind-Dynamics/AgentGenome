@@ -30,7 +30,8 @@ from ..parameters import (
 from .align import Alignment, Slot
 from .slice import Slice
 from .trace import (KIND_HUMAN, KIND_LLM, KIND_SHELL, KIND_TOOL, KIND_WRITE, ROLE_SCRIPT,
-                    Step, Trace, canonical_path, parse_command, placeholder_key, role)
+                    Step, Trace, canonical_path, parse_command, path_template,
+                    placeholder_key, probe_command, role)
 
 DEFAULT_VERSION = "0.1.0"
 # Tools whose call is an external side effect: replaying one submits work to a
@@ -340,6 +341,37 @@ def _replace_tokens(command: str, mapping: Mapping[str, str]) -> str:
     return text
 
 
+def _mentions(text: str, token: str) -> bool:
+    """Whether a command or work order spells this path token as a whole token."""
+    quoted = re.escape(token)
+    pattern = re.compile(
+        _BOUNDARY + r"(?:'" + quoted + r"'|\"" + quoted + r"\"|" + quoted
+        + r")(?![\w./-])"
+    )
+    return pattern.search(text) is not None
+
+
+_SEGMENT = re.compile(r"&&|\|\||;")
+
+
+def _inspected_paths(command: str) -> set[str]:
+    """Paths a command only looks at: `&& wc -l out`, `&& test -s out`.
+
+    A product named in a trailing verification is still the step's product, not one
+    of its inputs. Counting those reads made every `cp … && wc -l …` look like an
+    in-place edit, which the engine refuses and the author cannot act on.
+    """
+    found: set[str] = set()
+    for segment in _SEGMENT.split(command):
+        segment = segment.strip()
+        if not segment:
+            continue
+        parsed = parse_command(segment)
+        if probe_command(parsed):
+            found.update(parsed.read_paths)
+    return found
+
+
 def _replace_json_tokens(value: Any, mapping: Mapping[str, str]) -> Any:
     """Replace path tokens inside a tool call's args without quoting or retyping them.
 
@@ -592,6 +624,10 @@ class _Plan:
         if link is not None and link[0] < order:
             _, node_id, key, type_name = link
             return key, type_name, f"{node_id}.output.{key}"
+        template = path_template(path)
+        if template is not None:
+            root_key, _ = template
+            return self._input_for(f"{{{root_key}}}", order)
         key = self.params.get(path)
         if key is None:
             key = self.keys.claim(_key_base(path))
@@ -610,20 +646,55 @@ class _Plan:
         for order in sorted(self.node_ids):
             step = self.step(order)
             written = {self.file_of(path) for path in step.write_paths}
-            both = [path for path in step.read_paths if self.file_of(path) in written]
+            inspected = _inspected_paths(step.command)
+            both = [path for path in step.read_paths
+                    if self.file_of(path) in written and path not in inspected]
             if both:
                 raise EmitError(
-                    f"步骤 {order} 原地读写同一路径，v2 不支持：{', '.join(sorted(both))}")
+                    f"第 {order + 1} 步原地读写同一路径，v2 不支持："
+                    f"{', '.join(sorted(both))}；命令：{step.command}")
             inputs: list[tuple[str, str, str]] = []
             mapping: dict[str, str] = {}
-            for path in step.read_paths:
+            read_paths = list(step.read_paths)
+            for path in step.write_paths:
+                template = path_template(path)
+                if template is None:
+                    continue
+                # A dataset-root product pins its artifact under that root, so the root
+                # has to be a declared input even when the command only names it as a
+                # prefix of the product path. It is not a separate mapping token: the
+                # command spells `{data_dir}/x`, never a bare `{data_dir}`.
+                root_key, _ = template
+                key, type_name, source = self._input_for(f"{{{root_key}}}", order)
+                if all(key != item[0] for item in inputs):
+                    inputs.append((key, type_name, source))
+            for path in read_paths:
                 if path in self.scripts:
                     mapping[path] = self.scripts[path]
                     continue
+                linked = self.linkable.get(self.file_of(path))
+                if linked is not None and linked[0] >= order:
+                    linked = None
                 key, type_name, source = self._input_for(path, order)
                 if all(key != item[0] for item in inputs):
                     inputs.append((key, type_name, source))
-                mapping[path] = "{input." + key + "}"
+                template = path_template(path)
+                suffix = template[1] if template is not None and linked is None else ""
+                mapping[path] = "{input." + key + "}" + (f"/{suffix}" if suffix else "")
+            # `head -{limit}` spells the same input as `head -n {limit}`; the flag and
+            # the slot travel together. When the command only spells the attached form,
+            # the bare token stops being a key — the strict "every path must appear"
+            # rule would otherwise fail on a token the text never had on its own.
+            attached: dict[str, str] = {}
+            for token, slot in list(mapping.items()):
+                if placeholder_key(token) is None:
+                    continue
+                if not _mentions(step.command, "-" + token):
+                    continue
+                attached["-" + token] = "-" + slot
+                if not _mentions(step.command, token):
+                    mapping.pop(token, None)
+            mapping.update(attached)
             output = self.outputs.get(order)
             extra: tuple[str, ...] = ()
             ext: str | None = None
@@ -636,6 +707,23 @@ class _Plan:
                 extra = tuple(path for path in step.write_paths if path != primary)
                 ext = artifact_ext(self.file_of(primary))
                 at = self._artifact_at(step, order, primary)
+                # A step that also writes sibling products under the same dataset
+                # root keeps them addressable: they are not the node artifact, but the
+                # command still has to name a real path for each of them.
+                for path in extra:
+                    template = path_template(path)
+                    if template is None:
+                        continue
+                    root_key, relative = template
+                    key, _, _ = self._input_for(f"{{{root_key}}}", order)
+                    mapping[path] = f"{{input.{key}}}/{relative}"
+            if step.kind in (KIND_HUMAN, KIND_LLM):
+                # A work order or prompt may describe the job without repeating every
+                # declared path verbatim. The declaration still binds the artifact;
+                # substituting only the tokens the text really spells keeps the words
+                # readable instead of demanding a mechanical echo of the plan.
+                mapping = {token: slot for token, slot in mapping.items()
+                           if _mentions(step.command, token)}
             kind = {"llm": "llm", "human": "human"}.get(step.kind, "run")
             arguments: Mapping[str, Any] | None = None
             command = ""
@@ -713,6 +801,15 @@ class _Plan:
         """
         if step.kind != KIND_SHELL:
             return None
+        template = path_template(primary)
+        if template is not None:
+            # `{data_dir}/manifest.jsonl` names a product *inside* that directory, so
+            # the slot is the directory value itself. Using `.dir` here resolved to its
+            # parent and put the manifest one level above the images it names — a
+            # failure that only surfaced on the platform's pre-submit check.
+            root_key, relative = template
+            key, _, _ = self._input_for(f"{{{root_key}}}", order)
+            return f"{{input.{key}}}/{relative}"
         product = PurePosixPath(self.file_of(primary))
         if "{" in product.name or "}" in product.name:
             return self._pin_token_artifact(step, order, primary)
@@ -796,7 +893,9 @@ def _root_verify(plan: _Plan, composed: tuple[str, str, str]) -> str:
     if contract is None:
         if plan.output_contract:
             raise EmitError(
-                f"output_contract must include the final graph output `{key}`"
+                f"output_contract 的键必须等于最终产物的文件名主干：这里是 `{key}`"
+                f"（final_artifact 去掉目录和后缀）。现在收到的是 "
+                f"{sorted(plan.output_contract)}，请把那一项改名成 `{key}`。"
             )
         return f"test -s {{output.{key}}}"
     fmt = contract.get("format")
@@ -938,7 +1037,7 @@ def _verify_outputs(plan: _Plan, graph: Graph) -> None:
         if step.write_paths and (child is None or emitted.output is None or
                                  emitted.output[0] not in child.output):
             raise EmitError(
-                f"步骤 {emitted.order} 声明了产出 {step.write_paths}，"
+                f"第 {emitted.order + 1} 步声明了产出 {step.write_paths}，"
                 "但编译后的图节点没有对应的 output")
     if plan.slice.final_artifact is not None:
         composed = _composed(plan)

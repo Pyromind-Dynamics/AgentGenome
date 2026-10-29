@@ -388,10 +388,17 @@ class Captures:
                      + (f"，run `{state['run_id']}`" if state["run_id"] else ""))
         waiting = result.get("waiting")
         if isinstance(waiting, dict):
-            lines.append(f"  - 停在人工节点 `{waiting.get('node')}`，等待复核："
-                         f"{waiting.get('question')}")
-            lines.append("  - 人工完成后调用 genome_resume 继续同一条回放，"
-                         "本条经验在回放成功前不会发布")
+            if waiting.get("kind") == "external":
+                lines.append(
+                    f"  - 停在外部任务节点 `{waiting.get('node')}`，"
+                    f"等待任务 `{waiting.get('task_id')}`"
+                )
+                lines.append("  - 外部任务回调会继续同一条回放")
+            else:
+                lines.append(f"  - 停在人工节点 `{waiting.get('node')}`，等待复核："
+                             f"{waiting.get('question')}")
+                lines.append("  - 人工完成后调用 genome_resume 继续同一条回放，"
+                             "本条经验在回放成功前不会发布")
         failure = result.get("failure")
         if isinstance(failure, dict):
             lines.append(f"  - 失败节点 `{failure.get('node')}`：{failure.get('summary')}")

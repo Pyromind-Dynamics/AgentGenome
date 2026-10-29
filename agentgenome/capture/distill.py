@@ -17,7 +17,7 @@ import re
 import shlex
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
@@ -39,7 +39,8 @@ from .policy import POLICY_SCRIPTS_FIRST, normalize_policy
 from .slice import OUTPUT_CONTRACT_HINT, Slice, SliceError, render_slice, reverse_slice
 from .trace import (INLINE_MARK, KIND_HUMAN, KIND_LLM, KIND_SHELL, KIND_TOOL, KIND_WRITE,
                     ROLE_SCRIPT, TRACE_VERSION, Command, Trace, arg_paths, canonical_path,
-                    capture_trace, parse_command, placeholder_key, probe_command, role)
+                    capture_trace, parse_command, path_template, placeholder_key,
+                    probe_command, role)
 
 MAX_STEPS = 200
 KIND_RUN = "run"
@@ -84,6 +85,7 @@ class DistilledStep:
     tool_name: str | None = None
     arguments: Mapping[str, Any] | None = None
     keep: bool = False
+    await_receipt: str | None = None
 
     def payload(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -93,7 +95,11 @@ class DistilledStep:
             "reads": list(self.reads),
             "writes": list(self.writes),
         }
-        if self.kind == KIND_TOOL:
+        if self.await_receipt is not None:
+            data["kind"] = "await"
+            data["await"] = self.await_receipt
+            data["run"] = self.run
+        elif self.kind == KIND_TOOL:
             data["tool"] = self.tool_name
             data["args"] = dict(self.arguments or {})
         else:
@@ -303,13 +309,67 @@ def _check_command(run: str, command: Command, order: int) -> None:
             "请把输入和产出写成命令行上的路径")
 
 
+def _portable_mount_paths(
+    steps: Sequence[DistilledStep], params: Mapping[str, Any] | None
+) -> tuple[tuple[DistilledStep, ...], dict[str, Any]]:
+    """Rewrite sandbox mount spellings into the plan's portable form.
+
+    The trace quotes what the sandbox printed; a plan has to outlive that sandbox.
+    Normalising here keeps the later checks, the review and the frozen graph from
+    all reporting the same prefix as a problem the model must fix by hand.
+    """
+    def rewrite_path(path: str) -> str:
+        return paths.portable(path)
+
+    rewritten: list[DistilledStep] = []
+    for step in steps:
+        run = _MOUNT_TOKEN.sub(
+            lambda match: paths.portable(match.group(0)), step.run)
+        if step.await_receipt is not None:
+            receipt = rewrite_path(step.await_receipt)
+            writes = tuple(rewrite_path(path) for path in step.writes)
+            rewritten.append(replace(
+                step,
+                run=f"await {receipt} -> {writes[0]}" if writes else run,
+                reads=(receipt,),
+                writes=writes,
+                await_receipt=receipt,
+            ))
+            continue
+        arguments = step.arguments
+        if isinstance(arguments, Mapping):
+            arguments = {
+                key: (rewrite_path(value) if isinstance(value, str) else value)
+                for key, value in arguments.items()
+            }
+        rewritten.append(replace(
+            step,
+            run=run,
+            reads=tuple(rewrite_path(path) for path in step.reads),
+            writes=tuple(rewrite_path(path) for path in step.writes),
+            arguments=arguments,
+        ))
+    bound = {
+        key: (rewrite_path(value) if isinstance(value, str) else value)
+        for key, value in (params or {}).items()
+    }
+    return tuple(rewritten), bound
+
+
+_MOUNT_TOKEN = re.compile(
+    r"(?:/)?(?:target-workspace|workspace)"
+    r"(?:/\.pyromind-agent/[^/\s\"'`;|&<>]+)?"
+    r"(?:/[^\s\"'`;|&<>)]*)?"
+)
+
+
 def plan_steps(steps: Sequence[Any]) -> tuple[DistilledStep, ...]:
     """Validate the agent's chain against the capture contract, step by step."""
     if isinstance(steps, (str, bytes)) or not isinstance(steps, Sequence) or not steps:
         raise DistillError(
-            "distill 需要 steps：[{run, from?}]、[{llm, output, input?, from?}]、"
-            "[{tool, args, output, input?, from?}] 或 [{human, output, input?, from?}]，"
-            "按链路顺序排列")
+            "distill 需要 steps：[{run, from?}]、[{await, output, from?}]、"
+            "[{llm, output, input?, from?}]、[{tool, args, output, input?, from?}] "
+            "或 [{human, output, input?, from?}]，按链路顺序排列")
     if len(steps) > MAX_STEPS:
         raise DistillError(f"步骤过多（{len(steps)}），最多 {MAX_STEPS} 步")
     planned: list[DistilledStep] = []
@@ -328,14 +388,32 @@ def _plan_step(raw: Any, order: int) -> DistilledStep:
     """One step of the plan, validated against the contract the capture stages enforce."""
     if not isinstance(raw, Mapping):
         raise DistillError(f"第 {order} 步必须是对象：{{run, from?}}、"
-                           f"{{llm, output, input?, from?}}、{{tool, args, output, from?}} "
-                           f"或 {{human, output, input?, from?}}")
-    forms = [key for key in ("run", "llm", "tool", "human") if key in raw]
+                           f"{{await, output, from?}}、{{llm, output, input?, from?}}、"
+                           f"{{tool, args, output, from?}} 或 {{human, output, from?}}")
+    forms = [key for key in ("run", "await", "llm", "tool", "human") if key in raw]
     if len(forms) > 1:
         raise DistillError(
             f"第 {order} 步不能同时声明 {'、'.join(forms)}，只能取其一")
     derived = _derived_from(raw, order)
     keep = _keep_flag(raw, order)
+    if "await" in raw:
+        receipt = raw.get("await")
+        output = raw.get("output")
+        if not isinstance(receipt, str) or not receipt.strip():
+            raise DistillError(f"第 {order} 步的 await 必须是异步工具产出的回执路径")
+        if not isinstance(output, str) or not output.strip():
+            raise DistillError(f"第 {order} 步的 await 必须用 output 声明等待到的真实产物路径")
+        return DistilledStep(
+            order=order,
+            run=f"await {receipt.strip()} -> {output.strip()}",
+            derived_from=derived,
+            reads=(receipt.strip(),),
+            writes=(output.strip(),),
+            kind=KIND_RUN,
+            verify=_verify_command(raw, order),
+            keep=keep,
+            await_receipt=receipt.strip(),
+        )
     if "tool" in raw:
         name = _tool_name(raw, order)
         reads, output, args = _tool_io(raw, order)
@@ -348,11 +426,12 @@ def _plan_step(raw: Any, order: int) -> DistilledStep:
         _check_llm_prompt(step)
         return step
     if "human" in raw:
-        step = DistilledStep(order, _human_text(raw, order), derived,
+        # A work order is prose for a person: it may name the project and the job
+        # without echoing every declared path. The declaration still binds the
+        # artifact, and the review reports a work order that never mentions one.
+        return DistilledStep(order, _human_text(raw, order), derived,
                              *_llm_io(raw, order, label="human"), kind=KIND_HUMAN,
                              keep=keep)
-        _check_llm_prompt(step)
-        return step
     run = _run_text(raw, order)
     command = parse_command(run)
     _check_command(run, command, order)
@@ -1031,6 +1110,9 @@ def _materialize_scripts(
     rewritten: list[DistilledStep] = []
     replaced: set[str] = set()
     for step in planned:
+        if step.await_receipt is not None:
+            rewritten.append(step)
+            continue
         if step.kind == KIND_TOOL:
             args = dict(step.arguments or {})
             for key, value in frozen.items():
@@ -1127,54 +1209,57 @@ def _bound_values(package: Package, planned: Sequence[DistilledStep],
     return tuple(normalized)
 
 
-def _template_path_issues(planned: Sequence[DistilledStep]) -> list[str]:
-    """A path is one whole `{token}` or a literal — never a mix of both.
+def _template_path_issues(
+    planned: Sequence[DistilledStep],
+    params: Mapping[str, Any] | None = None,
+    final_artifact: str | None = None,
+) -> list[str]:
+    """Allow a directory parameter followed by a safe relative artifact path.
 
-    `prelabel_manifest_{records}.jsonl` reads like a parameterised name, but the
-    placeholder regex anchors at the end of the token, so the whole string became a
-    literal path. Every later stage then treats it as its own file: the key extractor
-    names a parameter `prelabel_manifest_records`, a second such path claims the same
-    base and gets `_2`, and the params check demands keys nobody declared.
-
-    A template path also cannot be frozen: an asset declares what it produces, and a
-    file name that changes with a parameter has no fixed product to declare.
+    The supported reusable form is ``{data_dir}/manifest.jsonl``: the root path
+    is a user input, while the suffix is a deterministic artifact location beneath
+    that directory. Templates in filenames, middle path segments, or prefixed by
+    a mount/object root remain invalid because they cannot be mapped unambiguously.
     """
-    matches: list[tuple[int, str, str]] = []
+    matches: list[tuple[int, str]] = []
+    missing: set[str] = set()
     seen: set[str] = set()
-    for step in planned:
-        for path in (*step.reads, *step.writes):
-            if path in seen or placeholder_key(path) is not None:
-                continue
-            match = _TEMPLATE_TOKEN.search(path)
-            if match is None:
-                continue
-            seen.add(path)
-            matches.append((step.order, path, match.group(0)))
-    if not matches:
-        return []
-    orders = sorted({order for order, _, _ in matches})
-    examples = "；".join(
-        f"第 {order} 步 `{path}`（`{token}`）"
-        for order, path, token in matches[:3]
-    )
-    remainder = (
-        f"；另有 {len(matches) - 3} 个同类路径"
-        if len(matches) > 3
-        else ""
-    )
-    return [
-        (
-            f"发现 {len(matches)} 个路径把占位符嵌在路径中间，涉及第 "
-            f"{'、'.join(str(order) for order in orders)} 步。示例：{examples}{remainder}。\n"
-            "这是同一条规则错误。系统只支持「整个路径是一个参数」，不支持在路径里拼参数；"
-            "按下面任一种写法一次性修正全部路径：\n"
-            "  1. 整条路径换成一个参数：命令里只写 `{output_path}`，"
-            "**目录也不要留在命令里**（不要写成 `dir/{{output_path}}`），"
-            "并在 params 里给出完整路径（\"output_path\": \"<完整路径>\"）；\n"
-            "  2. 文件名不随参数变：写死完整文件名，只把数量作为命令参数"
-            "（`head -n {records}` 保持不变）。"
-        )
+    values = params or {}
+    paths_to_check = [
+        (step.order, path)
+        for step in planned
+        for path in (*step.reads, *step.writes)
     ]
+    if final_artifact is not None:
+        paths_to_check.append((len(planned) or 1, final_artifact))
+    for order, path in paths_to_check:
+        if path in seen or placeholder_key(path) is not None or _TEMPLATE_TOKEN.search(path) is None:
+            continue
+        seen.add(path)
+        template = path_template(path)
+        if template is None:
+            matches.append((order, path))
+            continue
+        key, _ = template
+        if key not in values or not isinstance(values[key], str) or not values[key].strip():
+            missing.add(key)
+    problems: list[str] = []
+    if matches:
+        examples = "；".join(f"第 {order} 步 `{path}`" for order, path in matches[:3])
+        remainder = f"；另有 {len(matches) - 3} 个同类路径" if len(matches) > 3 else ""
+        problems.append(
+            f"发现 {len(matches)} 个不支持的路径模板：{examples}{remainder}。"
+            "路径变量只支持两种形式：整个路径是 `{input_path}`，或数据集根目录位于开头、"
+            "后接安全相对路径（`{data_dir}/manifest.jsonl`）。"
+            "不要把变量嵌进文件名，也不要在它前面写 `/datasets/` 或 `/target-workspace/`；"
+            "`data_dir` 的 params 值本身就是完整 Storage 对象路径。"
+        )
+    if missing:
+        problems.append(
+            "这些路径模板根目录必须在 params 中绑定为完整目录路径："
+            + "、".join(f"`{key}`" for key in sorted(missing))
+        )
+    return problems
 
 
 def _intermediate_token_issues(
@@ -1205,10 +1290,10 @@ def _intermediate_token_issues(
             if key is None or key in given or key not in read_keys:
                 continue
             issues.append(
-                f"第 {step.order} 步的产出 `{path}` 是链路中间产物，不该写成占位符。"
-                "中间产物的路径由产出它的节点决定；写成占位符会让 emit 无法确定落点"
-                "（artifact.at），依赖同目录文件的产物（例如命名兄弟图片的 manifest）"
-                "在回放时就会失效。请把这一步的产出写成具体路径。"
+                f"第 {step.order} 步的产出 `{path}` 是链路中间产物，但没有在 params 中绑定路径。"
+                "若产物应跟随数据集目录，请改成 `{data_dir}/相对文件名`，并在 params 中把"
+                "data_dir 绑定为完整目录；编译后的 artifact 会落在每次运行输入目录下。"
+                "否则，把该占位符作为独立完整路径绑定到 params。不要把中间产物当作额外根输入。"
             )
     return issues
 
@@ -1217,7 +1302,7 @@ def _step_material(step: DistilledStep) -> list[Any]:
     """What makes one step distinct, for the trace id a retry of the plan reuses."""
     if step.kind == KIND_TOOL:
         return [step.kind, step.tool_name, dict(step.arguments or {}), list(step.writes)]
-    return [step.kind, step.run]
+    return ["await", step.await_receipt, list(step.writes)] if step.await_receipt else [step.kind, step.run]
 
 
 def _trace_id(label: str, steps: Sequence[DistilledStep],
@@ -1269,13 +1354,18 @@ def _trace_entry(step: DistilledStep) -> dict[str, Any]:
             "result": {"is_error": False, "text": "distilled"},
             **kept,
         }
+    command = step.run
+    if step.await_receipt is not None:
+        if len(step.writes) != 1:
+            raise DistillError("await 节点必须声明且仅声明一个真实产物 output")
+        command = f"cat {shlex.quote(step.await_receipt)} > {shlex.quote(step.writes[0])}"
     entry = {
         "kind": "tool",
         "entry_id": entry_id,
         "timestamp": None,
         "tool": "terminal",
         "call_id": f"distilled-{step.order}",
-        "args": {"command": step.run},
+        "args": {"command": command},
         "result": {"is_error": False, "text": "distilled"},
         **kept,
     }
@@ -1437,8 +1527,8 @@ def _check_final_artifact(final_artifact: str, steps: Sequence[DistilledStep],
               if produced else "计划里没有任何产出")
     raise DistillError(
         f"final_artifact `{final_artifact}` 没有被任何步骤声明为产出；{detail}。"
-        f"如果这一步的脚本自己把产物写到这个位置，用 `publishes: [\"{final_artifact}\"]` "
-        f"声明它；否则把产物路径加到命令行的输出参数上。{OUTPUT_CONTRACT_HINT}")
+        f"把产物路径写到该步骤的 output，并让它出现在命令行上（`--output 路径`、`> 路径`）；"
+        f"脚本自己决定输出位置时，先给脚本加一个输出参数。{OUTPUT_CONTRACT_HINT}")
 
 
 def _step_semantics(
@@ -1450,7 +1540,7 @@ def _step_semantics(
     given = bindings(params)
     data: dict[str, Any] = {
         "step": step.order,
-        "kind": step.kind,
+        "kind": "await" if step.await_receipt is not None else step.kind,
         "source": step.derived_from,
         "inputs": sorted(_path_reads(step, params, input_contract)),
         "outputs": sorted(canonical_path(path, given) for path in step.writes),
@@ -1551,6 +1641,8 @@ def _awaits(step: DistilledStep, receipt: str | None) -> bool:
     stays as a fallback for chains that spell it `wait_*.py`, but a workspace is
     free to call it `poll_task.py` or `df_await.py`.
     """
+    if step.await_receipt is not None:
+        return receipt is None or _same_path(step.await_receipt, receipt)
     if step.kind == KIND_TOOL:
         return bool(_WAIT_TOOL.search(step.tool_name or ""))
     if step.kind != KIND_RUN:
@@ -1559,6 +1651,120 @@ def _awaits(step: DistilledStep, receipt: str | None) -> bool:
         return True
     return bool(_WAIT_SCRIPT.search(step.run))
 
+
+
+_SCRIPT_SUFFIXES = (".py", ".sh", ".js", ".ts", ".mjs", ".cjs")
+# A step whose whole job is moving the platform's product to a stable name is a
+# materialization, not a transformation: turning it into the await loses nothing.
+_COPY_COMMANDS = frozenset({"cp", "mv", "rsync"})
+# A plan may annotate its copy with echo/count output; stdout is not an artifact.
+_NOOP_COMMANDS = frozenset({"echo", "true", ":", "wc"})
+
+
+def _bind_submit_receipts(
+    steps: Sequence[DistilledStep], given: Mapping[str, Any] | None
+) -> tuple[DistilledStep, ...]:
+    """Point the step after an async submit at the receipt it has to consume.
+
+    The platform fills its run directory only after the task ends, and that
+    directory is named per run (``data_preparation/<uuid>/``), so a replay can
+    never reproduce it. A step copying from there is really waiting for the
+    receipt — but the receipt is named by the engine
+    (``<artifacts>/<trace>/<seq>-<tool>.json``), which a plan cannot spell.
+
+    Rebinding that one read keeps a correct chain recognisable as an await node
+    instead of rejecting it over a path the author had no way to know.
+    """
+    bound = given or {}
+    bindings = {
+        canonical_path(value, bound)
+        for value in bound.values()
+        if isinstance(value, str)
+    }
+    produced = {canonical_path(path, bound) for step in steps for path in step.writes}
+    result: list[DistilledStep] = []
+    index = 0
+    while index < len(steps):
+        step = steps[index]
+        if (
+            step.kind == KIND_TOOL
+            and _is_async_tool(step.tool_name or "")
+            and step.writes
+            and index + 1 < len(steps)
+        ):
+            following = steps[index + 1]
+            if following.kind == KIND_RUN:
+                receipt = step.writes[0]
+                rebindable = [
+                    path
+                    for path in following.reads
+                    if PurePosixPath(path).suffix.lower() not in _SCRIPT_SUFFIXES
+                    and not any(_same_path(path, receipt) for _ in (receipt,))
+                    and canonical_path(path, bound) not in produced
+                    and canonical_path(path, bound) not in bindings
+                ]
+                # Exactly one candidate, and the step only copies it: the await
+                # node yields that product, so dropping the command loses nothing.
+                # A step that also transforms it keeps the old contract — it has
+                # to read the receipt itself, or the transform would disappear.
+                if len(rebindable) == 1 and _is_pure_copy(following.run, rebindable[0]):
+                    stale = rebindable[0]
+                    result.append(step)
+                    # The command has to carry the receipt too: the steps are
+                    # re-parsed from their text downstream, so a read that only
+                    # exists in `reads` is dropped again.
+                    destination = next(
+                        (path for path in following.writes if not _same_path(path, stale)),
+                        None,
+                    )
+                    if destination is None:
+                        result.append(step)
+                        index += 1
+                        continue
+                    result.append(
+                        replace(
+                            following,
+                            run=f"cat {shlex.quote(receipt)} > {shlex.quote(destination)}",
+                            reads=(receipt,),
+                        )
+                    )
+                    index += 2
+                    continue
+        result.append(step)
+        index += 1
+    return tuple(result)
+
+
+def _is_pure_copy(command: str, source: str) -> bool:
+    """Whether the command only copies `source`, plus no-op annotations.
+
+    `cp receipt out.jsonl; echo waiting for the callback` is still a
+    materialization: the echo says what the step is for, it does not do anything.
+    """
+    segments = [part.strip() for part in re.split(r"&&|\|\||;", command) if part.strip()]
+    if not segments:
+        return False
+    head = segments[0]
+    if any(operator in head for operator in ("|", ">", "<")):
+        return False
+    try:
+        words = shlex.split(head)
+    except ValueError:
+        return False
+    if not words or PurePosixPath(words[0]).name not in _COPY_COMMANDS:
+        return False
+    if not any(word == source for word in words[1:]):
+        return False
+    for segment in segments[1:]:
+        if any(operator in segment for operator in ("|", ">", "<")):
+            return False
+        try:
+            annotation = shlex.split(segment)
+        except ValueError:
+            return False
+        if not annotation or PurePosixPath(annotation[0]).name not in _NOOP_COMMANDS:
+            return False
+    return True
 
 def _async_wait_issues(steps: Sequence[DistilledStep]) -> list[str]:
     """A submit tool hands back a receipt, not the product.
@@ -1792,7 +1998,8 @@ def _static_issues(draft: DistillDraft) -> tuple[list[str], list[str]]:
     issues = blocking
     given = bindings(draft.params)
     values = draft.params or {}
-    issues.extend(_template_path_issues(draft.steps))
+    issues.extend(_template_path_issues(
+        draft.steps, draft.params, draft.final_artifact))
     try:
         specs = contracts_to_specs(draft.input_contract)
     except ParameterError as exc:
@@ -2086,7 +2293,8 @@ def draft_distill(
         normalized_policy = normalize_policy(policy)
     except ValueError as exc:
         raise DistillError(str(exc)) from exc
-    planned = plan_steps(steps)
+    planned = _bind_submit_receipts(plan_steps(steps), params)
+    planned, params = _portable_mount_paths(planned, params)
     source_ids = tuple(
         dict.fromkeys(source_traces or tuple(trace.trace_id for trace in traces))
     )
@@ -2352,7 +2560,8 @@ def distill(service: GenomeService, *, label: str, steps: Sequence[Any],
             "来源轨迹导出不完整（dropped_steps）：" + ", ".join(truncated)
             + "；请重新导出完整会话后再沉淀整条链路。"
               "review_confirmed 无法验证导出里不存在的步骤")
-    planned = plan_steps(steps)
+    planned = _bind_submit_receipts(plan_steps(steps), params)
+    planned, params = _portable_mount_paths(planned, params)
     # Every check that reads the plan runs before anything is frozen, and they all
     # report together: a chain that is wrong in three ways should not take three
     # submissions to fix.
@@ -2360,7 +2569,7 @@ def distill(service: GenomeService, *, label: str, steps: Sequence[Any],
     if (declarations or {}).get("output_contract") and not final_artifact:
         problems.append("output_contract 声明了产出，distill 必须显式指定 final_artifact，"
                         "不能从步骤顺序推断最终产物")
-    problems.extend(_template_path_issues(planned))
+    problems.extend(_template_path_issues(planned, params, final_artifact))
     problems.extend(_async_wait_issues(planned))
     problems.extend(_slice_boundary_issues(traces, params))
     try:

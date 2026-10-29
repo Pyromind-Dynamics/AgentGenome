@@ -1368,6 +1368,59 @@ def test_distill_turns_an_async_tool_receipt_into_a_wait_step(
     assert "from: df-submit-pipeline.output.receipt" in graph
 
 
+def test_a_copy_from_the_platform_run_directory_becomes_the_wait_step(
+        service, host, pipeline_workspace):
+    """平台产物落在 run 目录里，名字带每次运行的 UUID，回放复现不了。
+
+    原会话里那一步就是 `cp <run目录>/processed.jsonl <目标>`，模型照抄；
+    但受理单是引擎命名的，作者拼不出来。把这次读重绑到受理单，
+    这一步就成了等待节点，而不是一个永远读不到东西的复制命令。
+    """
+    steps = [
+        {"tool": "df_submit_pipeline",
+         "args": {"dataset": "data/raw.csv", "task_name": "pretag"},
+         "output": "out/submission.json"},
+        {"run": "cp ~/data_preparation/6f1c9a/processed.jsonl out/processed.jsonl",
+         "output": "out/processed.jsonl"},
+    ]
+    plan = distill(service, label="提交后取产物", steps=steps, workspace=host,
+                   final_artifact="out/processed.jsonl")
+    assert [node.kind for node in plan.package.nodes] == ["tool", "await"]
+
+
+def test_a_copy_annotated_with_an_echo_still_counts_as_the_wait_step(
+        service, host, pipeline_workspace):
+    """`cp …; echo waiting for the callback` 还是物化：echo 只说明用途，不做事。"""
+    steps = [
+        {"tool": "df_submit_pipeline",
+         "args": {"dataset": "data/raw.csv", "task_name": "pretag"},
+         "output": "out/submission.json"},
+        {"run": "cp ~/data_preparation/6f1c9a/processed.jsonl out/processed.jsonl"
+                "; echo placeholder - real output lands via callback",
+         "output": "out/processed.jsonl"},
+    ]
+    plan = distill(service, label="提交后取产物", steps=steps, workspace=host,
+                   final_artifact="out/processed.jsonl")
+    assert [node.kind for node in plan.package.nodes] == ["tool", "await"]
+
+
+def test_a_copy_with_echo_and_count_annotations_becomes_the_wait_step(
+        service, host, pipeline_workspace):
+    steps = [
+        {"tool": "df_submit_pipeline",
+         "args": {"dataset": "data/raw.csv", "task_name": "pretag"},
+         "output": "out/submission.json", "keep": True},
+        {"run": "cp ~/data_preparation/6f1c9a/processed.jsonl out/processed.jsonl "
+                "&& echo copied && wc -l out/processed.jsonl",
+         "output": "out/processed.jsonl"},
+    ]
+    plan = distill(
+        service, label="提交后提取结果", steps=steps, workspace=host,
+        final_artifact="out/processed.jsonl",
+    )
+    assert [node.kind for node in plan.package.nodes] == ["tool", "await"]
+
+
 def test_distill_reports_every_problem_in_one_submission(service, host, pipeline_workspace):
     """一次提交报全部问题：五轮「改一个再提交」的校验循环太慢。"""
     steps = [{"run": "python3 -c 'print(1)' > out/probe.json"},
@@ -1863,6 +1916,28 @@ def test_distill_rejects_the_platform_chain_that_skipped_the_wait(
                 final_artifact="out/sft.jsonl")
 
 
+def test_explicit_await_step_matches_the_plugin_schema_and_emits_an_await_node(
+        service, host, pipeline_workspace):
+    steps = [
+        {"tool": "df_submit_pipeline",
+         "args": {"input_path": "{raw}", "script_path": "scripts/prelabel.py"},
+         "output": "out/receipt.json", "keep": True},
+        {"await": "out/receipt.json", "output": "out/processed.jsonl"},
+        {"run": "python3 scripts/clean.py out/processed.jsonl > out/clean.csv",
+         "output": "out/clean.csv"},
+    ]
+    plan = distill(
+        service, label="显式等待节点", steps=steps, workspace=host,
+        params={"raw": "data/raw.csv"}, final_artifact="out/clean.csv",
+    )
+
+    assert [node.kind for node in plan.package.nodes] == ["tool", "await", "run"]
+    graph = (plan.package.directory / "graph.yaml").read_text(encoding="utf-8")
+    assert "await:" in graph
+    assert "{output.receipt}" in graph
+    assert "cat out/receipt.json" not in graph
+
+
 def test_a_wait_step_turns_the_receipt_into_the_product(
         service, host, pipeline_workspace):
     """提交与等待是两个节点：受理单给等待步骤，产物给下游。
@@ -2008,7 +2083,7 @@ def test_an_omitted_validation_scope_defaults_to_the_captured_inputs(
 
 def test_a_plan_may_not_remember_a_sandbox_mount_path(
         service, host, pipeline_workspace):
-    """挂载前缀是执行环境的临时拼写，写进契约下次回放就不存在了。"""
+    """挂载前缀是执行环境的临时拼写：计划把它归一成对象路径，而不是报给用户改。"""
     arguments = distill_args()
     arguments["params"] = {
         "raw": "/target-workspace/.pyromind-agent/abc/data/raw.csv",
@@ -2018,8 +2093,10 @@ def test_a_plan_may_not_remember_a_sandbox_mount_path(
     plan = prepare(service, arguments, "call-mount-spelling", host)
 
     warnings = plan["review"]["warnings"]
-    assert any("沙箱挂载路径" in item for item in warnings)
-    assert any("data/raw.csv" in item for item in warnings)
+    assert not any("沙箱挂载路径" in item for item in warnings)
+    assert all("/target-workspace" not in item for item in warnings)
+    assert plan["review"]["validation"]["params"] == {"review": "out/review.jsonl"}
+    assert "/target-workspace" not in json.dumps(plan, ensure_ascii=False)
 
 
 def test_a_manifest_sliced_out_of_storage_must_stay_beside_it(
@@ -2580,13 +2657,152 @@ def test_a_template_path_is_rejected_with_a_way_out():
     issues = _template_path_issues(plan_steps(steps))
     assert len(issues) == 1
     assert "{records}" in issues[0]
-    assert "{output_path}" in issues[0]
-    assert "整个路径是一个参数" in issues[0]
+    assert "数据集根目录位于开头" in issues[0]
 
-    # A whole-path placeholder is the supported spelling and stays quiet.
+    # A dataset-root path template is valid; a variable filename is not.
+    assert _template_path_issues(plan_steps([
+        {"run": "python3 scripts/build.py --root {data_dir} "
+                "--output {data_dir}/manifest.jsonl",
+         "output": "{data_dir}/manifest.jsonl"},
+    ]), {"data_dir": "/datasets/set-a"}) == []
+    # A whole-path placeholder remains valid for an independently bound path.
     assert _template_path_issues(plan_steps([
         {"run": "head -n {records} {manifest} > {slice_path}"},
     ])) == []
+
+
+def test_dataset_root_templates_keep_outputs_under_the_runtime_input_dir(
+        service, host, pipeline_workspace):
+    pipeline_workspace.write(
+        "scripts/copy_dataset.py",
+        "import argparse, shutil\\n"
+        "parser = argparse.ArgumentParser()\\n"
+        "parser.add_argument('--input', required=True)\\n"
+        "parser.add_argument('--output', required=True)\\n"
+        "args = parser.parse_args()\\n"
+        "shutil.copyfile(args.input, args.output)\\n",
+    )
+    pipeline_workspace.write("data/set-a/source.jsonl", "{\\\"id\\\": 1}\\n")
+    pipeline_workspace.write("data/set-b/source.jsonl", "{\\\"id\\\": 2}\\n")
+    steps = [{
+        "run": "python3 scripts/copy_dataset.py --input {data_dir}/source.jsonl "
+               "--output {data_dir}/prelabel.jsonl",
+        "output": "{data_dir}/prelabel.jsonl",
+    }]
+
+    plan = distill(
+        service,
+        label="数据集目录模板",
+        steps=steps,
+        workspace=host,
+        params={"data_dir": "data/set-a"},
+        declarations={"input_contract": {
+            "data_dir": {"type": "path", "format": "directory"}}},
+        final_artifact="{data_dir}/prelabel.jsonl",
+    )
+
+    assert plan.package.params == (("data_dir", "{data_dir}"),)
+    node = plan.package.nodes[0]
+    assert node.artifact_at == "{input.data_dir}/prelabel.jsonl"
+    graph = (plan.package.directory / "graph.yaml").read_text(encoding="utf-8")
+    assert "at: '{input.data_dir}/prelabel.jsonl'" in graph
+    assert "--input {input.data_dir}/source.jsonl" in node.command
+    assert "--output {artifact}" in node.command
+    assert canonical_path(
+        "{data_dir}/prelabel.jsonl", {"data_dir": "/datasets/set-a"}
+    ) == "/datasets/set-a/prelabel.jsonl"
+    assert canonical_path(
+        "{data_dir}/prelabel.jsonl", {"data_dir": "/datasets/set-b"}
+    ) == "/datasets/set-b/prelabel.jsonl"
+
+
+def test_two_dataset_root_products_in_one_command_compile(
+        service, host, pipeline_workspace):
+    """`{data_dir}/a.json` 与 `{data_dir}/b.json` 同时出现时不能被当成缺失路径。"""
+    pipeline_workspace.write(
+        "scripts/gen_config.py",
+        "import sys\n"
+        "for path in sys.argv[1:]:\n"
+        "    open(path, 'w').write('{}')\n",
+    )
+    steps = [{
+        "run": "python3 scripts/gen_config.py "
+               "{data_dir}/ls_field_map.json {data_dir}/ls_label_config.xml",
+        "output": ["{data_dir}/ls_field_map.json", "{data_dir}/ls_label_config.xml"],
+    }]
+
+    plan = distill(
+        service, label="两份配置", steps=steps, workspace=host,
+        params={"data_dir": "data/set-a"},
+        declarations={"input_contract": {
+            "data_dir": {"type": "path", "format": "directory"}}},
+        final_artifact="{data_dir}/ls_field_map.json",
+    )
+
+    command = plan.package.nodes[0].command
+    assert "{input.data_dir}" in command
+    assert "{data_dir}" not in command
+    assert plan.package.nodes[0].artifact_at == "{input.data_dir}/ls_field_map.json"
+
+
+def test_a_human_work_order_need_not_echo_every_declared_path(
+        service, host, pipeline_workspace):
+    """工作单是给人看的话术：不逐字复述路径也应当成立，只在复核里提醒。"""
+    pipeline_workspace.write(
+        "scripts/gen_config.py",
+        "import sys\n"
+        "for path in sys.argv[1:]:\n"
+        "    open(path, 'w').write('{}')\n",
+    )
+    pipeline_workspace.write(
+        "scripts/convert.py",
+        "import sys\n"
+        "open(sys.argv[2], 'w').write(open(sys.argv[1]).read())\n",
+    )
+    steps = [
+        {"run": "python3 scripts/gen_config.py {data_dir}/field_map.json "
+                "{data_dir}/label_config.xml",
+         "output": ["{data_dir}/field_map.json", "{data_dir}/label_config.xml"]},
+        {"human": "到 Label Studio 里完成复核并把导出结果放回数据集目录",
+         "input": ["{data_dir}/field_map.json", "{data_dir}/label_config.xml"],
+         "output": "{data_dir}/ls_export.json"},
+        {"run": "python3 scripts/convert.py {data_dir}/ls_export.json "
+                "{data_dir}/sft.jsonl",
+         "output": "{data_dir}/sft.jsonl"},
+    ]
+
+    plan = distill(
+        service, label="人工复核不逐字复述", steps=steps, workspace=host,
+        params={"data_dir": "data/set-a"},
+        declarations={"input_contract": {
+            "data_dir": {"type": "path", "format": "directory"}}},
+        final_artifact="{data_dir}/sft.jsonl",
+    )
+
+    human = next(node for node in plan.package.nodes if node.kind == "human")
+    assert "Label Studio" in human.command
+    assert human.output is not None
+
+
+def test_mount_spellings_become_object_paths_before_any_check(
+        service, host, pipeline_workspace):
+    """trace 里是沙箱挂载路径，计划里必须落成对象路径，而不是让模型手工改。"""
+    steps = [{
+        "run": "python3 scripts/clean.py "
+               "/target-workspace/datasets/set-a/raw.csv > out/clean.csv",
+        "output": "out/clean.csv",
+    }]
+
+    plan = distill(
+        service, label="挂载路径归一", steps=steps, workspace=host,
+        final_artifact="out/clean.csv",
+    )
+
+    assert ("raw", "/datasets/set-a/raw.csv") in plan.package.params
+    report = Path(plan.report_path).read_text(encoding="utf-8")
+    assert "/target-workspace" not in report
+    assert "{input.raw}" in (plan.package.directory / "graph.yaml").read_text(
+        encoding="utf-8")
 
 
 def test_plan_review_reports_template_paths_as_one_rule(pipeline_workspace):
@@ -2620,10 +2836,96 @@ def test_plan_review_reports_template_paths_as_one_rule(pipeline_workspace):
     review = draft.review({"will_start_replay": True})
     issues = [
         issue for issue in review["blocking_issues"]
-        if "把占位符嵌在路径中间" in issue
+        if "不支持的路径模板" in issue
     ]
 
     assert len(issues) == 1
-    assert "第 1、2、3 步" in issues[0]
-    assert "3 个路径" in issues[0]
+    assert "第 1 步" in issues[0]
+    assert "第 2 步" in issues[0]
+    assert "第 3 步" in issues[0]
+    assert "3 个不支持的路径模板" in issues[0]
     assert review["validation"]["ready"] is False
+
+
+def test_an_attached_flag_value_is_frozen_as_an_input_slot(
+        service, host, pipeline_workspace):
+    """`head -{limit}` 必须固化成 `head -{input.limit}`，否则回放会看到字面量 `{`。"""
+    steps = [{
+        "run": "head -{limit} data/raw.csv > out/subset.csv",
+        "output": "out/subset.csv",
+    }]
+
+    plan = distill(
+        service, label="按条数切片", steps=steps, workspace=host,
+        params={"limit": 2},
+        declarations={"input_contract": {"limit": {"type": "number"}}},
+        final_artifact="out/subset.csv",
+    )
+
+    command = plan.package.nodes[0].command
+    assert "-{input.limit}" in command
+    assert "{limit}" not in command
+
+
+def test_a_dataset_root_product_never_lands_in_the_parent_directory(
+        service, host, pipeline_workspace):
+    """契约只写 `type: path` 时，产物也必须落在 data_dir 里，而不是它的上一层。
+
+    真实回放就是这么挂的：manifest 写到了 `/datasets/test_100/manifest.jsonl`，
+    图片却在 `/datasets/test_100/test_100/`，平台预检找不到相对图片路径。
+    """
+    pipeline_workspace.write(
+        "scripts/gen_manifest.py",
+        "import sys\n"
+        "open(sys.argv[2], 'w').write('{}')\n",
+    )
+    steps = [{
+        "run": "python3 scripts/gen_manifest.py {data_dir} {data_dir}/manifest.jsonl",
+        "output": "{data_dir}/manifest.jsonl",
+    }]
+
+    plan = distill(
+        service, label="数据集目录内的清单", steps=steps, workspace=host,
+        params={"data_dir": "/datasets/test_100/test_100"},
+        declarations={"input_contract": {"data_dir": {"type": "path"}}},
+        final_artifact="{data_dir}/manifest.jsonl",
+    )
+
+    node = plan.package.nodes[0]
+    assert node.artifact_at == "{input.data_dir}/manifest.jsonl"
+    assert ".dir" not in (node.artifact_at or "")
+    graph = (plan.package.directory / "graph.yaml").read_text(encoding="utf-8")
+    assert "at: '{input.data_dir}/manifest.jsonl'" in graph
+
+
+def test_a_trailing_verification_of_the_product_is_not_an_in_place_edit(
+        service, host, pipeline_workspace):
+    """`cp a b && wc -l b` 里的 b 是产物，不是输入。"""
+    pipeline_workspace.write("out/a.jsonl", "{}\n")
+    steps = [{
+        "run": "cp out/a.jsonl out/b.jsonl && wc -l out/b.jsonl",
+        "output": "out/b.jsonl",
+    }]
+
+    plan = distill(service, label="复制并核对条数", steps=steps, workspace=host,
+                   final_artifact="out/b.jsonl")
+
+    command = plan.package.nodes[0].command
+    assert command.startswith("cp {input.a} {artifact}")
+    assert "&& wc -l {artifact}" in command
+
+
+def test_a_real_in_place_edit_still_fails_with_a_one_based_step_number(
+        service, host, pipeline_workspace):
+    """真正的原地改写仍要拒绝，而且报的是人看到的第几步。"""
+    steps = [
+        {"run": "python3 scripts/clean.py data/raw.csv > out/clean.csv",
+         "output": "out/clean.csv"},
+        {"run": "python3 scripts/clean.py out/clean.csv > out/clean.csv",
+         "output": "out/clean.csv"},
+    ]
+
+    with pytest.raises(DistillError, match="第 2 步原地读写") as error:
+        distill(service, label="原地改写", steps=steps, workspace=host,
+                final_artifact="out/clean.csv")
+    assert "命令：" in str(error.value)

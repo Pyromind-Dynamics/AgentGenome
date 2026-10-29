@@ -110,6 +110,8 @@ _REPORTED_DIRECT = re.compile(
 # A `{name}` token is how the agent declares a chain parameter instead of a literal
 # path, so the same command can be replayed with another input.
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
+# `-{limit}`: a short flag whose value is the placeholder itself (`head -3`).
+_ATTACHED_PLACEHOLDER = re.compile(r"-\{([A-Za-z_][A-Za-z0-9_]*)\}\Z")
 _COMMAND_SUBSTITUTION = "__agentgenome_command_substitution__"
 _COMMAND_SUBSTITUTION_SHAPE = "<command-substitution>"
 
@@ -251,15 +253,42 @@ def placeholder_key(token: str) -> str | None:
     return match.group(1) if match else None
 
 
-def canonical_path(token: str, bindings: Mapping[str, str]) -> str:
-    """The file a path token names: a `{param}` stands for the path bound to it.
+def path_template(token: str) -> tuple[str, str] | None:
+    """A root-directory placeholder followed by a safe relative artifact path.
 
-    A plan may write `{filtered_jsonl}` in one step and read the path that
-    placeholder binds to in the next; both spellings name one file, so every stage
-    that pairs writes with reads has to compare them through this.
+    ``{data_dir}/manifest.jsonl`` is a path under a root input, not a new input
+    parameter. Keep the syntax deliberately narrow: one whole placeholder at the
+    beginning, followed by ordinary relative components. Arbitrary interpolation
+    such as ``/datasets/{name}/file`` or ``out_{records}.jsonl`` is not a path
+    contract and remains invalid.
+    """
+    match = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}/(.+)", token)
+    if match is None:
+        return None
+    relative = PurePosixPath(match.group(2))
+    if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+        return None
+    return match.group(1), relative.as_posix()
+
+
+def canonical_path(token: str, bindings: Mapping[str, str]) -> str:
+    """Resolve a whole-path parameter or a safe path under a directory parameter.
+
+    The two accepted forms are ``{input_file}`` and
+    ``{data_dir}/derived/output.jsonl``. A path template is only expanded for
+    comparisons and validation; the graph keeps it symbolic so output artifacts
+    can be pinned under the directory supplied on each run.
     """
     key = placeholder_key(token)
-    return bindings.get(key, token) if key is not None else token
+    if key is not None:
+        return bindings.get(key, token)
+    template = path_template(token)
+    if template is not None:
+        key, relative = template
+        root = bindings.get(key)
+        if isinstance(root, str) and root.strip():
+            return f"{root.rstrip('/')}/{relative}"
+    return token
 
 
 def _is_number(token: str) -> bool:
@@ -471,11 +500,26 @@ def _simple_command(tokens: list[str]) -> Command:
             pending_flag = None
             continue
         if token.startswith("-") and token != "-":
+            attached = _ATTACHED_PLACEHOLDER.fullmatch(token)
+            if attached is not None:
+                # `head -{limit}` is `head -3`: the value rides on the flag. Treat the
+                # placeholder as the read it is, so it becomes a graph input instead of
+                # reaching bash as the literal text `{limit}`.
+                shape.append("<path>")
+                read_paths.append("{" + attached.group(1) + "}")
+                direction = None
+                pending = False
+                pending_flag = None
+                continue
             flag, sep, value = token.partition("=")
             if sep:
                 shape.append(f"{flag}=<value>")
                 if _flag_direction(flag) is not None:
                     (write_paths if _flag_direction(flag) == "write" else read_paths).append(value)
+                elif _is_path(value):
+                    # An unknown flag's value can still be a path or a `{param}`; leaving
+                    # it out made the placeholder invisible and replay saw `{x}` literally.
+                    read_paths.append(value)
                 pending = False
                 pending_flag = None
                 continue

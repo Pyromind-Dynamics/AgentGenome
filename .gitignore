@@ -5,6 +5,11 @@ __pycache__/
 runs/
 .DS_Store
 
+# pytest / build 临时产物
+.pytest_tmp/
+build.bak.*/
+.workbuddy-ai/
+
 build/
 dist/
 pi-extension/python/*.whl

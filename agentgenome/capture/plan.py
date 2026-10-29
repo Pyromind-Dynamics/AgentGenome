@@ -96,11 +96,15 @@ class CandidatePlan:
                 **dict(self.params),
             }
         if self.input_contract:
-            supplied = resolved.get("input_contract")
-            resolved["input_contract"] = {
-                **dict(supplied or {}),
-                **dict(self.input_contract),
-            }
+            supplied = dict(resolved.get("input_contract") or {})
+            merged = {key: dict(value) if isinstance(value, Mapping) else value
+                      for key, value in self.input_contract.items()}
+            for key, value in supplied.items():
+                if key in merged and isinstance(merged[key], Mapping) and isinstance(value, Mapping):
+                    merged[key] = {**dict(merged[key]), **dict(value)}
+                else:
+                    merged[key] = value
+            resolved["input_contract"] = merged
         return resolved
 
 
@@ -242,7 +246,8 @@ def _replace_tokens(value: Any, replacements: Mapping[str, str]) -> Any:
         text = value
         for source in sorted(replacements, key=len, reverse=True):
             text = re.sub(
-                r"(?<![\w./-])" + re.escape(source) + r"(?![\w./-])",
+                r"(?<![\w./-])" + re.escape(source)
+                + r"(?=/(?:[^\s\"'`<>]+)|(?=$|[\s\"'`<>;,]))",
                 replacements[source],
                 text,
             )
@@ -641,7 +646,12 @@ def _param_names(
     for path in roots:
         if path in names:
             continue
-        base = _key_base(path)
+        namespace, _ = paths.canonical(path)
+        base = (
+            "data_dir"
+            if namespace == paths.STORAGE and not PurePosixPath(path).suffix
+            else _key_base(path)
+        )
         candidate = base
         index = 1
         while candidate in used:
@@ -691,6 +701,8 @@ def build_candidate_plan(
         path: "{" + name + "}"
         for path, name in names.items()
     }
+    if final is not None:
+        final = _replace_tokens(final, replacements)
 
     steps: list[dict[str, Any]] = []
     for action in ordered:
@@ -713,7 +725,14 @@ def build_candidate_plan(
             "不在最终产物的依赖闭包里，已作为旁支排除"
         )
 
-    input_contract = {name: {"type": "path"} for name in names.values()}
+    input_contract = {}
+    for path, name in names.items():
+        namespace, _ = paths.canonical(path)
+        is_directory = namespace == paths.STORAGE and not PurePosixPath(path).suffix
+        input_contract[name] = {
+            "type": "path",
+            **({"format": "directory"} if is_directory else {}),
+        }
     generated = tuple(
         action.writes[0] for action in ordered
         if action.generated_output
@@ -721,7 +740,7 @@ def build_candidate_plan(
     return CandidatePlan(
         steps=tuple(steps),
         final_artifact=final,
-        params={names[path]: path for path in roots},
+        params={names[path]: paths.display(path) for path in roots},
         input_contract=input_contract,
         branches=tuple(dict.fromkeys(branches)),
         ambiguities=tuple(dict.fromkeys(ambiguities)),

@@ -6,7 +6,7 @@ import ast
 import hashlib
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -30,7 +30,9 @@ _ID = re.compile(r"^[a-z][a-z0-9_-]*$")
 _TOOL_NAME = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SLOT = re.compile(r"\{(artifact|(?:input|output)\.[^{}]+)\}")
 _TRIED_SLOT = re.compile(r"\{tried\.([a-z][a-z0-9_-]*)\.(stage|reason|attempt)\}")
-_ARTIFACT_AT = re.compile(r"^\{input\.([a-z][a-z0-9_-]*)\.dir\}/([^/{}]+)$")
+_ARTIFACT_AT = re.compile(
+    r"^\{input\.([a-z][a-z0-9_-]*)(\.dir)?\}/([^/{}]+)$"
+)
 _TYPES = {"text", "json", "path", "number", "bool"}
 _NEEDS = {"shell", "llm", "human", "tool", "await"}
 _ARTIFACT_EXT = re.compile(r"[A-Za-z0-9]{1,12}")
@@ -287,7 +289,8 @@ class _Compiler:
     ) -> tuple[str | None, str | None]:
         """`{artifact}` 的后缀与落点；读取方按扩展名选解析器，缺省 .out 保持兼容。
 
-        `at` 把产物钉在一个输入旁边（`{input.<键>.dir}/<文件名>`）。带相对引用的产物
+        `at` 把产物钉在目录输入下（`{input.<目录键>}/<相对路径>`）或文件输入旁边
+        （`{input.<文件键>.dir}/<相对路径>`）。带相对引用的产物
         ——比如用相对路径指向同目录图片的 manifest——只有留在原位才仍然有效，落到
         运行目录的 artifacts/ 里就会指向不存在的位置。
 
@@ -323,11 +326,16 @@ class _Compiler:
         if match is None:
             self.error(
                 "E_ARTIFACT", path,
-                "artifact.at 必须形如 {input.<键>.dir}/<文件名>，只允许一个目录槽位加一个文件名",
+                "artifact.at 必须形如 {input.<目录键>}/<文件名> 或 "
+                "{input.<文件键>.dir}/<文件名>，只允许一个目录槽位加一个文件名",
             )
             return ext, None
         if match.group(1) not in inputs:
-            self.error("E_SLOT", path, f"槽位 {{input.{match.group(1)}.dir}} 未引用已声明输入")
+            self.error("E_SLOT", path, f"槽位 {{input.{match.group(1)}}} 未引用已声明输入")
+            return ext, None
+        relative = PurePosixPath(match.group(3))
+        if relative.is_absolute() or len(relative.parts) != 1 or relative.name in (".", ".."):
+            self.error("E_ARTIFACT", path, "artifact.at 只允许一个文件名，不允许子目录或 ..")
             return ext, None
         return ext, at
 

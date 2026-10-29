@@ -22,7 +22,7 @@ from .native_stages import NativeStages
 from .service import GenomeService
 
 PROTOCOL = 1
-VERSION = "0.6.48"
+VERSION = "0.6.60"
 ACTIVE = {"queued", "running", "cancelling"}
 
 
